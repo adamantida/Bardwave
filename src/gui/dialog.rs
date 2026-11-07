@@ -23,8 +23,10 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
 
     paint_scrim(ctx);
 
-    // A click on the scrim or `Esc` dismisses the modal.
-    let escaped = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    // A click on the scrim or `Esc` dismisses the modal — except while a
+    // YouTube download is running: that modal closes when the worker reports
+    // back, so the download cannot be forgotten mid-flight.
+    let escaped = ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !state.youtube_busy();
     if escaped {
         state.close_dialog();
         return;
@@ -282,6 +284,92 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                 state.close_dialog();
             } else if let Some(group) = chosen {
                 state.assign_sound_group(group);
+            }
+        }
+
+        Dialog::AddYouTube { url, error } => {
+            let mut field = url;
+            let mut submit = false;
+            let mut cancel = false;
+            let busy = state.youtube_busy();
+            let status = state.youtube_status();
+
+            modal(ctx, |ui| {
+                header(
+                    ui,
+                    "Add From YouTube",
+                    "The audio is downloaded once, then played like any local sound",
+                );
+                ui.add_space(Metrics::MD);
+
+                ui.label(micro_label("Video or music link"));
+                ui.add_space(Metrics::XS);
+                let resp = name_field(ui, &mut field, "https://youtube.com/watch?v=…");
+                if !busy && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                ui.add_space(Metrics::XS);
+                if let Some(message) = &error {
+                    error_line(ui, message);
+                } else if busy {
+                    ui.label(micro_label(&status));
+                } else {
+                    ui.label(micro_label(
+                        "First use downloads yt-dlp + ffmpeg once (~230 MB), then it just works",
+                    ));
+                }
+
+                ui.add_space(Metrics::LG);
+                hairline(ui);
+                ui.add_space(Metrics::MD);
+
+                ui.horizontal(|ui| {
+                    if busy {
+                        if ConsoleButton::ghost("Close")
+                            .font_size(11.0)
+                            .width(150.0)
+                            .height(Metrics::BTN_H)
+                            .id_salt("dlg_yt_cancel")
+                            .show(ui)
+                            .clicked()
+                        {
+                            // The download keeps running in the background and
+                            // lands on the board (or in the log) when it ends.
+                            cancel = true;
+                        }
+                    } else if ConsoleButton::primary("Add")
+                        .glyph(glyph::PLUS)
+                        .width(150.0)
+                        .height(Metrics::BTN_H)
+                        .id_salt("dlg_yt_ok")
+                        .show(ui)
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                    if !busy {
+                        ui.add_space(Metrics::SM);
+                        if ConsoleButton::ghost("Cancel")
+                            .glyph(glyph::CROSS)
+                            .width(120.0)
+                            .height(Metrics::BTN_H)
+                            .id_salt("dlg_yt_cancel2")
+                            .show(ui)
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                    }
+                });
+            });
+
+            if let Dialog::AddYouTube { url, .. } = state.dialog_mut() {
+                *url = field;
+            }
+            if cancel {
+                state.close_dialog();
+            } else if submit {
+                state.submit_add_youtube();
             }
         }
     }

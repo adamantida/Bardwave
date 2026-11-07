@@ -25,6 +25,9 @@ roxmltree = "0.21"
 # Utilities
 anyhow = "1.0"
 thiserror = "1.0"
+# Self-downloading yt-dlp (one-time, from its GitHub releases) so the
+# YouTube feature works without any manual installation.
+ureq = { version = "2.10", default-features = false, features = ["tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
@@ -63,6 +66,7 @@ axum = { workspace = true }
 tokio-tungstenite = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+ureq = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

@@ -67,6 +67,7 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 
 **Library**
 - WAV, FLAC, MP3, OGG-Vorbis and AAC/MP4 decoding via [Symphonia](https://github.com/pdeljanov/Symphonia)
+- **YouTube links**: paste a video/music URL — yt-dlp and ffmpeg download themselves on first use (no setup needed), the audio is saved once into `bardwave-library/` next to the executable and plays like any local file, including after a restart
 - Library, groups, per-sound volume and loop flags **persist across restarts**
 - Everything stored in a plain, human-readable `config.toml` next to the executable
 
@@ -98,6 +99,15 @@ cargo run --release
 ```
 
 The console window opens. Click **Add sound** (or the ⨁ button) and pick a few audio files from your library, then press **Start** in the SERVER panel.
+
+#### Sounds from YouTube
+
+Click **YouTube** next to *Add Sound*, paste a video or music link and press **Add**. The audio track is downloaded once (the video itself is not), transcoded to MP3 and stored in `bardwave-library/` next to the executable; the row appears under its title like any local sound. Tools:
+
+- **No manual setup**. On the first **Add** the console fetches the current [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) release (~24 MB) and, on Windows, a static `ffmpeg.exe` (~230 MB with yt-dlp total) from BtbN's stable builds — progress runs in the dialog. Both are saved next to the executable, or into the app-data folder when that is not writable. A `yt-dlp`/`ffmpeg` already next to the exe or on the `PATH` always wins over the download.
+- On Linux/macOS `yt-dlp` is fetched automatically, but `ffmpeg` must be installed the usual way (`apt install ffmpeg`, `brew install ffmpeg`) — the dialog says so when it is missing.
+- Playlists are not a board feature — a link pasted with `&list=…` still adds just that one track.
+- Re-adding the same link is free: the download already exists, so it is only re-registered.
 
 > Built binary, if you do not want a terminal hanging around: `cargo build --release` puts `target/release/soundshared.exe` — rename it to `Bardwave.exe` if you like. Keep `config.toml` in the **same folder** as the executable.
 

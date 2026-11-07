@@ -53,6 +53,10 @@ pub enum Dialog {
     DeleteGroup { id: GroupId },
     /// Assign a sound to a group (or clear its membership).
     AssignSound { sound_id: SoundId, name: String },
+    /// Add a sound from a YouTube link. Holds the in-progress link field and
+    /// its validation error; the download itself runs on a worker thread and
+    /// reports into [`SoundSharedApp::youtube_result_rx`].
+    AddYouTube { url: String, error: Option<String> },
 }
 
 /// How long the library may stay unsaved before it is flushed to disk.
@@ -198,6 +202,13 @@ pub struct SoundSharedApp {
     decode_tx: Sender<DecodeJob>,
     /// Decoded files coming back from the worker, finished on the GUI thread.
     decoded_rx: Receiver<DecodedJob>,
+    /// Results from the (at most one) YouTube download worker. The sender half
+    /// lives in the worker thread; a new download simply replaces the receiver.
+    youtube_result_rx: Receiver<YouTubeJob>,
+    /// Progress text the YouTube worker updates for the modal to read.
+    youtube_status: Arc<Mutex<String>>,
+    /// True while a YouTube download is in flight (the modal disables itself).
+    youtube_busy: bool,
     /// MASTER OUTPUT meter position (0..1, dB scale with peak decay).
     output_meter: f32,
 }
@@ -210,6 +221,9 @@ type DecodedJob = (
     Sender<anyhow::Result<SoundInfo>>,
     Result<DecodedAudio, String>,
 );
+
+/// One finished YouTube download: the file ready for the decoder, or the reason.
+type YouTubeJob = Result<PathBuf, String>;
 
 /// Decode files one by one off the GUI thread.
 ///
@@ -298,6 +312,9 @@ impl SoundSharedApp {
             bind_result_tx,
             decode_tx,
             decoded_rx,
+            youtube_result_rx: crossbeam_channel::unbounded::<YouTubeJob>().1,
+            youtube_status: Arc::new(Mutex::new(String::new())),
+            youtube_busy: false,
             output_meter: 0.0,
         };
 
@@ -945,6 +962,95 @@ impl SoundSharedApp {
         }
     }
 
+    // ===== YouTube links =====
+
+    /// Open the "add from YouTube" modal.
+    pub fn open_add_youtube(&mut self) {
+        if self.youtube_busy {
+            return; // one download at a time; the modal is already reporting it
+        }
+        self.dialog = Dialog::AddYouTube {
+            url: String::new(),
+            error: None,
+        };
+    }
+
+    /// Whether a YouTube download is currently in flight.
+    pub fn youtube_busy(&self) -> bool {
+        self.youtube_busy
+    }
+
+    /// The YouTube worker's latest progress line.
+    pub fn youtube_status(&self) -> String {
+        self.youtube_status.lock().unwrap().clone()
+    }
+
+    /// Apply the open "add from YouTube" modal: validate the link and hand the
+    /// download to a worker thread. Validation failures stay in the modal.
+    pub fn submit_add_youtube(&mut self) {
+        let url = match &self.dialog {
+            Dialog::AddYouTube { url, .. } => url.clone(),
+            _ => return,
+        };
+        let Some(video_id) = crate::audio::youtube::extract_video_id(&url) else {
+            if let Dialog::AddYouTube { error, .. } = &mut self.dialog {
+                *error = Some("Not a YouTube video link".to_string());
+            }
+            return;
+        };
+
+        let (result_tx, result_rx) = bounded(1);
+        self.youtube_result_rx = result_rx;
+        *self.youtube_status.lock().unwrap() = "Connecting…".to_string();
+        self.youtube_busy = true;
+
+        let status = self.youtube_status.clone();
+        let sink: crate::audio::youtube::StatusSink = Arc::new(move |line: &str| {
+            if let Ok(mut status) = status.lock() {
+                *status = line.to_string();
+            }
+        });
+        std::thread::Builder::new()
+            .name("youtube-download".into())
+            .spawn(move || {
+                let result = crate::audio::youtube::download_audio(&url, &video_id, &sink);
+                // The channel is closed with the app; failing to report simply
+                // means nobody is listening for the result any more.
+                let _ = result_tx.send(result);
+            })
+            .expect("spawn youtube download worker");
+    }
+
+    /// Collect YouTube download outcomes from the worker.
+    ///
+    /// Success hands the file to the normal loader (the row appears as soon as
+    /// it is decoded, sharing every existing path). Failure lands in the modal
+    /// if it is still open, and in the log in any case.
+    fn poll_youtube_results(&mut self) {
+        while let Ok(result) = self.youtube_result_rx.try_recv() {
+            let result = match result {
+                Ok(path) => path,
+                Err(message) => {
+                    error!("YouTube download failed: {}", message);
+                    if matches!(self.dialog, Dialog::AddYouTube { .. }) {
+                        if let Dialog::AddYouTube { error, .. } = &mut self.dialog {
+                            *error = Some(message);
+                        }
+                    }
+                    self.youtube_busy = false;
+                    continue;
+                }
+            };
+
+            info!("YouTube download finished: {}", result.display());
+            if matches!(self.dialog, Dialog::AddYouTube { .. }) {
+                self.dialog = Dialog::None;
+            }
+            self.youtube_busy = false;
+            self.request_load_sound(result);
+        }
+    }
+
     // ===== Library, groups and filters =====
 
     /// The saved library: groups plus their sounds, in display order.
@@ -1246,6 +1352,7 @@ impl SoundSharedApp {
         // Process pending audio commands (runs on main thread where AudioEngine lives)
         self.process_audio_commands();
         self.finish_decoded();
+        self.poll_youtube_results();
 
         // Auto-detect tracks that finished playing (mixer marks them stopped but keeps them)
         // so the GUI button switches from "Stop" back to "Play" and the sound can be removed.
@@ -1290,10 +1397,18 @@ impl SoundSharedApp {
         self.maybe_persist();
 
         // Request repaint for live updates: the level meter needs a steady
-        // frame rate while anything plays (or the meter is still falling).
-        let animating =
-            self.output_meter > 0.0 || self.sounds.lock().unwrap().values().any(|s| s.playing);
-        ctx.request_repaint_after(Duration::from_millis(if animating { 33 } else { 500 }));
+        // frame rate while anything plays (or the meter is still falling), and
+        // the YouTube modal reads its worker's progress line.
+        let animating = self.output_meter > 0.0
+            || self.youtube_busy
+            || self.sounds.lock().unwrap().values().any(|s| s.playing);
+        ctx.request_repaint_after(Duration::from_millis(if self.youtube_busy {
+            200
+        } else if animating {
+            33
+        } else {
+            500
+        }));
     }
 
     /// Register the files the decoder worker has finished.
@@ -1309,11 +1424,10 @@ impl SoundSharedApp {
                     let sound_id = engine.load_sound_from_data(audio);
                     let (duration, sample_rate, _) =
                         engine.sound_info(sound_id).unwrap_or((0.0, 48000, 2));
-                    let name = std::path::Path::new(&path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Unknown")
-                        .to_string();
+                    // YouTube downloads arrive as `<title> [<id>]` on disk;
+                    // their ` [id]` stamp is trimmed so the row shows the
+                    // title. Any other file keeps its plain stem.
+                    let name = crate::audio::youtube::display_name(std::path::Path::new(&path));
 
                     // A sound that was saved at a lower level must come
                     // back at that level: the engine starts every sound

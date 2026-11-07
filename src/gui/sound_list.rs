@@ -95,6 +95,17 @@ fn header(ui: &mut Ui, state: &mut SoundSharedApp) {
             {
                 state.open_file_dialog();
             }
+            ui.add_space(Metrics::SM);
+            if ConsoleButton::ghost("YouTube")
+                .glyph(glyph::WAVE)
+                .font_size(11.0)
+                .width(110.0)
+                .id_salt("library_add_youtube")
+                .show(ui)
+                .clicked()
+            {
+                state.open_add_youtube();
+            }
         });
     });
 }
@@ -783,6 +794,17 @@ fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, hei
                 .clicked()
             {
                 state.open_file_dialog();
+            }
+            ui.add_space(Metrics::SM);
+            ui.label(micro_label("…or drop in a YouTube link"));
+            if ConsoleButton::ghost("YouTube")
+                .glyph(glyph::WAVE)
+                .width(150.0)
+                .id_salt("empty_add_youtube")
+                .show(ui)
+                .clicked()
+            {
+                state.open_add_youtube();
             }
             if matches!(filter, GroupFilter::Group(_) | GroupFilter::Ungrouped) {
                 ui.add_space(Metrics::SM);
