@@ -729,7 +729,9 @@ mod tests {
                 .send_audio(AudioFrame::new(block, WIRE_SAMPLE_RATE, WIRE_CHANNELS, 0))
                 .expect("queue block");
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Well past STREAM_FLUSH_DELAY, so the padded tail has been sent on
+        // every platform's timer resolution.
+        tokio::time::sleep(STREAM_FLUSH_DELAY * 5).await;
 
         let mut packets = 0;
         while let Ok(message) = rx.try_recv() {
@@ -738,9 +740,13 @@ mod tests {
                 packets += 1;
             }
         }
-        // 8 x 441 = 3528 frames is 7.35 wire frames, so 7 packets, and none of
-        // the boundaries may fall on a dropped block.
-        assert_eq!(packets, 7, "3528 frames must reblock into 7 whole packets");
+        // 8 x 441 = 3528 frames is 7.35 wire frames: 7 whole packets, none
+        // lost at a block boundary, plus the 0.35 tail padded and flushed once
+        // the engine goes quiet.
+        assert_eq!(
+            packets, 8,
+            "3528 frames must reblock into 7 whole packets plus the flushed tail"
+        );
 
         drop(handle);
     }
