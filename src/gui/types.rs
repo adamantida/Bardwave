@@ -121,6 +121,10 @@ pub struct AppState {
     /// Problems that keep players out (VPN route, firewall), written by the
     /// server thread on Start and cleared on Stop.
     pub network_notes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+
+    /// Access key of the listener stream, shared with the server: the
+    /// console puts it into every link it copies and can issue a new one.
+    pub access: crate::network::AccessGuard,
 }
 
 impl AppState {
@@ -138,6 +142,13 @@ impl AppState {
             config,
             upnp_status: Default::default(),
             network_notes: Default::default(),
+            access: Default::default(),
         }
+    }
+
+    /// Use `access` as the stream's access key guard.
+    pub fn with_access(mut self, access: crate::network::AccessGuard) -> Self {
+        self.access = access;
+        self
     }
 }

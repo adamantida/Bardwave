@@ -452,6 +452,8 @@ pub(crate) struct AudioEngineInner {
     master_volume: Arc<parking_lot::Mutex<f32>>,
     /// Next track ID
     next_track_id: AtomicU64,
+    /// How `[audio]` wants the local device opened (read at `start_output`).
+    device_prefs: parking_lot::Mutex<DevicePrefs>,
 }
 
 // Manual Debug implementation since cpal::Stream doesn't implement Debug
@@ -532,9 +534,15 @@ impl AudioEngine {
             local_output: Arc::new(parking_lot::RwLock::new(LocalOutputStatus::stopped())),
             master_volume: Arc::new(parking_lot::Mutex::new(1.0)),
             next_track_id: AtomicU64::new(0),
+            device_prefs: parking_lot::Mutex::new(DevicePrefs::default()),
         });
 
         Ok(Self { inner })
+    }
+
+    /// Choose how the local device is opened by the next `start_output`.
+    pub fn set_device_prefs(&self, prefs: DevicePrefs) {
+        *self.inner.device_prefs.lock() = prefs;
     }
 
     /// Create a new audio engine with custom mixer config and broadcast channel
@@ -553,6 +561,7 @@ impl AudioEngine {
             local_output: Arc::new(parking_lot::RwLock::new(LocalOutputStatus::stopped())),
             master_volume: Arc::new(parking_lot::Mutex::new(1.0)),
             next_track_id: AtomicU64::new(0),
+            device_prefs: parking_lot::Mutex::new(DevicePrefs::default()),
         });
 
         Ok(Self { inner })
@@ -606,7 +615,8 @@ impl AudioEngine {
             }
         };
 
-        let (chosen, reason) = match Self::choose_output_config(&device, &supported) {
+        let prefs = *self.inner.device_prefs.lock();
+        let (chosen, reason) = match Self::choose_output_config(&device, &supported, &prefs) {
             Ok(chosen) => chosen,
             Err(e) => {
                 self.record_local_output_failure(Some(device_name), 0, 0, "none", e.to_string());
@@ -617,11 +627,11 @@ impl AudioEngine {
         let sample_format = chosen.sample_format();
         let adapter = DeviceAdapter::new(chosen.sample_rate().0, chosen.channels());
 
-        // Ask for a 10 ms buffer. Not every backend accepts a fixed size, so
-        // `build_adapted_stream` retries with the device default instead of
-        // failing outright.
+        // `[audio] buffer_size` (10 ms by default). Not every backend accepts
+        // a fixed size, so `build_adapted_stream` retries with the device
+        // default instead of failing outright.
         let stream_config = StreamConfig {
-            buffer_size: BufferSize::Fixed(480), // 480 frames = 10 ms at 48 kHz
+            buffer_size: prefs.buffer_size(),
             ..chosen.config()
         };
 
@@ -769,6 +779,7 @@ impl AudioEngine {
     fn choose_output_config(
         device: &cpal::Device,
         supported: &[SupportedStreamConfigRange],
+        prefs: &DevicePrefs,
     ) -> Result<(SupportedStreamConfig, Option<String>), EngineError> {
         let device_default = match device.default_output_config() {
             Ok(config) => Some(config),
@@ -778,7 +789,7 @@ impl AudioEngine {
             }
         };
 
-        plan_output_config(supported, device_default.as_ref())
+        plan_output_config(supported, device_default.as_ref(), prefs)
     }
 
     /// Record why local audio is unavailable, so the UI can show it instead of
@@ -1222,13 +1233,94 @@ impl AudioEngine {
 ///
 /// The device's own default rate is preferred when the range allows it; the
 /// closest in-range rate to 48 kHz is the fallback.
+/// What the `[audio]` section asks of the local output device.
+///
+/// The mix and the network stream are always 48 kHz stereo (that is the wire
+/// format every listener decodes); these settings only choose how the desktop
+/// sound card is opened. A device that cannot do what is asked falls back to
+/// the next best mode, exactly as before, and the reason is logged and shown
+/// in the status strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevicePrefs {
+    /// Device sample rate to ask for, in Hz.
+    pub sample_rate: u32,
+    /// Device channel count to ask for (1 = mono downmix, 2 = stereo, more =
+    /// stereo plus a centre mix on the extra channels).
+    pub channels: u16,
+    /// Device buffer in frames; 0 lets the driver choose.
+    pub buffer_frames: u32,
+}
+
+impl Default for DevicePrefs {
+    fn default() -> Self {
+        Self {
+            sample_rate: TARGET_SAMPLE_RATE,
+            channels: TARGET_CHANNELS as u16,
+            buffer_frames: 480,
+        }
+    }
+}
+
+impl DevicePrefs {
+    /// Build from `[audio]`, replacing nonsense with the defaults (and
+    /// saying so in the log) instead of failing to open the device.
+    pub fn from_audio_config(audio: &crate::config::AudioConfig) -> Self {
+        let defaults = Self::default();
+        let sample_rate = if (8_000..=192_000).contains(&audio.sample_rate) {
+            audio.sample_rate
+        } else {
+            warn!(
+                "[audio] sample_rate = {} is out of range (8000-192000); using {}",
+                audio.sample_rate, defaults.sample_rate
+            );
+            defaults.sample_rate
+        };
+        let channels = if (1..=8).contains(&audio.channels) {
+            audio.channels
+        } else {
+            warn!(
+                "[audio] channels = {} is out of range (1-8); using {}",
+                audio.channels, defaults.channels
+            );
+            defaults.channels
+        };
+        let buffer_frames = match audio.buffer_size {
+            0 => 0,
+            n @ 64..=8192 => n as u32,
+            n => {
+                warn!(
+                    "[audio] buffer_size = {n} is out of range (0 or 64-8192); using {}",
+                    defaults.buffer_frames
+                );
+                defaults.buffer_frames
+            }
+        };
+        Self {
+            sample_rate,
+            channels,
+            buffer_frames,
+        }
+    }
+
+    fn buffer_size(&self) -> BufferSize {
+        match self.buffer_frames {
+            0 => BufferSize::Default,
+            n => BufferSize::Fixed(n),
+        }
+    }
+}
+
 fn preferred_rate(
     range: &SupportedStreamConfigRange,
     device_default: Option<&SupportedStreamConfig>,
+    wanted: u32,
 ) -> u32 {
     let min = range.min_sample_rate().0;
     let max = range.max_sample_rate().0;
 
+    if (min..=max).contains(&wanted) {
+        return wanted;
+    }
     match device_default {
         Some(default) if default.sample_rate().0 >= min && default.sample_rate().0 <= max => {
             default.sample_rate().0
@@ -1250,8 +1342,26 @@ fn preferred_rate(
 fn plan_output_config(
     supported: &[SupportedStreamConfigRange],
     device_default: Option<&SupportedStreamConfig>,
+    prefs: &DevicePrefs,
 ) -> Result<(SupportedStreamConfig, Option<String>), EngineError> {
-    // 1. Fast path: exactly the mix format, written straight through.
+    let configured =
+        (prefs.sample_rate, prefs.channels) != (TARGET_SAMPLE_RATE, TARGET_CHANNELS as u16);
+
+    // 0. Exactly what `[audio]` asks for (by default 48 kHz stereo f32, the
+    //    mix format, which is written straight through).
+    if let Some(range) = supported.iter().find(|candidate| {
+        candidate.channels() == prefs.channels
+            && candidate.sample_format() == SampleFormat::F32
+            && candidate.min_sample_rate().0 <= prefs.sample_rate
+            && candidate.max_sample_rate().0 >= prefs.sample_rate
+    }) {
+        return Ok((
+            (*range).with_sample_rate(SampleRate(prefs.sample_rate)),
+            None,
+        ));
+    }
+
+    // 1. The mix format, when the configured one is not available.
     if let Some(range) = supported.iter().find(|candidate| {
         candidate.channels() == TARGET_CHANNELS as u16
             && candidate.sample_format() == SampleFormat::F32
@@ -1260,7 +1370,12 @@ fn plan_output_config(
     }) {
         return Ok((
             (*range).with_sample_rate(SampleRate(TARGET_SAMPLE_RATE)),
-            None,
+            configured.then(|| {
+                format!(
+                    "device has no {} Hz {} ch f32 mode ([audio]); using 48 kHz stereo",
+                    prefs.sample_rate, prefs.channels
+                )
+            }),
         ));
     }
 
@@ -1269,7 +1384,7 @@ fn plan_output_config(
         candidate.channels() == TARGET_CHANNELS as u16
             && candidate.sample_format() == SampleFormat::F32
     }) {
-        let rate = preferred_rate(range, device_default);
+        let rate = preferred_rate(range, device_default, prefs.sample_rate);
         return Ok((
             (*range).with_sample_rate(SampleRate(rate)),
             Some(format!(
@@ -1584,6 +1699,56 @@ mod tests {
     /// 48 kHz stereo f32 config, return `UnsupportedFormat`, and drop the app to
     /// headless mode — the web UI kept playing while the desktop stayed silent.
     #[test]
+    fn plan_output_config_honours_the_audio_section() {
+        let supported = vec![
+            range(2, 44_100, 96_000, SampleFormat::F32),
+            range(1, 44_100, 96_000, SampleFormat::F32),
+        ];
+        let device_default = default_config(2, 48_000, SampleFormat::F32);
+        let prefs = DevicePrefs {
+            sample_rate: 44_100,
+            channels: 1,
+            buffer_frames: 256,
+        };
+        let (chosen, reason) =
+            plan_output_config(&supported, Some(&device_default), &prefs).unwrap();
+        assert_eq!(chosen.channels(), 1);
+        assert_eq!(chosen.sample_rate().0, 44_100);
+        assert!(reason.is_none());
+        assert_eq!(prefs.buffer_size(), BufferSize::Fixed(256));
+    }
+
+    #[test]
+    fn plan_output_config_says_why_the_audio_section_was_not_met() {
+        let supported = vec![range(2, 48_000, 48_000, SampleFormat::F32)];
+        let device_default = default_config(2, 48_000, SampleFormat::F32);
+        let prefs = DevicePrefs {
+            sample_rate: 96_000,
+            channels: 2,
+            buffer_frames: 0,
+        };
+        let (chosen, reason) =
+            plan_output_config(&supported, Some(&device_default), &prefs).unwrap();
+        assert_eq!(chosen.sample_rate().0, 48_000);
+        assert!(reason.unwrap().contains("96000 Hz"));
+        assert_eq!(prefs.buffer_size(), BufferSize::Default);
+    }
+
+    #[test]
+    fn device_prefs_replace_nonsense_with_defaults() {
+        let audio = crate::config::AudioConfig {
+            buffer_size: 3,
+            sample_rate: 1,
+            channels: 0,
+            master_volume: 0.8,
+        };
+        assert_eq!(
+            DevicePrefs::from_audio_config(&audio),
+            DevicePrefs::default()
+        );
+    }
+
+    #[test]
     fn plan_output_config_accepts_a_44100_only_device() {
         let supported = vec![
             range(2, 44_100, 44_100, SampleFormat::U8),
@@ -1593,8 +1758,9 @@ mod tests {
         ];
         let device_default = default_config(2, 44_100, SampleFormat::F32);
 
-        let (chosen, reason) = plan_output_config(&supported, Some(&device_default))
-            .expect("a 44.1 kHz device must still be opened, not rejected");
+        let (chosen, reason) =
+            plan_output_config(&supported, Some(&device_default), &DevicePrefs::default())
+                .expect("a 44.1 kHz device must still be opened, not rejected");
 
         assert_eq!(chosen.sample_rate().0, 44_100);
         assert_eq!(chosen.channels(), 2);
@@ -1614,7 +1780,8 @@ mod tests {
         ];
         let device_default = default_config(2, 44_100, SampleFormat::F32);
 
-        let (chosen, reason) = plan_output_config(&supported, Some(&device_default)).unwrap();
+        let (chosen, reason) =
+            plan_output_config(&supported, Some(&device_default), &DevicePrefs::default()).unwrap();
 
         assert_eq!(chosen.sample_rate().0, TARGET_SAMPLE_RATE);
         assert!(reason.is_none(), "the mix format needs no conversion");
@@ -1625,7 +1792,8 @@ mod tests {
     fn plan_output_config_accepts_a_rate_range_containing_48k() {
         let supported = vec![range(2, 44_100, 96_000, SampleFormat::F32)];
 
-        let (chosen, reason) = plan_output_config(&supported, None).unwrap();
+        let (chosen, reason) =
+            plan_output_config(&supported, None, &DevicePrefs::default()).unwrap();
 
         assert_eq!(chosen.sample_rate().0, TARGET_SAMPLE_RATE);
         assert!(reason.is_none());
@@ -1637,7 +1805,8 @@ mod tests {
         let supported = vec![range(6, 48_000, 48_000, SampleFormat::I16)];
         let device_default = default_config(6, 48_000, SampleFormat::I16);
 
-        let (chosen, reason) = plan_output_config(&supported, Some(&device_default)).unwrap();
+        let (chosen, reason) =
+            plan_output_config(&supported, Some(&device_default), &DevicePrefs::default()).unwrap();
 
         assert_eq!(chosen.channels(), 6);
         assert_eq!(chosen.sample_format(), SampleFormat::I16);
@@ -1648,7 +1817,8 @@ mod tests {
     fn plan_output_config_uses_the_default_when_nothing_is_listed() {
         let device_default = default_config(2, 44_100, SampleFormat::F32);
 
-        let (chosen, reason) = plan_output_config(&[], Some(&device_default)).unwrap();
+        let (chosen, reason) =
+            plan_output_config(&[], Some(&device_default), &DevicePrefs::default()).unwrap();
 
         assert_eq!(chosen.sample_rate().0, 44_100);
         assert!(reason.is_some());
@@ -1656,7 +1826,7 @@ mod tests {
 
     #[test]
     fn plan_output_config_fails_only_without_any_config() {
-        assert!(plan_output_config(&[], None).is_err());
+        assert!(plan_output_config(&[], None, &DevicePrefs::default()).is_err());
     }
 
     // --- mix → device conversions -------------------------------------------

@@ -238,9 +238,74 @@ fn adapter_addresses() -> Vec<IpAddr> {
 /// filter still keep TUN addresses out of the published URL, which is what this
 /// module exists for. Reading the table elsewhere would need libc getifaddrs,
 /// and this app ships for Windows.
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn adapter_addresses() -> Vec<IpAddr> {
+    unix::interface_addresses()
+}
+
+#[cfg(not(any(windows, unix)))]
 fn adapter_addresses() -> Vec<IpAddr> {
     Vec::new()
+}
+
+/// Interface addresses on Linux / macOS / BSD via `getifaddrs`.
+///
+/// Without it only the route probe was available there, which picks the VPN
+/// or Docker adapter whenever that owns the default route; the adapter list
+/// lets the scoring prefer the real LAN address, as on Windows.
+#[cfg(unix)]
+mod unix {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    pub fn interface_addresses() -> Vec<IpAddr> {
+        let mut found = Vec::new();
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        // SAFETY: getifaddrs allocates a linked list into `head`, released
+        // with freeifaddrs below; nothing is kept past that.
+        if unsafe { libc::getifaddrs(&mut head) } != 0 {
+            return found;
+        }
+        let mut cursor = head;
+        while !cursor.is_null() {
+            // SAFETY: `cursor` is a node of the list returned above.
+            let ifa = unsafe { &*cursor };
+            cursor = ifa.ifa_next;
+
+            let flags = ifa.ifa_flags as libc::c_uint;
+            let up = flags & (libc::IFF_UP as libc::c_uint) != 0;
+            let loopback = flags & (libc::IFF_LOOPBACK as libc::c_uint) != 0;
+            if !up || loopback || ifa.ifa_addr.is_null() {
+                continue;
+            }
+            // SAFETY: ifa_addr is non-null and points at a sockaddr whose
+            // family tells which concrete type it is.
+            let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
+            if family == libc::AF_INET {
+                // SAFETY: family AF_INET means a sockaddr_in.
+                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                found.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                    sin.sin_addr.s_addr,
+                ))));
+            } else if family == libc::AF_INET6 {
+                // SAFETY: family AF_INET6 means a sockaddr_in6.
+                let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                found.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+            }
+        }
+        // SAFETY: `head` came from getifaddrs and is freed exactly once.
+        unsafe { libc::freeifaddrs(head) };
+        found
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn lists_without_loopback() {
+            for ip in super::interface_addresses() {
+                assert!(!ip.is_loopback(), "{ip}");
+            }
+        }
+    }
 }
 
 /// Minimal GetAdaptersAddresses binding.

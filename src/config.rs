@@ -44,6 +44,13 @@ pub struct ServerConfig {
     /// reachable from the global IP. Enabled by default.
     #[serde(default = "default_upnp")]
     pub upnp: bool,
+
+    /// Key players need in the link (`/?k=…`) to hear the stream.
+    ///
+    /// Generated on first start when missing. Set it to `""` to let anyone
+    /// who can reach the port listen (not recommended with UPnP on).
+    #[serde(default)]
+    pub access_token: Option<String>,
 }
 
 /// Audio engine configuration
@@ -157,7 +164,9 @@ fn default_upnp() -> bool {
 }
 
 fn default_buffer_size() -> usize {
-    1024
+    // 10 ms at 48 kHz: what the engine always asked for before this setting
+    // was applied.
+    480
 }
 
 fn default_sample_rate() -> u32 {
@@ -187,6 +196,7 @@ impl Default for ServerConfig {
             port: default_port(),
             host: default_host(),
             upnp: default_upnp(),
+            access_token: None,
         }
     }
 }
@@ -314,12 +324,24 @@ mod tests {
         dir.join(format!("{}-{}.toml", name, std::process::id()))
     }
 
+    /// The commented config.toml shipped in the release archives must load,
+    /// and must not carry an access key (each install generates its own).
+    #[test]
+    fn shipped_example_config_loads() {
+        let config: Config = toml::from_str(include_str!("../packaging/config.toml"))
+            .expect("packaging/config.toml");
+        assert_eq!(config.server.port, 8080);
+        assert!(config.server.access_token.is_none());
+        assert_eq!(config.audio.buffer_size, 480);
+        assert!(config.library.sounds.is_empty());
+    }
+
     #[test]
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.host, "0.0.0.0");
-        assert_eq!(config.audio.buffer_size, 1024);
+        assert_eq!(config.audio.buffer_size, 480);
         assert_eq!(config.audio.sample_rate, 48000);
         assert_eq!(config.audio.channels, 2);
         assert_eq!(config.audio.master_volume, 0.8);

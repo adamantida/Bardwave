@@ -2,7 +2,7 @@
 
 pub use axum::response::{Html, Response};
 pub use axum::{
-    extract::{State, WebSocketUpgrade},
+    extract::{Query, State, WebSocketUpgrade},
     http::{header, StatusCode},
     response::{IntoResponse, Json},
     routing::get,
@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 pub use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
+use crate::network::access::{AccessGuard, KEY_PARAM};
 use crate::network::broadcast::{
     AudioBroadcaster, BroadcastError, BroadcasterConfig, BroadcasterHandle,
 };
@@ -53,6 +54,8 @@ pub struct ServerConfig {
     pub broadcaster_config: BroadcasterConfig,
     /// WebSocket configuration
     pub websocket_config: WebSocketConfig,
+    /// Access key for the stream (open by default)
+    pub access: AccessGuard,
 }
 
 impl Default for ServerConfig {
@@ -63,6 +66,7 @@ impl Default for ServerConfig {
             upnp: true,
             broadcaster_config: BroadcasterConfig::default(),
             websocket_config: WebSocketConfig::default(),
+            access: AccessGuard::default(),
         }
     }
 }
@@ -113,6 +117,8 @@ pub struct ServerState {
     /// open, which used to leave the console reporting "Live" after Stop server
     /// and froze the whole server thread.
     pub shutdown_tx: broadcast::Sender<()>,
+    /// Access key the audio WebSocket and the status API require.
+    pub access: AccessGuard,
 }
 
 /// Build the router that serves the listener page, the status API and the audio
@@ -178,6 +184,7 @@ impl NetworkServer {
             broadcaster: broadcaster_handle.clone(),
             websocket_config: self.config.websocket_config.clone(),
             shutdown_tx: shutdown_tx.clone(),
+            access: self.config.access.clone(),
         };
         let app = build_router(state);
 
@@ -249,8 +256,33 @@ impl NetworkServer {
     }
 }
 
+/// Reply for a request without a valid access key.
+fn access_denied() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "status": "unauthorized",
+            "message": "access key missing or outdated"
+        })),
+    )
+        .into_response()
+}
+
 /// REST API: GET /api/status
-pub async fn api_status(State(state): State<ServerState>) -> impl IntoResponse {
+///
+/// Guarded by the access key like the stream: the listener page calls it
+/// first, so a missing or outdated key is reported as such instead of as an
+/// endless reconnect loop.
+pub async fn api_status(
+    State(state): State<ServerState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !state
+        .access
+        .allows(query.get(KEY_PARAM).map(String::as_str))
+    {
+        return access_denied();
+    }
     let listener_count = state.broadcaster.listener_count().await;
 
     let status = serde_json::json!({
@@ -264,7 +296,7 @@ pub async fn api_status(State(state): State<ServerState>) -> impl IntoResponse {
         }
     });
 
-    Json(status)
+    Json(status).into_response()
 }
 
 /// Static file handlers using embedded file contents
@@ -310,8 +342,18 @@ pub async fn serve_opus_decoder_js() -> impl IntoResponse {
 }
 
 /// WebSocket handler: GET /ws/audio
-pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
+pub async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<ServerState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
     info!("🔌 WebSocket upgrade requested at /ws/audio");
+    let key = query.get(KEY_PARAM).cloned();
+    if !state.access.allows(key.as_deref()) {
+        tracing::warn!("🔌 Listener rejected: access key missing or wrong");
+        return access_denied();
+    }
+    let revocation = Some((state.access.subscribe(), key));
     // The configured frame limit used to be ignored here, so the library
     // default applied no matter what WebSocketConfig said.
     let ws = ws.max_message_size(state.websocket_config.max_message_size);
@@ -324,6 +366,7 @@ pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<ServerS
             state.broadcaster,
             state.websocket_config,
             shutdown_rx,
+            revocation,
         )
     })
 }

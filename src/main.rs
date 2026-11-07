@@ -135,13 +135,16 @@ async fn start_listener(
         // Opus packets are ~100 bytes every 10 ms: with Nagle's algorithm on,
         // Windows holds them back and sends bursts, which drains the
         // listener's jitter buffer and makes the stream stutter.
-        let _ = axum::serve(listener, app_clone)
-            .tcp_nodelay(true)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx_for_server.recv().await;
-                info!("🌐 Shutdown signal received, stopping server...");
-            })
-            .await;
+        let _ = axum::serve(
+            listener,
+            app_clone.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .tcp_nodelay(true)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx_for_server.recv().await;
+            info!("🌐 Shutdown signal received, stopping server...");
+        })
+        .await;
         info!("🌐 Server task ended");
     });
 
@@ -175,6 +178,7 @@ fn run_server_and_get_handle(
     server_handle_tx: Sender<ServerHandle>,
     upnp_status: Arc<Mutex<UpnpStatus>>,
     network_notes: Arc<Mutex<Vec<String>>>,
+    extra_routes: Option<Router>,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -207,9 +211,13 @@ fn run_server_and_get_handle(
             broadcaster: broadcaster_handle.clone(),
             websocket_config: config.websocket_config.clone(),
             shutdown_tx: shutdown_tx.clone(),
+            access: config.access.clone(),
         };
 
-        let app = build_router(state);
+        let app = match extra_routes {
+            Some(routes) => build_router(state).merge(routes),
+            None => build_router(state),
+        };
 
         // Create server handle (URL is None until Start command)
         let shutdown_tx_for_handle = shutdown_tx.clone();
@@ -464,17 +472,17 @@ fn main() -> Result<()> {
         }
     }));
 
-    attach_parent_console();
-
     // Check for --server-only flag to run without GUI
     let args: Vec<String> = std::env::args().collect();
     let server_only = args.iter().any(|a| a == "--server-only");
+
+    attach_parent_console(server_only);
 
     // Load configuration. A broken config.toml used to end the process
     // silently (there is no console to print to), which looked like the app
     // simply refusing to start. Say what is wrong instead; never fall back to
     // defaults here, because the next save would overwrite the library.
-    let config = match Config::load() {
+    let mut config = match Config::load() {
         Ok(config) => config,
         Err(e) => {
             if !server_only {
@@ -501,6 +509,20 @@ fn main() -> Result<()> {
     // Initialize logging
     init_logging(&config)?;
 
+    // The stream is guarded by an access key carried in the shared link. A
+    // config without one gets a fresh key (and keeps it); `access_token = ""`
+    // explicitly opens the stream to anyone who can reach the port.
+    if config.server.access_token.is_none() {
+        config.server.access_token = Some(soundshared::network::generate_key());
+        if let Err(e) = config.save() {
+            warn!("Could not save the new access key to config.toml: {}", e);
+        }
+    }
+    let access = soundshared::network::AccessGuard::new(config.server.access_token.clone());
+    if access.current().is_none() {
+        warn!("Listener stream is open: access_token is empty in config.toml");
+    }
+
     info!("Starting SoundShared v{}", soundshared::VERSION);
 
     // Create channels for inter-component communication
@@ -523,6 +545,12 @@ fn main() -> Result<()> {
             SoundSharedError::Audio(soundshared::error::AudioError::Mixer(e.to_string()))
         })?;
 
+    // `[audio]`: how the desktop sound card is opened (the mix and the network
+    // stream stay 48 kHz stereo).
+    audio_engine.set_device_prefs(soundshared::audio::engine::DevicePrefs::from_audio_config(
+        &config.audio,
+    ));
+
     // Get the broadcast output receiver for WebSocket streaming
     let broadcast_output_rx = audio_engine.broadcast_output_receiver();
 
@@ -539,6 +567,7 @@ fn main() -> Result<()> {
         upnp: config.server.upnp,
         broadcaster_config: BroadcasterConfig::default(),
         websocket_config: WebSocketConfig::default(),
+        access: access.clone(),
     };
 
     // Create shared app state (for GUI)
@@ -547,7 +576,8 @@ fn main() -> Result<()> {
         server_cmd_tx,
         Arc::new(Mutex::new(0)),
         Arc::new(Mutex::new(config.clone())),
-    );
+    )
+    .with_access(access.clone());
 
     // Spawn server thread (does NOT auto-start - waits for Start command from GUI).
     // The thread learns about process shutdown from its own Stop command / the
@@ -559,6 +589,11 @@ fn main() -> Result<()> {
     let server_handle_tx_clone = server_handle_tx.clone();
     let upnp_status = app_state.upnp_status.clone();
     let network_notes = app_state.network_notes.clone();
+    // `--server-only` has no console window: the library is played through a
+    // local control page instead (see network::control).
+    let (control_tx, control_rx) =
+        crossbeam_channel::unbounded::<soundshared::network::control::ControlCommand>();
+    let control_routes = server_only.then(|| soundshared::network::control::router(control_tx));
     thread::spawn(move || {
         if let Err(e) = run_server_and_get_handle(
             server_config_clone,
@@ -567,6 +602,7 @@ fn main() -> Result<()> {
             server_handle_tx_clone,
             upnp_status,
             network_notes,
+            control_routes,
         ) {
             error!("Server error: {}", e);
         }
@@ -626,6 +662,14 @@ fn main() -> Result<()> {
     if server_only {
         info!("Running in server-only mode (no GUI). Press Ctrl+C to stop.");
 
+        // Load the saved library so there is something to play.
+        let mut board = {
+            let guard = audio_engine_shared.lock().unwrap();
+            let engine = guard.as_ref().expect("audio engine");
+            soundshared::network::control::Board::load(engine, &config.library)
+        };
+        info!("Library loaded: {} sound(s)", board.len());
+
         // There is no GUI to press "Start", so start the listener server here.
         let (response_tx, response_rx) = bounded::<anyhow::Result<String>>(1);
         if let Err(e) = server_cmd_tx_for_start.send(ServerCommand::Start {
@@ -634,7 +678,12 @@ fn main() -> Result<()> {
             error!("Failed to request server start: {}", e);
         } else {
             match response_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok(url)) => info!("Listener server available at {}", url),
+                Ok(Ok(url)) => {
+                    info!("Listener server available at {}", access.share_url(&url));
+                    if let Some(local) = soundshared::network::loopback_url(&url) {
+                        info!("Control page (this PC only): {local}/control");
+                    }
+                }
                 Ok(Err(e)) => error!("Failed to start listener server: {}", e),
                 Err(e) => error!("Timed out waiting for listener server to start: {}", e),
             }
@@ -648,7 +697,22 @@ fn main() -> Result<()> {
         })
         .expect("Error setting Ctrl+C handler");
 
-        let _ = ctrlc_rx.recv();
+        // Run control actions on this thread (the engine is not Send) until
+        // Ctrl+C.
+        loop {
+            crossbeam_channel::select! {
+                recv(ctrlc_rx) -> _ => break,
+                recv(control_rx) -> command => {
+                    let Ok(command) = command else { break };
+                    let guard = audio_engine_shared.lock().unwrap();
+                    let result = match guard.as_ref() {
+                        Some(engine) => board.handle(engine, command.action),
+                        None => Err("audio engine stopped".to_string()),
+                    };
+                    let _ = command.reply.send(result);
+                }
+            }
+        }
 
         info!("Shutting down...");
         stop_server_and_wait(&server_cmd_tx_for_start);
@@ -778,19 +842,26 @@ impl std::io::Write for TeeWriter {
 /// The release build uses the GUI subsystem (no console window of its own),
 /// so `soundshared.exe --server-only` started from cmd/PowerShell would
 /// otherwise print nothing at all.
+///
+/// `--server-only` started from Explorer or a shortcut has no terminal at all;
+/// it gets a console window of its own, so the log (and Ctrl+C to stop) is
+/// there.
 #[cfg(all(windows, not(debug_assertions)))]
-fn attach_parent_console() {
+fn attach_parent_console(server_only: bool) {
     #[link(name = "kernel32")]
     extern "system" {
         fn AttachConsole(process_id: u32) -> i32;
+        fn AllocConsole() -> i32;
     }
     const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
-    // SAFETY: plain Win32 call without pointers; failure (no parent console)
+    // SAFETY: plain Win32 calls without pointers; failure (no parent console)
     // is harmless and simply leaves the process without a console.
     unsafe {
-        AttachConsole(ATTACH_PARENT_PROCESS);
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 && server_only {
+            AllocConsole();
+        }
     }
 }
 
 #[cfg(not(all(windows, not(debug_assertions))))]
-fn attach_parent_console() {}
+fn attach_parent_console(_server_only: bool) {}

@@ -187,6 +187,30 @@ impl WireEncoder {
         self.primed = false;
     }
 
+    /// Pad the carried partial frame with silence and encode it.
+    ///
+    /// Called when the stream pauses. Without it the last few milliseconds
+    /// of every sound stayed in the reblocker until the next sound started
+    /// (and were then thrown away), so the end of a one-shot never reached
+    /// the listeners. Returns the number of packets appended (0 or 1).
+    pub fn flush(&mut self, out: &mut Vec<Vec<u8>>) -> usize {
+        if self.remainder.is_empty() {
+            return 0;
+        }
+        let mut block = std::mem::take(&mut self.remainder);
+        block.resize(WIRE_FRAME_SAMPLES, 0.0);
+        let encoded = match self.encode_block(&block) {
+            Some(packet) => {
+                out.push(packet);
+                1
+            }
+            None => 0,
+        };
+        block.clear();
+        self.remainder = block;
+        encoded
+    }
+
     /// Discard a partial frame that is too old to ever be completed.
     ///
     /// The engine publishes nothing while nothing plays, so after a pause the
@@ -228,6 +252,24 @@ impl Default for WireEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tail of a sound (less than one 10 ms frame) is padded and sent
+    /// when the stream pauses, instead of waiting for the next sound.
+    #[test]
+    fn flush_sends_the_partial_tail() {
+        let mut encoder = WireEncoder::new();
+        let mut out = Vec::new();
+        // 1.5 frames: one packet now, half a frame carried.
+        encoder.push(&vec![0.25f32; WIRE_FRAME_SAMPLES * 3 / 2], &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(encoder.buffered_samples(), WIRE_FRAME_SAMPLES / 2);
+
+        assert_eq!(encoder.flush(&mut out), 1);
+        assert_eq!(out.len(), 2);
+        assert_eq!(encoder.buffered_samples(), 0);
+        // Nothing left to flush.
+        assert_eq!(encoder.flush(&mut out), 0);
+    }
 
     /// 48 kHz sine, stereo, `frames` frames long, starting at `phase` (radians).
     fn sine(frames: usize, hz: f64, amplitude: f32, phase: f64) -> (Vec<f32>, f64) {

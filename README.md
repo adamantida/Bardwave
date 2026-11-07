@@ -58,6 +58,7 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 - Low-latency: small mixing buffers, compact binary frames
 - Browser listener page is **embedded in the binary**, so there is no static folder to ship
 - **Live listener counter** in the console
+- **Access key** in the shared link, and a **per-player volume** slider on the listener page
 - Automatic local address detection that ignores VPN/TUN adapters
 - Graceful start/stop that does not leave the server thread hung
 
@@ -124,13 +125,22 @@ On **Start** the console asks your router to forward the port to this PC (UPnP I
 
 The LISTEN URL is click-to-copy. Players open it, hit **Establish Link**, and the stream starts.
 
+#### Access key
+
+Every link the console copies ends with `/?k=<key>`: the stream (and `/api/status`) refuse connections without it, so an open port does not mean anyone on the internet can listen. The key is generated on first start and kept in `config.toml` (`[server] access_token`). The ⟳ button next to **Access key** in the SERVER panel issues a new one: the old link stops working at once and everyone who joined with it is disconnected — share the new link afterwards. `access_token = ""` turns the check off.
+
 ### Headless
 
 ```bash
 soundshared.exe --server-only
 ```
 
-> ⚠️ The current `--server-only` mode starts the HTTP/WebSocket server but has no console to load sounds, so it broadcasts silence. It is useful for protocol and network testing, not for a session. Planned to be finished — see [Roadmap](#roadmap).
+Runs without the console window, for a spare PC next to the router or a session you drive from a phone-sized screen. The saved library (`[library]` in `config.toml`, i.e. whatever you set up in the console) is loaded at start, the listener server starts at once, and the log shows both links:
+
+- the **player link** (with the access key) to share, as in the console;
+- a **control page**, `http://127.0.0.1:<port>/control`: play/stop, repeat and volume for every sound, master volume and *Stop all*.
+
+The control page only answers on the machine that runs Bardwave (players reach the same port over the network and must not get the GM's buttons). Started from Explorer or a shortcut, the server opens a console window with its log; close it or press Ctrl+C to stop.
 
 ## Configuration
 
@@ -141,11 +151,12 @@ soundshared.exe --server-only
 host = "0.0.0.0"   # bind address; "0.0.0.0" = all IPv4 interfaces
 port = 8080
 upnp = true        # ask the router to forward the port for players outside the LAN
+access_token = "…" # key players need in the link (/?k=…); generated on first start, "" = open
 
 [audio]
-buffer_size = 1024 # samples per channel
-sample_rate = 48000
-channels = 2
+buffer_size = 480  # device buffer in frames (480 = 10 ms); 0 = driver default
+sample_rate = 48000 # device rate to ask for; the mix and the stream stay 48 kHz
+channels = 2        # device channels: 1 = mono downmix, 2 = stereo
 master_volume = 0.8
 
 [logging]
@@ -186,7 +197,7 @@ Because players hear the **mix** and not the files, you can edit, replace or re-
 │                                          │                  │
 │                              axum HTTP + WebSocket          │
 └──────────────────────────────────────────┼──────────────────┘
-                                           │ ws://<lan-ip>:8080/ws
+                                           │ ws://<lan-ip>:8080/ws/audio?k=<key>
                           ┌────────────────┼────────────────┐
                           ▼                ▼                ▼
                      🧝 browser        🧙 browser       🧟 browser
@@ -213,7 +224,7 @@ The broadcaster encodes the 48 kHz / stereo f32 mix to Opus before sending it ov
 **Format announcement (text WebSocket message, sent on first frame):**
 
 ```json
-{"type":"data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":480}}
+{"type":"format","data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":480}}
 ```
 
 **Client decode:** The browser listener decodes each Opus packet with the bundled `opus-decoder` WASM module, which returns per-channel `Float32Array`s (`channelData`). The listener interleaves them into a single stereo buffer before pushing to the Web Audio ring buffer.
@@ -241,11 +252,9 @@ To retry a failed release, run it by hand: Actions → **Release** → **Run wor
 
 Honest list of what is **not** done yet — this is an early build, not a finished competitor:
 
-- [ ] Apply `[audio]` sample rate / channels / buffer size from the config (only master volume is wired up today)
-- [ ] A working `--server-only` mode that can load a library
 - [ ] Cross-platform local-IP detection (macOS/Linux)
-- [ ] Crossfade between scenes; per-listener volume control
-- [ ] Packaging: installer, portable build, maybe a Steam/itch release
+- [ ] Crossfade between scenes
+- [ ] Packaging: an installer, a macOS build, maybe a Steam/itch release (releases already ship a portable Windows zip and a Linux tar.gz, each with a commented `config.toml`)
 
 Ideas, bug reports and pull requests are welcome.
 

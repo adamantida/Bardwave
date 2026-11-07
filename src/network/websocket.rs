@@ -2,7 +2,7 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -57,6 +57,9 @@ pub struct WebSocketSession {
     msg_tx: mpsc::Sender<Message>,
     /// Receiver for messages to send
     msg_rx: mpsc::Receiver<Message>,
+    /// Access-key changes, and the key this listener connected with: when the
+    /// GM issues a new key, sessions on the old one are closed.
+    revocation: Option<(watch::Receiver<Option<String>>, Option<String>)>,
 }
 
 impl WebSocketSession {
@@ -78,7 +81,18 @@ impl WebSocketSession {
             shutdown_rx,
             msg_tx,
             msg_rx,
+            revocation: None,
         }
+    }
+
+    /// Close this session when the access key changes away from `own_key`.
+    pub fn with_revocation(
+        mut self,
+        keys: watch::Receiver<Option<String>>,
+        own_key: Option<String>,
+    ) -> Self {
+        self.revocation = Some((keys, own_key));
+        self
     }
 
     /// Get session ID
@@ -136,9 +150,35 @@ impl WebSocketSession {
 
         // Note: axum's WebSocket doesn't have split() so we handle both in one loop
         let mut interval = tokio::time::interval(self.config.ping_interval);
+        let mut revocation = self.revocation.take();
 
         loop {
             tokio::select! {
+                // The GM issued a new access key: a listener on the old key is
+                // disconnected (with a code the page explains) instead of
+                // keeping a leaked link alive until it reconnects.
+                changed = async {
+                    match revocation.as_mut() {
+                        Some((keys, _)) => keys.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Some((keys, own)) = revocation.as_ref() else { continue };
+                    if changed.is_err() {
+                        revocation = None;
+                        continue;
+                    }
+                    let current = keys.borrow().clone();
+                    if current.is_some() && current != *own {
+                        info!("🔌 Access key changed, closing session {}", self.id);
+                        self.close_gracefully(Some(axum::extract::ws::CloseFrame {
+                            code: crate::network::access::CLOSE_KEY_REVOKED,
+                            reason: "access key changed".into(),
+                        }))
+                        .await;
+                        break;
+                    }
+                }
                 // Outgoing: messages from broadcaster -> WebSocket
                 Some(msg) = self.msg_rx.recv() => {
                     debug!("🔌 Sending message to client: {:?}", msg);
@@ -188,13 +228,33 @@ impl WebSocketSession {
                 // actually finish.
                 _ = self.shutdown_rx.recv() => {
                     info!("🔌 Server shutting down, closing session {}", self.id);
-                    let _ = self.ws.send(Message::Close(None)).await;
+                    self.close_gracefully(None).await;
                     break;
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Send a Close frame and wait (briefly) for the client's reply.
+    ///
+    /// Dropping the socket right after sending Close resets the connection on
+    /// Windows, and the reset discards the Close frame on its way to the
+    /// browser — the page then sees a plain network error instead of the code
+    /// that tells it why (e.g. a revoked access key).
+    async fn close_gracefully(&mut self, frame: Option<axum::extract::ws::CloseFrame<'static>>) {
+        if self.ws.send(Message::Close(frame)).await.is_err() {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(Ok(message)) = self.ws.recv().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        })
+        .await;
     }
 
     /// Handle incoming text messages (control messages from client)
@@ -242,9 +302,13 @@ pub async fn handle_websocket_upgrade(
     broadcaster: BroadcasterHandle,
     config: WebSocketConfig,
     shutdown_rx: broadcast::Receiver<()>,
+    revocation: Option<(watch::Receiver<Option<String>>, Option<String>)>,
 ) {
     info!("🔌 New WebSocket connection from client");
-    let session = WebSocketSession::new(ws, broadcaster, config, shutdown_rx);
+    let mut session = WebSocketSession::new(ws, broadcaster, config, shutdown_rx);
+    if let Some((keys, own)) = revocation {
+        session = session.with_revocation(keys, own);
+    }
 
     if let Err(e) = session.run().await {
         warn!("🔌 WebSocket session error: {}", e);

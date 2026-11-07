@@ -1,0 +1,22 @@
+# Bardwave settings. Keep this file next to the program (Bardwave.exe).
+# Every key is optional; the app writes the rest (library, access key) itself.
+
+[server]
+host = "0.0.0.0"   # bind address; "0.0.0.0" = every IPv4 network of this PC
+port = 8080
+upnp = true        # ask the router to open the port for players outside the LAN
+# access_token is generated on the first start: players need it in the link
+# (http://<address>:8080/?k=<key>). Set it to "" to let anyone listen.
+
+[audio]
+buffer_size = 480  # sound-card buffer in frames (480 = 10 ms); 0 = driver default
+sample_rate = 48000 # sound-card rate to ask for; the stream itself is always 48 kHz
+channels = 2       # sound-card channels: 1 = mono, 2 = stereo
+master_volume = 0.8
+
+[logging]
+level = "info"      # trace | debug | info | warn | error
+file_logging = false # true: also write bardwave.log next to the program
+
+[gui]
+reduce_motion = false # stop the pulsing dot and backdrop animation

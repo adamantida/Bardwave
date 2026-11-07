@@ -79,3 +79,7 @@ backtrace = { workspace = true }
 ctrlc = { workspace = true }
 socket2 = { workspace = true }
 roxmltree = { workspace = true }
+
+# getifaddrs for LAN address detection on Linux / macOS
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

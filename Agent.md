@@ -25,7 +25,7 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 │                                          │                  │
 │                              axum HTTP + WebSocket          │
 └──────────────────────────────────────────┼──────────────────┘
-                                           │ ws://<lan-ip>:8080/ws
+                                           │ ws://<lan-ip>:8080/ws/audio?k=<key>
                                   ┌────────┼────────┐
                                   ▼        ▼        ▼
                               🧝 browser  🧙 browser  🧟 browser
@@ -150,9 +150,10 @@ cargo run --release
 host = "0.0.0.0"
 port = 8080
 upnp = true
+access_token = "..."   # key listeners need in the link (/?k=...); "" = open
 
 [audio]
-buffer_size = 1024
+buffer_size = 480
 sample_rate = 48000
 channels = 2
 master_volume = 0.8
@@ -185,7 +186,7 @@ reduce_motion = false
 
 **Format announcement (text message on first frame):**
 ```json
-{"type":"data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":480}}
+{"type":"format","data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":480}}
 ```
 
 ---

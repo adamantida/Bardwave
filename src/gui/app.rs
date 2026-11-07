@@ -769,6 +769,26 @@ impl SoundSharedApp {
         }
     }
 
+    /// `url` as players need it: with the access key appended.
+    pub fn share_url(&self, url: &str) -> String {
+        self.app_state.access.share_url(url)
+    }
+
+    /// The stream's access key, if one is required.
+    pub fn access_key(&self) -> Option<String> {
+        self.app_state.access.current()
+    }
+
+    /// Issue a new access key: the old link stops working at once and its
+    /// listeners are disconnected. Saved with the next config flush.
+    pub fn regenerate_access_key(&mut self) {
+        let key = crate::network::generate_key();
+        self.app_state.access.set(Some(key.clone()));
+        self.app_state.config.lock().unwrap().server.access_token = Some(key);
+        self.library_dirty = true;
+        info!("Issued a new listener access key");
+    }
+
     /// Live output level for the MASTER OUTPUT strip (0..1).
     pub fn output_meter(&self) -> f32 {
         self.output_meter

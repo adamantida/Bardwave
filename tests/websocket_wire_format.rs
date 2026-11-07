@@ -22,6 +22,7 @@ async fn websocket_audio_frame_has_eight_byte_header_and_opus_payload() {
         broadcaster: broadcaster.clone(),
         websocket_config: WebSocketConfig::default(),
         shutdown_tx,
+        access: Default::default(),
     };
 
     // The router the app actually serves, so this test covers the real routes.
@@ -110,6 +111,7 @@ async fn late_listener_receives_the_stream_format() {
         broadcaster: broadcaster.clone(),
         websocket_config: WebSocketConfig::default(),
         shutdown_tx,
+        access: Default::default(),
     };
     let app = build_router(state);
 
@@ -163,6 +165,7 @@ async fn server_shutdown_closes_listener_sessions() {
         broadcaster: broadcaster.clone(),
         websocket_config: WebSocketConfig::default(),
         shutdown_tx: shutdown_tx.clone(),
+        access: Default::default(),
     };
     let app = build_router(state);
 
@@ -197,5 +200,69 @@ async fn server_shutdown_closes_listener_sessions() {
     assert!(closed, "the session must close when the server stops");
     let _ = ws.close(None).await;
     // The plain test server keeps accepting, so it is detached, not awaited.
+    server.abort();
+}
+
+/// The stream (and the status API) require the access key from the shared
+/// link; a new key disconnects listeners that joined with the old one.
+#[tokio::test]
+async fn access_key_guards_the_stream_and_revokes_old_links() {
+    use soundshared::network::AccessGuard;
+
+    let (broadcaster, broadcaster_task) = AudioBroadcaster::new(BroadcasterConfig::default());
+    tokio::spawn(broadcaster_task.run());
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let access = AccessGuard::new(Some("secret42".into()));
+    let state = ServerState {
+        broadcaster,
+        websocket_config: WebSocketConfig::default(),
+        shutdown_tx,
+        access: access.clone(),
+    };
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // No key, wrong key: refused before the upgrade.
+    for url in [
+        format!("ws://{addr}/ws/audio"),
+        format!("ws://{addr}/ws/audio?k=wrong"),
+    ] {
+        match tokio_tungstenite::connect_async(url).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), 401)
+            }
+            other => panic!("expected 401, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    // The right key connects.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/audio?k=secret42"))
+        .await
+        .expect("connect with key");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A new key closes that session with the "key revoked" code.
+    access.set(Some("fresh77".into()));
+    let mut close_code = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                close_code = frame.map(|f| u16::from(f.code));
+                break;
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    assert_eq!(close_code, Some(4001));
+
     server.abort();
 }

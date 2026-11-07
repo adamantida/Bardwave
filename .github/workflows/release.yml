@@ -124,7 +124,9 @@ jobs:
           $dir = "Bardwave-$env:TAG-${{ matrix.name }}"
           New-Item -ItemType Directory -Path $dir | Out-Null
           Copy-Item target/release/soundshared.exe "$dir/Bardwave.exe"
-          Copy-Item README.md, LICENSE $dir
+          # A commented config.toml next to the exe (the access key is generated
+          # on first start) and a short plain-text quick start.
+          Copy-Item README.md, LICENSE, packaging/config.toml, packaging/README.txt $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -134,7 +136,7 @@ jobs:
           dir="Bardwave-$TAG-${{ matrix.name }}"
           mkdir "$dir"
           cp target/release/soundshared "$dir/bardwave"
-          cp README.md LICENSE "$dir/"
+          cp README.md LICENSE packaging/config.toml packaging/README.txt "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
 

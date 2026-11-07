@@ -154,6 +154,17 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         this.lastL = 0;
         this.lastR = 0;
 
+        // End-of-stream detection. The server sends nothing while nothing
+        // plays, so a short one-shot (shorter than the target pre-buffer)
+        // never filled the queue far enough to start: it sat silent until
+        // the *next* sound pushed the queue over the target, and then both
+        // played back to back. Once no packet has arrived for idleFrames the
+        // stream has paused: whatever is queued is played out right away and
+        // to the very end ("draining"), instead of waiting or rebuffering.
+        this.idleFrames = Math.floor(this.sampleRate * 0.12);
+        this.sincePush = 0;
+        this.draining = false;
+
         this.underruns = 0;
         this.overruns = 0;
         this.resyncs = 0;
@@ -207,6 +218,8 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         if (frames <= 0) return;
 
         this.receivedFrames += frames;
+        this.sincePush = 0;
+        this.draining = false;
 
         // Jumbo packet guard: one packet larger than the whole ring would
         // wrap the write past its own head. Drop the oldest part of it.
@@ -284,6 +297,8 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         this.speed = 1;
         this.lastL = 0;
         this.lastR = 0;
+        this.sincePush = 0;
+        this.draining = false;
         this.underruns = 0;
         this.overruns = 0;
         this.resyncs = 0;
@@ -338,15 +353,32 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         const frames = left.length;
         const step = this.updateSpeed(frames);
 
+        // The stream went quiet: play out what is queued now.
+        if (this.sincePush >= this.idleFrames && this.available >= 3) {
+            if (!this.started) {
+                this.started = true;
+                this.report();
+            }
+            this.draining = true;
+        }
+
         for (let i = 0; i < frames; i++) {
             // Underrun is detected per sample: as soon as the queue drops
             // to the low-water mark, playback fades out on the audio that is
             // still queued (30 ms is far more than the 8 ms fade), so the
             // stream never stops mid-waveform and never plays zeros at full
-            // gain — both of which are loud clicks.
-            if (this.started && this.available < this.lowWaterFrames) {
+            // gain — both of which are loud clicks. While draining the end of
+            // a sound, the queue is played down to the last sample instead.
+            if (this.started && !this.draining && this.available < this.lowWaterFrames) {
                 this.started = false;
                 this.underruns++;
+                this.report();
+            } else if (this.started && this.draining && this.available < 3) {
+                // End of the sound: fade out from its last sample.
+                this.started = false;
+                this.draining = false;
+                this.readFrame = this.writeFrame;
+                this.available = 0;
                 this.report();
             }
 
@@ -384,6 +416,8 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
                 this.lastR = 0;
             }
         }
+
+        this.sincePush += frames;
 
         if (this.playedFrames - this.lastReportPlayed >= Math.floor(this.sampleRate / 10)) {
             this.lastReportPlayed = this.playedFrames;
@@ -549,6 +583,9 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         scriptFade: 0,
         scriptLastL: 0,
         scriptLastR: 0,
+        // End-of-stream draining for the fallback (see the worklet).
+        scriptLastPushAt: 0,
+        scriptDraining: false,
 
         // Buffer / playback statistics
         bufferFrames: 0,
@@ -609,6 +646,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     let bufferCells = [];
 
     function cacheElements() {
+        els.volumeSlider = document.getElementById('volumeSlider');
+        els.volumeValue = document.getElementById('volumeValue');
         els.statusIndicator = document.getElementById('statusIndicator');
         els.statusText = document.getElementById('statusText');
 
@@ -747,7 +786,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
     function updateWsUrlUI() {
         if (!els.wsUrl) return;
-        const url = state.wsUrl || buildWsUrl();
+        // Never print the access key on the page.
+        const url = (state.wsUrl || buildWsUrl()).split('?')[0];
         els.wsUrl.textContent = url;
         els.wsUrl.title = url;
     }
@@ -915,7 +955,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.timeData = new Float32Array(state.analyserNode.fftSize);
 
         state.gainNode = context.createGain();
-        state.gainNode.gain.value = 1.0;
+        state.gainNode.gain.value = volumeGain();
 
         try {
             const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
@@ -1050,14 +1090,25 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         if (!state.scriptStarted && ring.available >= ring.targetFrames) {
             state.scriptStarted = true;
         }
+        // The stream went quiet: play out a short sound now instead of
+        // holding it until the next one arrives (see the worklet).
+        if (performance.now() - state.scriptLastPushAt > 120 && ring.available >= 2) {
+            state.scriptStarted = true;
+            state.scriptDraining = true;
+        }
         const step = ring.blockSpeed(frames);
 
         for (let i = 0; i < frames; i++) {
             // Same per-sample underrun handling as the worklet: fade out on
             // the audio still queued instead of cutting to zeros.
-            if (state.scriptStarted && ring.available < lowFrames) {
+            if (state.scriptStarted && !state.scriptDraining && ring.available < lowFrames) {
                 state.scriptStarted = false;
                 state.underruns++;
+            } else if (state.scriptStarted && state.scriptDraining && ring.available < 2) {
+                state.scriptStarted = false;
+                state.scriptDraining = false;
+                ring.readFrame = ring.writeFrame;
+                ring.available = 0;
             }
 
             const consuming = state.scriptStarted || state.scriptFade > 0;
@@ -1111,6 +1162,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             );
         } else if (state.playbackMode === 'script' && state.scriptRing) {
             state.scriptRing.push(samples);
+            state.scriptLastPushAt = performance.now();
+            state.scriptDraining = false;
         }
     }
 
@@ -1488,10 +1541,46 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     // =========================================================================
     // WebSocket
     // =========================================================================
+    // Access key from the shared link (`/?k=...`). The GM's console puts it
+    // into every link it copies; the audio stream refuses connections
+    // without it.
+    const ACCESS_KEY = (function () {
+        try {
+            return new URLSearchParams(location.search).get('k') || '';
+        } catch (e) {
+            return '';
+        }
+    })();
+
+    function keyQuery() {
+        return ACCESS_KEY ? '?k=' + encodeURIComponent(ACCESS_KEY) : '';
+    }
+
     function buildWsUrl() {
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         const host = location.host || 'localhost:8080';
-        return protocol + '//' + host + '/ws/audio';
+        return protocol + '//' + host + '/ws/audio' + keyQuery();
+    }
+
+    // The link has no valid key (missing, mistyped, or replaced by the GM):
+    // say so and stop, instead of retrying forever.
+    function accessDenied() {
+        state.shouldReconnect = false;
+        state.isConnecting = false;
+        if (state.reconnectTimer) {
+            clearTimeout(state.reconnectTimer);
+            state.reconnectTimer = null;
+        }
+        setStatus('error', 'Access Denied');
+        setButtonState('idle');
+        setSystemToast('Access key rejected.', false, 'lucide:alert-triangle');
+        showMessage(
+            ACCESS_KEY
+                ? 'This link is no longer valid: the GM issued a new access key. Ask for the current link.'
+                : 'This link has no access key. Open the full link from the GM (it ends with ?k=...).',
+            'error',
+            true
+        );
     }
 
     function connect() {
@@ -1519,8 +1608,24 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         setSystemToast('Negotiating WebSocket handshake...', false, 'lucide:radio-tower');
         hideMessage();
 
-        log('Connecting to', state.wsUrl);
+        log('Connecting to', state.wsUrl.split('?')[0]);
 
+        // A browser WebSocket cannot see the HTTP status of a refused
+        // upgrade, so the key is checked against the status API first: a 401
+        // there means the link is wrong, not that the server is down.
+        fetch('/api/status' + keyQuery(), { cache: 'no-store' })
+            .then((res) => {
+                if (res.status === 401) {
+                    accessDenied();
+                    return;
+                }
+                openSocket();
+            })
+            .catch(() => openSocket());
+    }
+
+    function openSocket() {
+        if (!state.shouldReconnect) return;
         try {
             const ws = new WebSocket(state.wsUrl);
             ws.binaryType = 'arraybuffer';
@@ -1570,6 +1675,12 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         resetAudioPipeline();
         updateBufferUI();
         updateStatsUI();
+
+        if (event.code === 4001) {
+            // The GM issued a new access key; this link is revoked.
+            accessDenied();
+            return;
+        }
 
         if (state.shouldReconnect) {
             if (event.code === 1000) {
@@ -1805,8 +1916,84 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     // =========================================================================
     // Init
     // =========================================================================
+    // =========================================================================
+    // Per-listener volume
+    //
+    // Only this device: the GM's mix and every other player are unaffected.
+    // Remembered in localStorage. The slider is perceptual (squared), so the
+    // lower half is usable instead of everything below 50 % sounding loud.
+    // =========================================================================
+    const VOLUME_KEY = 'bardwave.volume';
+    const volume = { percent: 100, muted: false };
+
+    function loadVolume() {
+        try {
+            const saved = JSON.parse(localStorage.getItem(VOLUME_KEY) || 'null');
+            if (saved && typeof saved.percent === 'number') {
+                volume.percent = Math.max(0, Math.min(100, Math.round(saved.percent)));
+                volume.muted = !!saved.muted;
+            }
+        } catch (e) {
+            // Private mode / blocked storage: just start at 100 %.
+        }
+    }
+
+    function saveVolume() {
+        try {
+            localStorage.setItem(VOLUME_KEY, JSON.stringify(volume));
+        } catch (e) {
+            // Not fatal: the volume simply is not remembered.
+        }
+    }
+
+    function volumeGain() {
+        if (volume.muted) return 0;
+        const v = volume.percent / 100;
+        return v * v;
+    }
+
+    function applyVolume() {
+        if (els.volumeSlider) {
+            els.volumeSlider.value = String(volume.percent);
+            els.volumeSlider.style.setProperty('--fill', volume.percent + '%');
+        }
+        if (els.volumeValue) {
+            els.volumeValue.textContent = volume.muted ? 'MUTED' : volume.percent + '%';
+            els.volumeValue.classList.toggle('is-muted', volume.muted);
+        }
+        if (state.gainNode && state.audioContext) {
+            // A short ramp instead of a jump: no zipper noise while dragging.
+            state.gainNode.gain.setTargetAtTime(
+                volumeGain(),
+                state.audioContext.currentTime,
+                0.015
+            );
+        }
+    }
+
+    function initVolume() {
+        loadVolume();
+        applyVolume();
+        if (els.volumeSlider) {
+            els.volumeSlider.addEventListener('input', () => {
+                volume.percent = Number(els.volumeSlider.value) || 0;
+                volume.muted = false;
+                applyVolume();
+            });
+            els.volumeSlider.addEventListener('change', saveVolume);
+        }
+        if (els.volumeValue) {
+            els.volumeValue.addEventListener('click', () => {
+                volume.muted = !volume.muted;
+                applyVolume();
+                saveVolume();
+            });
+        }
+    }
+
     function init() {
         cacheElements();
+        initVolume();
 
         updateWsUrlUI();
         updateInfoUI({

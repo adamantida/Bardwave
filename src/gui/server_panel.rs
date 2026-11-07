@@ -96,6 +96,12 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
 
         let url = server.bind_url.clone().unwrap_or_else(|| "—".to_string());
         let running = matches!(server.status, GuiServerStatus::Running);
+        // What players actually need: the address plus the access key.
+        let share = if running {
+            state.share_url(&url)
+        } else {
+            url.clone()
+        };
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -114,7 +120,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                 Palette::ZINC_600
             };
             let galley = painter.layout_no_wrap(
-                crate::gui::widgets::elide(&url, 30),
+                crate::gui::widgets::elide(&share, 30),
                 crate::gui::widgets::glyph_font(12.0),
                 color,
             );
@@ -134,7 +140,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                 .id_salt("copy_url_icon")
                 .show(ui);
             if copy.clicked() && running {
-                ui.output_mut(|o| o.copied_text = url.clone());
+                ui.output_mut(|o| o.copied_text = share.clone());
                 state.set_copied_feedback(true);
             }
         });
@@ -157,7 +163,16 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         if running && !advertised_is_loopback {
             if let Some(local) = server.local_url.as_deref() {
                 ui.add_space(Metrics::XS);
-                ui.label(micro_label(format!("Local {local}")));
+                let label = ui.add(
+                    egui::Label::new(micro_label(format!("Local {local}"))).sense(Sense::click()),
+                );
+                if label
+                    .on_hover_text("Click to copy the link for this PC (with the access key)")
+                    .clicked()
+                {
+                    ui.output_mut(|o| o.copied_text = state.share_url(local));
+                    state.set_copied_feedback(true);
+                }
             }
         }
 
@@ -186,7 +201,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                             )
                             .clicked()
                         {
-                            ui.output_mut(|o| o.copied_text = url.clone());
+                            ui.output_mut(|o| o.copied_text = state.share_url(url));
                             state.set_copied_feedback(true);
                         }
                     }
@@ -221,6 +236,46 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                 );
             }
         }
+
+        // ---- Access key ----
+        // Players need it in the link; a new one revokes the old link and
+        // disconnects everyone who used it (e.g. after it leaked).
+        ui.add_space(Metrics::SM);
+        ui.horizontal(|ui| {
+            // The key itself stays lowercase (it is case-sensitive); only the
+            // label follows the console's uppercase style.
+            let (text, color) = match state.access_key() {
+                Some(key) => (
+                    format!("ACCESS KEY {}", crate::gui::widgets::elide(&key, 6)),
+                    Palette::ZINC_500,
+                ),
+                None => (
+                    "ACCESS KEY OFF - ANYONE CAN LISTEN".to_string(),
+                    Palette::AMBER_400,
+                ),
+            };
+            ui.label(
+                RichText::new(text)
+                    .font(crate::gui::widgets::glyph_font(Metrics::MICRO))
+                    .color(color)
+                    .extra_letter_spacing(0.8),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if crate::gui::widgets::IconButton::new(glyph::REFRESH)
+                    .size(20.0)
+                    .font_size(10.0)
+                    .tooltip(
+                        "New access key: the current link stops working and everyone \
+                         listening with it is disconnected. Share the new link afterwards.",
+                    )
+                    .id_salt("server_new_key")
+                    .show(ui)
+                    .clicked()
+                {
+                    state.regenerate_access_key();
+                }
+            });
+        });
 
         ui.add_space(Metrics::LG);
 
@@ -305,7 +360,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                 .clicked()
                 && running
             {
-                ui.output_mut(|o| o.copied_text = url.clone());
+                ui.output_mut(|o| o.copied_text = share.clone());
                 state.set_copied_feedback(true);
             }
         });

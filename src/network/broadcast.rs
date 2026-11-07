@@ -31,6 +31,10 @@ pub const WIRE_CODEC: &str = "opus";
 /// glued onto the audio that comes next.
 const STREAM_RESTART_GAP: std::time::Duration = std::time::Duration::from_millis(120);
 
+/// How long the engine may stay silent before the partial frame it left in
+/// the reblocker is padded and sent: a few device callbacks.
+const STREAM_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(40);
+
 /// `AudioFormatInfo` announced to clients on connect / first frame.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AudioFormatInfo {
@@ -443,20 +447,7 @@ impl AudioBroadcaster {
         if packets.is_empty() {
             return;
         }
-        self.pending.extend(packets);
-
-        while let Some(payload) = self.pending.pop_front() {
-            let seq = self.seq_no.fetch_add(1, Ordering::Relaxed);
-            let header = AudioFrame {
-                samples: Vec::new(),
-                sample_rate: WIRE_SAMPLE_RATE,
-                channels: WIRE_CHANNELS,
-                timestamp: frame.timestamp,
-                seq_no: seq,
-            };
-            let binary_data = header.to_binary_header(&self.stream_epoch, &payload);
-            self.deliver(Message::Binary(binary_data)).await;
-        }
+        self.send_packets(packets, frame.timestamp).await;
 
         // The first packet of the session is what establishes the stream
         // format. It is announced only once the stream really starts, so a
@@ -476,6 +467,43 @@ impl AudioBroadcaster {
         };
         if let Some(text) = announcement {
             self.deliver(Message::Text(text)).await;
+        }
+    }
+
+    /// Number and send encoded packets to every listener.
+    async fn send_packets(&mut self, packets: Vec<Vec<u8>>, timestamp: std::time::Instant) {
+        self.pending.extend(packets);
+        while let Some(payload) = self.pending.pop_front() {
+            let seq = self.seq_no.fetch_add(1, Ordering::Relaxed);
+            let header = AudioFrame {
+                samples: Vec::new(),
+                sample_rate: WIRE_SAMPLE_RATE,
+                channels: WIRE_CHANNELS,
+                timestamp,
+                seq_no: seq,
+            };
+            let binary_data = header.to_binary_header(&self.stream_epoch, &payload);
+            self.deliver(Message::Binary(binary_data)).await;
+        }
+    }
+
+    /// Whether the reblocker holds a partial frame.
+    fn has_partial_frame(&self) -> bool {
+        self.wire
+            .lock()
+            .map(|wire| wire.buffered_samples() > 0)
+            .unwrap_or(false)
+    }
+
+    /// The stream paused: send the tail of the last sound padded to a frame.
+    async fn flush_partial_frame(&mut self) {
+        let mut packets = Vec::new();
+        self.wire
+            .lock()
+            .expect("Opus encoder mutex poisoned")
+            .flush(&mut packets);
+        if !packets.is_empty() {
+            self.send_packets(packets, std::time::Instant::now()).await;
         }
     }
 
@@ -523,6 +551,11 @@ impl AudioBroadcaster {
                 // Handle audio frames from engine
                 Some(frame) = self.audio_rx.recv() => {
                     self.broadcast_frame(frame).await;
+                }
+                // Nothing new for a while and a partial frame is waiting: the
+                // sound ended, so send its tail instead of holding it.
+                _ = tokio::time::sleep(STREAM_FLUSH_DELAY), if self.has_partial_frame() => {
+                    self.flush_partial_frame().await;
                 }
                 // Handle control commands
                 Some(cmd) = self.command_rx.recv() => {
@@ -715,14 +748,24 @@ mod tests {
     /// A pause must not glue a pre-pause fragment onto the next burst.
 
     #[tokio::test]
-    async fn pause_between_bursts_drops_the_partial_frame() {
+    async fn pause_flushes_the_partial_frame_instead_of_gluing_it() {
         let (handle, broadcaster) = AudioBroadcaster::new(BroadcasterConfig::default());
         let _task = tokio::spawn(broadcaster.run());
 
         let (tx, mut rx) = mpsc::channel(64);
         handle.register_client(tx).await.expect("register");
 
-        // Half a frame, then a pause far longer than the restart gap.
+        let count_binary = |rx: &mut mpsc::Receiver<Message>| {
+            let mut binary = 0;
+            while let Ok(message) = rx.try_recv() {
+                if let Message::Binary(_) = message {
+                    binary += 1;
+                }
+            }
+            binary
+        };
+
+        // Half a frame (the tail of a sound), then a pause.
         handle
             .send_audio(AudioFrame::new(
                 vec![0.5f32; 240 * 2],
@@ -733,8 +776,17 @@ mod tests {
             .expect("queue partial block");
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // One whole frame after the pause must become exactly one packet: the
-        // 240 carried frames are gone, not prepended.
+        // The tail went out during the pause, padded to one packet; it used
+        // to sit in the reblocker until the next sound (and then be dropped),
+        // so the end of a one-shot never reached the listeners.
+        assert_eq!(
+            count_binary(&mut rx),
+            1,
+            "the tail must be sent during the pause"
+        );
+
+        // One whole frame after the pause is exactly one packet: nothing from
+        // before the pause is glued onto it.
         handle
             .send_audio(AudioFrame::new(
                 vec![0.5f32; WIRE_FRAME_FRAMES * 2],
@@ -743,15 +795,8 @@ mod tests {
                 0,
             ))
             .expect("queue whole block");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let mut binary = 0;
-        while let Ok(message) = rx.try_recv() {
-            if let Message::Binary(_) = message {
-                binary += 1;
-            }
-        }
-        assert_eq!(binary, 1, "the stale half frame must not be sent");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(count_binary(&mut rx), 1);
 
         drop(handle);
     }
