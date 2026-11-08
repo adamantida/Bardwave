@@ -1070,9 +1070,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         if (typeof msg.targetMs === 'number') {
             state.workletTargetMs = msg.targetMs;
         }
-
-        updateBufferUI();
-        updateStatsUI();
+        // UI refresh is throttled in updateUI(); do not update from here.
     }
 
     function onScriptProcess(event) {
@@ -1148,7 +1146,10 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.resyncs = ring.resyncs;
 
         const now = performance.now();
-        if (!state.hidden && now - state.lastUiUpdate >= CONFIG.uiUpdateInterval) {
+        if (
+            !state.hidden &&
+            now - state.lastUiUpdate >= (state.streamActive ? 200 : CONFIG.uiUpdateInterval)
+        ) {
             state.lastUiUpdate = now;
             updateBufferUI();
             updateStatsUI();
@@ -1509,8 +1510,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             );
             hideMessage();
         }
-
-        updateStatsUI();
+        // UI refresh is throttled in updateUI(); do not update from here.
     }
 
     function handleControlMessage(msg) {
@@ -1855,9 +1855,12 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             return;
         }
 
-        // Throttle meter / DOM work to ~15 fps so the main thread does not
-        // contend with the audio thread while the tab is active.
-        if (t - state.lastUiUpdate >= CONFIG.uiUpdateInterval) {
+        // When music is playing, drop UI to 1 fps so the main thread gives
+        // maximum priority to the audio path (ScriptProcessor on HTTP). When
+        // nothing is playing, keep ~15 fps for responsive meters.
+        const uiInterval = state.streamActive ? 200 : CONFIG.uiUpdateInterval;
+
+        if (t - state.lastUiUpdate >= uiInterval) {
             state.lastUiUpdate = t;
 
             updateMeter();
