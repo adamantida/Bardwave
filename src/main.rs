@@ -132,7 +132,7 @@ async fn start_listener(
             "🌐 Server task started, beginning to serve on {}",
             actual_addr
         );
-        // Opus packets are ~100 bytes every 10 ms: with Nagle's algorithm on,
+        // Opus packets are ~160 bytes every 20 ms: with Nagle's algorithm on,
         // Windows holds them back and sends bursts, which drains the
         // listener's jitter buffer and makes the stream stutter.
         let _ = axum::serve(

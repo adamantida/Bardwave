@@ -164,9 +164,9 @@ fn default_upnp() -> bool {
 }
 
 fn default_buffer_size() -> usize {
-    // 10 ms at 48 kHz: what the engine always asked for before this setting
-    // was applied.
-    480
+    // 20 ms at 48 kHz: the wire now ships 20 ms Opus frames; the engine
+    // publishes blocks of this size.
+    960
 }
 
 fn default_sample_rate() -> u32 {
@@ -332,7 +332,7 @@ mod tests {
             .expect("packaging/config.toml");
         assert_eq!(config.server.port, 8080);
         assert!(config.server.access_token.is_none());
-        assert_eq!(config.audio.buffer_size, 480);
+        assert_eq!(config.audio.buffer_size, 960);
         assert!(config.library.sounds.is_empty());
     }
 
@@ -341,7 +341,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.host, "0.0.0.0");
-        assert_eq!(config.audio.buffer_size, 480);
+        assert_eq!(config.audio.buffer_size, 960);
         assert_eq!(config.audio.sample_rate, 48000);
         assert_eq!(config.audio.channels, 2);
         assert_eq!(config.audio.master_volume, 0.8);

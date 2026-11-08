@@ -3,12 +3,12 @@
 //! The wire payload is Opus-encoded: raw f32 PCM at 48 kHz stereo is 3 Mbit/s,
 //! which both floods weak Wi-Fi links (bursty delivery -> jitter-buffer
 //! overruns on the client) and holds the CPU of every listener. The mixed
-//! audio is encoded to 10 ms Opus packets (~100-300 bytes at 96 kbit/s) right
+//! audio is encoded to 20 ms Opus packets (~100-300 bytes at 96 kbit/s) right
 //! here, before it enters any per-client queue.
 //!
 //! The engine publishes whatever block size the local audio device asked for,
 //! which is usually *not* 480 frames; [`WireEncoder`] reblocks it into fixed
-//! 10 ms frames so every packet on the wire is a valid Opus frame (see
+//! 20 ms frames so every packet on the wire is a valid Opus frame (see
 //! [`crate::network::opus_wire`] for why that matters).
 
 use axum::extract::ws::Message;
@@ -581,8 +581,8 @@ impl AudioBroadcaster {
 /// Helper: create a test audio frame for testing
 #[cfg(test)]
 pub fn create_test_frame() -> AudioFrame {
-    // 48000 Hz, stereo, 10ms frame = 480 frames = 960 samples
-    let samples: Vec<f32> = (0..960).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    // 48000 Hz, stereo, 20ms frame = 960 frames = 1920 samples
+    let samples: Vec<f32> = (0..1920).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
     AudioFrame::new(samples, 48000, 2, 0)
 }
 
@@ -625,8 +625,8 @@ mod tests {
         let frame = create_test_frame();
         assert_eq!(frame.sample_rate, 48000);
         assert_eq!(frame.channels, 2);
-        assert_eq!(frame.frame_count(), 480);
-        assert!((frame.duration() - 0.01).abs() < 0.001);
+        assert_eq!(frame.frame_count(), 960);
+        assert!((frame.duration() - 0.02).abs() < 0.001);
     }
 
     #[test]
@@ -740,12 +740,12 @@ mod tests {
                 packets += 1;
             }
         }
-        // 8 x 441 = 3528 frames is 7.35 wire frames: 7 whole packets, none
-        // lost at a block boundary, plus the 0.35 tail padded and flushed once
+        // 8 x 441 = 3528 frames is 3.675 wire frames: 3 whole packets, none
+        // lost at a block boundary, plus the 0.675 tail padded and flushed once
         // the engine goes quiet.
         assert_eq!(
-            packets, 8,
-            "3528 frames must reblock into 7 whole packets plus the flushed tail"
+            packets, 4,
+            "3528 frames must reblock into 3 whole packets plus the flushed tail"
         );
 
         drop(handle);

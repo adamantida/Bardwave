@@ -14,8 +14,8 @@
 //! crackle riding on the music.
 //!
 //! So the PCM is rebuffered here first, exactly as opusfile/ffmpeg do it: an
-//! interleaved f32 remainder is carried across calls, and only whole 480-frame
-//! (10 ms) blocks are ever handed to the encoder.
+//! interleaved f32 remainder is carried across calls, and only whole 960-frame
+//! (20 ms) blocks are ever handed to the encoder.
 //!
 //! # Discontinuities
 //!
@@ -36,8 +36,8 @@ use super::broadcast::AudioFormatInfo;
 pub const WIRE_SAMPLE_RATE: u32 = 48_000;
 /// Channels of the wire stream (always stereo: the mix is stereo).
 pub const WIRE_CHANNELS: u16 = 2;
-/// Frames per channel in one wire packet: 10 ms at 48 kHz.
-pub const WIRE_FRAME_FRAMES: usize = 480;
+/// Frames per channel in one wire packet: 20 ms at 48 kHz.
+pub const WIRE_FRAME_FRAMES: usize = 960;
 /// Interleaved samples in one wire packet (`WIRE_FRAME_FRAMES * WIRE_CHANNELS`).
 pub const WIRE_FRAME_SAMPLES: usize = WIRE_FRAME_FRAMES * WIRE_CHANNELS as usize;
 
@@ -80,7 +80,7 @@ pub fn wire_encoder() -> OpusEncoder {
 /// PCM -> fixed-size Opus packets.
 ///
 /// Holds the encoder plus the interleaved f32 remainder between calls. Feeding
-/// it any block size is safe; it emits zero or more whole 10 ms packets.
+/// it any block size is safe; it emits zero or more whole 20 ms packets.
 pub struct WireEncoder {
     encoder: OpusEncoder,
     /// Leftover interleaved samples that did not fill a whole frame.
@@ -104,7 +104,7 @@ impl WireEncoder {
         }
     }
 
-    /// Push one mixed block and append every completed 10 ms packet to `out`.
+    /// Push one mixed block and append every completed 20 ms packet to `out`.
     ///
     /// `samples` is interleaved stereo at 48 kHz, i.e. what the mixer produces.
     /// The return value is the number of packets appended, so callers can skip
@@ -253,7 +253,7 @@ impl Default for WireEncoder {
 mod tests {
     use super::*;
 
-    /// The tail of a sound (less than one 10 ms frame) is padded and sent
+    /// The tail of a sound (less than one 20 ms frame) is padded and sent
     /// when the stream pauses, instead of waiting for the next sound.
     #[test]
     fn flush_sends_the_partial_tail() {
@@ -313,8 +313,8 @@ mod tests {
         assert_eq!(encoder.buffered_samples(), 0);
     }
 
-    /// The regression that made every non-480-frame device silent or crackly:
-    /// arbitrary device block sizes must still produce valid 10 ms packets.
+    /// The regression that made every non-960-frame device silent or crackly:
+    /// arbitrary device block sizes must still produce valid 20 ms packets.
     #[test]
     fn arbitrary_block_sizes_still_produce_ten_ms_packets() {
         for block_frames in [441usize, 512, 1000, 1024, 47, 1] {
@@ -334,8 +334,8 @@ mod tests {
             }
 
             assert!(
-                packets.len() >= 99,
-                "block {block_frames}: 1 s of audio must yield ~100 packets, got {}",
+                packets.len() >= 49,
+                "block {block_frames}: 1 s of audio must yield ~50 packets, got {}",
                 packets.len()
             );
             let mut total_level = 0f32;
@@ -347,7 +347,7 @@ mod tests {
                 assert_eq!(
                     decoded.len(),
                     WIRE_FRAME_SAMPLES,
-                    "block {block_frames}: packet {i} is not a 10 ms stereo frame"
+                    "block {block_frames}: packet {i} is not a 20 ms stereo frame"
                 );
                 total_level += rms(&decoded);
                 packet_count += 1;
@@ -390,7 +390,7 @@ mod tests {
             phase = next;
             encoder.push(&block, &mut packets);
         }
-        assert!(packets.len() >= 16);
+        assert!(packets.len() >= 8);
 
         let mut decoded: Vec<f32> = Vec::new();
         for packet in &packets {

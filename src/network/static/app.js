@@ -6,7 +6,7 @@
  *
  * Playback uses an AudioWorklet with a ring buffer and a drift-correcting
  * jitter buffer:
- *   - wait for ~200 ms before starting
+ *   - wait for ~350 ms before starting
  *   - rebuffer when the queue drops below ~30 ms
  *   - hold the queue at the target by consuming at 1 +/- a small factor
  *     (fractional, Catmull-Rom interpolated read), so two independent audio
@@ -73,8 +73,10 @@
     const CONFIG = {
         sampleRate: 48000,
         channels: 2,
-        // Playback starts once this much audio is queued.
-        targetBufferMs: 200,
+        // Playback starts once this much audio is queued. 20 ms Opus frames
+        // arrive half as often, so a deeper prebuffer keeps the queue full and
+        // avoids underruns; latency is traded for stability/quality.
+        targetBufferMs: 350,
         // If the queue falls below this, pause and rebuffer.
         lowWaterMs: 30,
         // Hard latency cap. Above this the queue is cleared and rebuffers on
@@ -815,7 +817,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         const sampleRate = state.bufferSampleRate || CONFIG.sampleRate;
         const ms = (frames / sampleRate) * 1000;
         // The scale runs to the hard cap, not the target: at the healthy
-        // 200 ms prebuffer the bar used to already look "maxed out", which
+        // 350 ms prebuffer the bar used to already look "maxed out", which
         // made real overruns impossible to see. The target is a marker here.
         const target = Math.round(state.workletTargetMs || CONFIG.targetBufferMs);
         const pct = Math.max(0, Math.min(1, ms / CONFIG.maxBufferMs));
