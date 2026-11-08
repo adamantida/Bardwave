@@ -95,8 +95,9 @@
         // threshold, i.e. on every 10 ms packet; that 100 Hz pitch wobble
         // is what made the stream sound like it was farting.
         catchupLimit: 0.005,
-        // UI refresh interval for fallback stats (ms).
-        uiUpdateInterval: 100,
+        // UI refresh interval for meter and stats (ms). ~15 fps keeps the
+        // main thread from fighting the audio thread on the active tab.
+        uiUpdateInterval: 66,
         reconnect: {
             initialDelay: 1000,
             maxDelay: 30000,
@@ -638,7 +639,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
         // UI loop
         animationFrame: null,
-        lastUiUpdate: 0
+        lastUiUpdate: 0,
+        hidden: false
     };
 
     // =========================================================================
@@ -1146,7 +1148,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.resyncs = ring.resyncs;
 
         const now = performance.now();
-        if (now - state.lastUiUpdate >= CONFIG.uiUpdateInterval) {
+        if (!state.hidden && now - state.lastUiUpdate >= CONFIG.uiUpdateInterval) {
             state.lastUiUpdate = now;
             updateBufferUI();
             updateStatsUI();
@@ -1845,18 +1847,32 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     function updateUI(now) {
         const t = typeof now === 'number' ? now : performance.now();
 
-        updateMeter();
-
-        if (state.streamActive && t - state.lastPacketAt > 1000) {
-            state.streamActive = false;
-            updateBufferUI();
+        // When the tab is hidden the browser already throttles rAF to ~1 fps
+        // and the main thread is contended; skip all meter / DOM work so the
+        // audio thread (ScriptProcessor on HTTP) is not starved.
+        if (state.hidden) {
+            state.animationFrame = requestAnimationFrame(updateUI);
+            return;
         }
 
-        if (t > state.peakHoldUntil && state.peakLevel > 0) {
-            state.peakLevel = Math.max(0, state.peakLevel - 0.01);
-            if (els.levelPeak) {
-                els.levelPeak.style.left =
-                    'calc(' + (state.peakLevel * 100).toFixed(1) + '% - 1px)';
+        // Throttle meter / DOM work to ~15 fps so the main thread does not
+        // contend with the audio thread while the tab is active.
+        if (t - state.lastUiUpdate >= CONFIG.uiUpdateInterval) {
+            state.lastUiUpdate = t;
+
+            updateMeter();
+
+            if (state.streamActive && t - state.lastPacketAt > 1000) {
+                state.streamActive = false;
+                updateBufferUI();
+            }
+
+            if (t > state.peakHoldUntil && state.peakLevel > 0) {
+                state.peakLevel = Math.max(0, state.peakLevel - 0.01);
+                if (els.levelPeak) {
+                    els.levelPeak.style.left =
+                        'calc(' + (state.peakLevel * 100).toFixed(1) + '% - 1px)';
+                }
             }
         }
 
@@ -1897,6 +1913,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     }
 
     function onVisibilityChange() {
+        state.hidden = document.hidden;
         // Keep the stream running while hidden. The worklet continues to
         // consume audio; the ring buffer caps latency, so there is no need to
         // drop packets or clear the queue when the tab becomes visible again.
