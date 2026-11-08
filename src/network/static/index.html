@@ -326,6 +326,30 @@
             animation: blink 1s infinite step-end;
             margin-left: 6px;
         }
+
+        /* ------------------------------------------------------------------
+           Reduced frame rate when music is playing
+           ------------------------------------------------------------------ */
+        .crt-content.streaming .crt-content,
+        .crt-content.streaming .pixel-block,
+        .crt-content.streaming .screen-tear,
+        .crt-content.streaming .meter-fill,
+        .crt-content.streaming .glitch-active,
+        .crt-content.streaming .cursor-blink,
+        .crt-content.streaming .terminal-box:hover {
+            animation-play-state: paused !important;
+        }
+
+        /* 5 fps tick: briefly resume animations every 200 ms */
+        .crt-content.streaming-tick .crt-content,
+        .crt-content.streaming-tick .pixel-block,
+        .crt-content.streaming-tick .screen-tear,
+        .crt-content.streaming-tick .meter-fill,
+        .crt-content.streaming-tick .glitch-active,
+        .crt-content.streaming-tick .cursor-blink,
+        .crt-content.streaming-tick .terminal-box:hover {
+            animation-play-state: running !important;
+        }
     </style>
 </head>
 <body>

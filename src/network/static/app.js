@@ -1880,6 +1880,17 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         }
 
         state.animationFrame = requestAnimationFrame(updateUI);
+
+        // Toggle streaming class on CRT container to pause/resume animations
+        const crtContent = document.querySelector('.crt-content');
+        if (crtContent) {
+            if (state.streamActive && !crtContent.classList.contains('streaming')) {
+                crtContent.classList.add('streaming');
+            } else if (!state.streamActive && crtContent.classList.contains('streaming')) {
+                crtContent.classList.remove('streaming');
+                crtContent.classList.remove('streaming-tick');
+            }
+        }
     }
 
     // =========================================================================
@@ -2033,6 +2044,17 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         els.dismissBtn.addEventListener('click', hideMessage);
         document.addEventListener('visibilitychange', onVisibilityChange);
         window.addEventListener('beforeunload', onBeforeUnload);
+
+        // 5 fps animation tick when music is playing: briefly resume
+        // paused CSS animations every 200 ms.
+        setInterval(() => {
+            if (state.streamActive) {
+                const crtContent = document.querySelector('.crt-content');
+                if (crtContent) {
+                    crtContent.classList.toggle('streaming-tick');
+                }
+            }
+        }, 200);
 
         state.animationFrame = requestAnimationFrame(updateUI);
 
