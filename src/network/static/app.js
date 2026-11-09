@@ -2061,10 +2061,135 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         log('Bardwave Listener initialized');
     }
 
+    // =========================================================================
+    // Boot Loader – 6-10 s CRT startup animation before the main app shows
+    // =========================================================================
+    const BOOT_MESSAGES = [
+        'initializing audio context...',
+        'allocating ring buffer...',
+        'loading opus decoder...',
+        'handshake protocol v2.5...',
+        'calibrating levels...',
+        'syncing timecode...',
+        'opening audio socket...',
+        'ready.'
+    ];
+
+    // Matrix Rain
+    let matrixCanvas, matrixCtx, matrixCols, matrixDrops, matrixChars, matrixInterval;
+
+    function initMatrixRain() {
+        matrixCanvas = document.getElementById('matrixRain');
+        if (!matrixCanvas) return;
+        matrixCtx = matrixCanvas.getContext('2d');
+        resizeMatrix();
+        window.addEventListener('resize', resizeMatrix);
+
+        const chars = 'アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%&@';
+        matrixChars = chars.split('');
+
+        function resizeMatrix() {
+            matrixCanvas.width = window.innerWidth;
+            matrixCanvas.height = window.innerHeight;
+            const fontSize = 14;
+            matrixCols = matrixCanvas.width / fontSize;
+            matrixDrops = [];
+            for (let i = 0; i < matrixCols; i++) matrixDrops[i] = 1;
+        }
+
+        function draw() {
+            matrixCtx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+            matrixCtx.fillRect(0, 0, matrixCanvas.width, matrixCanvas.height);
+            matrixCtx.fillStyle = '#0f0';
+            matrixCtx.font = '14px JetBrains Mono, monospace';
+            for (let i = 0; i < matrixDrops.length; i++) {
+                const text = matrixChars[Math.floor(Math.random() * matrixChars.length)];
+                matrixCtx.fillText(text, i * 14, matrixDrops[i] * 14);
+                if (matrixDrops[i] * 14 > matrixCanvas.height && Math.random() > 0.975) {
+                    matrixDrops[i] = 0;
+                }
+                matrixDrops[i]++;
+            }
+        }
+        setInterval(draw, 60);
+    }
+
+    function runBootLoader() {
+        const loader = document.getElementById('bootLoader');
+        const mainApp = document.getElementById('mainApp');
+        const progressBar = document.getElementById('loaderProgressBar');
+        const statusEl = document.getElementById('loaderStatus');
+        const pctEl = document.getElementById('loaderPct');
+        const msgEl = document.getElementById('loaderMessage');
+
+        if (!loader || !mainApp || !progressBar) {
+            init();
+            return;
+        }
+
+        initMatrixRain();
+
+        const durationMs = 6000 + Math.floor(Math.random() * 4000); // 6-10 s
+        const start = performance.now();
+        let completed = false;
+
+        // Fallback: force-complete boot if rAF stalls for any reason
+        setTimeout(() => {
+            if (!completed) {
+                completed = true;
+                const matrixEl = document.getElementById('matrixRain');
+                if (matrixEl) matrixEl.style.display = 'none';
+                if (matrixInterval) clearInterval(matrixInterval);
+                loader.classList.add('hidden');
+                mainApp.classList.remove('hidden');
+                void mainApp.offsetWidth;
+                mainApp.classList.add('reveal');
+                try { init(); } catch (e) { console.error('Boot loader fallback init() failed:', e); }
+            }
+        }, durationMs + 1000);
+
+        function tick(now) {
+            if (completed) return;
+            const elapsed = now - start;
+            const pct = Math.min(elapsed / durationMs, 1);
+
+            progressBar.style.width = (pct * 100).toFixed(1) + '%';
+            pctEl.textContent = Math.floor(pct * 100) + '%';
+
+            const msgIndex = Math.min(
+                Math.floor(pct * BOOT_MESSAGES.length),
+                BOOT_MESSAGES.length - 1
+            );
+            statusEl.textContent = BOOT_MESSAGES[msgIndex].toUpperCase();
+            msgEl.textContent = BOOT_MESSAGES[msgIndex];
+
+            if (pct < 1) {
+                requestAnimationFrame(tick);
+            } else {
+                completed = true;
+                // Boot complete: stop matrix rain, hide loader, zoom in main app
+                if (matrixInterval) clearInterval(matrixInterval);
+                const matrixEl = document.getElementById('matrixRain');
+                if (matrixEl) matrixEl.style.display = 'none';
+                loader.classList.add('hidden');
+                mainApp.classList.remove('hidden');
+                void mainApp.offsetWidth;
+                mainApp.classList.add('reveal');
+                try {
+                    init();
+                } catch (e) {
+                    console.error('Boot loader: init() failed:', e);
+                }
+            }
+        }
+
+        requestAnimationFrame(tick);
+    }
+
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
+        document.addEventListener('DOMContentLoaded', runBootLoader);
     } else {
-        init();
+        runBootLoader();
     }
 
     // Expose for debugging.
