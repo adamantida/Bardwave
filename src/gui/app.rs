@@ -1,6 +1,9 @@
 //! GUI application state and logic
 
-use crate::audio::{AudioDecoder, AudioEngine, DecodedAudio, Director, LocalOutputStatus, SoundId};
+use crate::audio::{
+    AudioDecoder, AudioEngine, DecodedAudio, Director, DuckMode, LocalOutputStatus, MixControl,
+    SoundId,
+};
 use crate::gui::groups::{GroupFilter, GroupId, Library};
 use crate::gui::types::{
     AppState, AudioCommand, ServerCommand, ServerStatus as AppServerStatus, SoundInfo,
@@ -1454,8 +1457,22 @@ impl SoundSharedApp {
         let Some(engine) = guard.as_ref() else {
             return;
         };
+        let audio_cfg = self.app_state.config.lock().unwrap().audio.clone();
+        self.director.configure_audio(&audio_cfg);
         self.director.tick(engine);
         mirror_playing(&self.sounds, engine);
+        // Loudness measured in the background: store the gains in the library.
+        for update in self.director.take_gain_updates() {
+            let path = uuid::Uuid::parse_str(&update.library_id)
+                .ok()
+                .and_then(|id| self.library.sound_by_id(id))
+                .map(|sound| sound.path.clone());
+            if let Some(path) = path {
+                if self.library.set_gain_db(&path, update.gain_db) {
+                    self.library_dirty = true;
+                }
+            }
+        }
     }
 
     /// Register the files the decoder worker has finished.
@@ -1486,7 +1503,14 @@ impl SoundSharedApp {
                         .sound(&path_buf)
                         .map(|sound| sound.volume)
                         .unwrap_or(1.0);
-                    if let Err(e) = engine.set_sound_volume(sound_id, saved_volume) {
+                    let saved_gain = self
+                        .library
+                        .sound(&path_buf)
+                        .map(|sound| sound.gain_db)
+                        .unwrap_or(0.0);
+                    let saved_level =
+                        crate::audio::director_audio::level_for(saved_volume, saved_gain);
+                    if let Err(e) = engine.set_sound_volume(sound_id, saved_level) {
                         warn!(
                             "Could not apply saved volume {:.2} to {}: {}",
                             saved_volume,
@@ -1539,6 +1563,14 @@ impl SoundSharedApp {
                     };
                     self.sounds.lock().unwrap().insert(sound_id, entry);
                     self.sound_order.lock().unwrap().push(sound_id);
+                    // Loudness normalization (off by default): a sound without
+                    // a gain is measured in the background.
+                    let audio_cfg = self.app_state.config.lock().unwrap().audio.clone();
+                    self.director.configure_audio(&audio_cfg);
+                    if audio_cfg.normalize {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        self.director.normalize_sound(engine, sound_id);
+                    }
                     let _ = response.send(Ok(info));
                 }
                 Err(e) => {
@@ -1705,6 +1737,73 @@ impl SoundSharedApp {
                         mirror_playing(&self.sounds, engine);
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
+                    AudioCommand::SetBusVolume {
+                        bus,
+                        volume,
+                        response,
+                    } => {
+                        let result = self.director.set_bus_volume(&*engine, bus, volume);
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::Duck {
+                        target,
+                        amount,
+                        attack_ms,
+                        release_ms,
+                        response,
+                    } => {
+                        let result = self.director.run_mix_control(
+                            &*engine,
+                            MixControl::Duck {
+                                target,
+                                mode: DuckMode::On,
+                                amount,
+                                attack_ms,
+                                release_ms,
+                            },
+                        );
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::DuckRelease { target, response } => {
+                        let result = self.director.duck_release(&*engine, target);
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::DuckHold {
+                        target,
+                        active,
+                        response,
+                    } => {
+                        let result = if active {
+                            self.director.duck_start(&*engine, target)
+                        } else {
+                            self.director.duck_end(&*engine, target)
+                        };
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::DuckToggle { target, response } => {
+                        let result = self.director.duck_toggle(&*engine, target);
+                        let _ = response.send(result.map(|_| ()).map_err(|e| e.into()));
+                    }
+                    AudioCommand::SetNormalize {
+                        enabled,
+                        target_lufs,
+                        response,
+                    } => {
+                        let target = target_lufs
+                            .unwrap_or_else(|| self.director.normalization().target_lufs);
+                        {
+                            let mut config = self.app_state.config.lock().unwrap();
+                            config.audio.normalize = enabled;
+                            config.audio.normalize_target_lufs = target;
+                        }
+                        self.director.set_normalize(enabled, target);
+                        self.library_dirty = true;
+                        if enabled {
+                            sync_director(&mut self.director, &self.library, &self.sounds);
+                            self.director.normalize_catalog(&*engine);
+                        }
+                        let _ = response.send(Ok(()));
+                    }
                 }
             } else {
                 // Engine not available - handle each variant separately due to different response types
@@ -1746,6 +1845,14 @@ impl SoundSharedApp {
                         let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
                     }
                     AudioCommand::PlayStinger { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                    }
+                    AudioCommand::SetBusVolume { response, .. }
+                    | AudioCommand::Duck { response, .. }
+                    | AudioCommand::DuckRelease { response, .. }
+                    | AudioCommand::DuckHold { response, .. }
+                    | AudioCommand::DuckToggle { response, .. }
+                    | AudioCommand::SetNormalize { response, .. } => {
                         let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
                     }
                 };

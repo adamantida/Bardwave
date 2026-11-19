@@ -31,8 +31,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch};
 
 use crate::audio::director::{Director, DirectorState, Playback};
+use crate::audio::director_audio::{
+    bus_name, parse_bus, DuckMode, DuckTarget, GainUpdate, MixControl,
+};
 use crate::audio::{AudioEngine, CatalogSound, SoundId};
-use crate::config::LibraryConfig;
+use crate::config::{AudioConfig, LibraryConfig};
 
 /// Header every control action must carry (see the module docs).
 pub const CONTROL_HEADER: &str = "x-bardwave-control";
@@ -100,6 +103,8 @@ pub enum ControlAction {
     ActivateScene(usize),
     /// Fade out the active scene.
     StopScene,
+    /// A bus volume or ducking request.
+    Mix(MixControl),
 }
 
 /// One queued action plus where to send the resulting board state.
@@ -212,6 +217,25 @@ impl Board {
         Self { sounds, director }
     }
 
+    /// Take the ducking defaults and the normalization switch from `[audio]`.
+    pub fn configure_audio(&mut self, audio: &AudioConfig) {
+        self.director.configure_audio(audio);
+    }
+
+    /// Start measuring the loudness of every loaded sound that has no gain yet
+    /// (a no-op unless `audio.normalize` is on). Returns how many
+    /// measurements were started; the results arrive through
+    /// [`tick`](Self::tick) and [`take_gain_updates`](Self::take_gain_updates).
+    pub fn normalize_missing(&mut self, engine: &AudioEngine) -> usize {
+        self.director.normalize_catalog(engine)
+    }
+
+    /// Gains measured since the last call, for the caller to store in the
+    /// config (see `audio::director_audio::apply_gain_updates`).
+    pub fn take_gain_updates(&mut self) -> Vec<GainUpdate> {
+        self.director.take_gain_updates()
+    }
+
     /// Number of playable sounds.
     pub fn len(&self) -> usize {
         self.sounds.len()
@@ -312,6 +336,10 @@ impl Board {
             ControlAction::StopScene => {
                 self.director.stop_scene(pb).map_err(|e| e.to_string())?;
             }
+            ControlAction::Mix(control) => self
+                .director
+                .run_mix_control(pb, control)
+                .map_err(|e| e.to_string())?,
         }
         Ok(self.state(pb))
     }
@@ -373,6 +401,8 @@ pub fn router(commands: Sender<ControlCommand>) -> Router {
         .route("/api/control/volume", post(control_volume))
         .route("/api/control/loop", post(control_loop))
         .route("/api/control/master", post(control_master))
+        .route("/api/control/duck", post(control_duck))
+        .route("/api/control/bus", post(control_bus))
         .with_state(commands)
 }
 
@@ -592,6 +622,73 @@ async fn control_master(
         true,
     )
     .await
+}
+
+#[derive(Deserialize)]
+struct DuckQuery {
+    /// `on`, `off`, `toggle`, `start` (hold) or `end`; default `toggle`.
+    mode: Option<String>,
+    /// `music`, `ambience`, `sfx`, `all` or `default` (the configured buses).
+    bus: Option<String>,
+    /// Level the buses are lowered to, `0.0..=1.0` (`on` only).
+    amount: Option<f32>,
+    attack_ms: Option<u32>,
+    release_ms: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct BusQuery {
+    bus: String,
+    value: f32,
+}
+
+fn bad_request(message: String) -> Response {
+    (StatusCode::BAD_REQUEST, message).into_response()
+}
+
+/// `POST /api/control/duck?mode=on|off|toggle|start|end&bus=...&amount=...`
+async fn control_duck(
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    State(commands): State<Sender<ControlCommand>>,
+    Query(q): Query<DuckQuery>,
+) -> Response {
+    let mode_text = q.mode.as_deref().unwrap_or("toggle");
+    let Some(mode) = DuckMode::parse(mode_text) else {
+        return bad_request(format!("unknown duck mode \"{mode_text}\""));
+    };
+    let bus_text = q.bus.as_deref().unwrap_or("default");
+    let Some(target) = DuckTarget::parse(bus_text) else {
+        return bad_request(format!("unknown bus \"{bus_text}\""));
+    };
+    let action = ControlAction::Mix(MixControl::Duck {
+        target,
+        mode,
+        amount: q.amount,
+        attack_ms: q.attack_ms,
+        release_ms: q.release_ms,
+    });
+    run(peer, &headers, &commands, action, true).await
+}
+
+/// `POST /api/control/bus?bus=music|ambience|sfx&value=0.0..1.0`
+async fn control_bus(
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    State(commands): State<Sender<ControlCommand>>,
+    Query(q): Query<BusQuery>,
+) -> Response {
+    let Some(bus) = parse_bus(&q.bus) else {
+        return bad_request(format!(
+            "unknown bus \"{}\" (try {}, {} or {})",
+            q.bus,
+            bus_name(crate::config::Bus::Music),
+            bus_name(crate::config::Bus::Ambience),
+            bus_name(crate::config::Bus::Sfx)
+        ));
+    };
+    let action = ControlAction::Mix(MixControl::SetBusVolume(bus, q.value));
+    run(peer, &headers, &commands, action, true).await
 }
 
 /// The control page: a plain list of the library with play/stop, repeat and

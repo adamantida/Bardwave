@@ -61,6 +61,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
 
+use crate::audio::director_audio::AudioControl;
 use crate::audio::engine::{AudioEngine, EngineError, SoundId};
 use crate::audio::mixer::{Bus as MixerBus, DuckSettings, FadeCurve as MixerCurve};
 use crate::config::{Bus, FadeCurve, SceneConfig, SceneItemConfig, SceneStart};
@@ -461,7 +462,7 @@ struct PendingStart {
 
 /// The control core. See the module docs.
 pub struct Director {
-    catalog: Vec<CatalogSound>,
+    pub(crate) catalog: Vec<CatalogSound>,
     scenes: Vec<SceneConfig>,
     active: Option<String>,
     pending: Vec<PendingStart>,
@@ -469,6 +470,8 @@ pub struct Director {
     stingers: HashSet<SoundId>,
     state_tx: watch::Sender<DirectorState>,
     last_refresh: Option<Instant>,
+    /// Buses, ducking and normalization (see `director_audio.rs`).
+    pub(crate) audio_ctl: AudioControl,
 }
 
 impl Default for Director {
@@ -489,6 +492,7 @@ impl Director {
             stingers: HashSet::new(),
             state_tx,
             last_refresh: None,
+            audio_ctl: AudioControl::default(),
         }
     }
 
@@ -970,6 +974,7 @@ impl Director {
 
     /// [`tick`](Self::tick) with an explicit clock, for tests.
     pub fn tick_at<P: Playback + ?Sized>(&mut self, pb: &P, now: Instant) {
+        self.poll_normalization(pb);
         let mut ran = false;
         if self.pending.iter().any(|p| p.due <= now) {
             let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)

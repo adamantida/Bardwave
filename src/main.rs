@@ -676,7 +676,12 @@ fn main() -> Result<()> {
         let mut board = {
             let guard = audio_engine_shared.lock().unwrap();
             let engine = guard.as_ref().expect("audio engine");
-            soundshared::network::control::Board::load(engine, &config.library)
+            let mut board = soundshared::network::control::Board::load(engine, &config.library);
+            // Ducking defaults; loudness measurement runs in the background
+            // when `audio.normalize` is on.
+            board.configure_audio(&config.audio);
+            board.normalize_missing(engine);
+            board
         };
         info!("Library loaded: {} sound(s)", board.len());
 
@@ -732,6 +737,18 @@ fn main() -> Result<()> {
             }
             if let Some(engine) = audio_engine_shared.lock().unwrap().as_ref() {
                 board.tick(engine);
+            }
+            // Gains measured in the background go into the saved library.
+            let updates = board.take_gain_updates();
+            if !updates.is_empty()
+                && soundshared::audio::director_audio::apply_gain_updates(
+                    &mut config.library,
+                    &updates,
+                )
+            {
+                if let Err(e) = config.save() {
+                    error!("Failed to save measured loudness: {}", e);
+                }
             }
         }
 
