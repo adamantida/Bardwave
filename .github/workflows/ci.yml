@@ -50,3 +50,7 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets --locked
+
+      # The optional MIDI module is not built by default; keep it compiling.
+      - name: Check with the midi feature
+        run: cargo clippy --all-targets --locked --features midi

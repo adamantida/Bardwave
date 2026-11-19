@@ -271,7 +271,7 @@ pub enum RowStatus {
     Ok,
     /// The key text is not a key combination.
     Invalid(String),
-    /// A MIDI trigger in a build without MIDI support.
+    /// A MIDI trigger: MIDI input is not connected to the app, so it never fires.
     MidiUnavailable,
     /// Another entry (0-based index) has the same key and comes first: this
     /// entry never fires.
@@ -295,7 +295,8 @@ impl RowStatus {
             Self::Ok => return None,
             Self::Invalid(why) => why.clone(),
             Self::MidiUnavailable => {
-                "MIDI binding: this build has no MIDI support, it will not fire".to_string()
+                "MIDI binding: MIDI input is not connected in this build, it will not fire"
+                    .to_string()
             }
             Self::Shadowed(by) => format!(
                 "Conflict: the same key is bound in #{}, which wins - this one never fires",

@@ -27,7 +27,8 @@
 //!   with consuming of the egui events so keys do not leak into text fields.
 //! * [`HotkeyService`] ([`service`]): system-wide shortcuts through the
 //!   `global-hotkey` crate when `gui.global_hotkeys` is on.
-//! * `midi` (cargo feature `midi`, off by default): note / CC triggers.
+//! * `midi` (cargo feature `midi`, off by default): note / CC triggers. Not
+//!   connected to the GUI yet, so MIDI bindings are reported as unavailable.
 //!
 //! # Key syntax
 //!

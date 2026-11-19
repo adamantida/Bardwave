@@ -57,7 +57,9 @@ pub struct KeyEntry {
 pub enum ProblemKind {
     /// The key string does not parse.
     Invalid(ParseError),
-    /// A MIDI trigger, and this build has no MIDI support (`midi` feature off).
+    /// A MIDI trigger. Nothing in the app connects a MIDI device yet (the
+    /// `midi` module is not wired into the GUI loop), so it never fires, with
+    /// or without the `midi` cargo feature.
     MidiUnavailable,
     /// Another entry (index `by`) has the same combination and comes first,
     /// so this one never fires.
@@ -84,7 +86,7 @@ impl MapProblem {
         match &self.kind {
             ProblemKind::Invalid(e) => format!("hotkey {}: {e}", self.index + 1),
             ProblemKind::MidiUnavailable => format!(
-                "hotkey {}: {:?} is a MIDI binding, but this build has no MIDI support",
+                "hotkey {}: {:?} is a MIDI binding, but MIDI input is not connected in this build",
                 self.index + 1,
                 self.key
             ),
@@ -120,14 +122,13 @@ impl HotkeyMap {
         let mut map = Self::default();
         for (index, hotkey) in hotkeys.iter().enumerate() {
             if is_midi_key(&hotkey.key) {
-                // Handled by the MIDI module when it is compiled in.
-                if !cfg!(feature = "midi") {
-                    map.problems.push(MapProblem {
-                        index,
-                        key: hotkey.key.clone(),
-                        kind: ProblemKind::MidiUnavailable,
-                    });
-                }
+                // Keep reporting it until `MidiService` is wired into the GUI
+                // loop: the `midi` feature alone does not make it fire.
+                map.problems.push(MapProblem {
+                    index,
+                    key: hotkey.key.clone(),
+                    kind: ProblemKind::MidiUnavailable,
+                });
                 continue;
             }
             let binding = match Binding::parse_for(&hotkey.key, platform) {
@@ -321,12 +322,11 @@ mod tests {
         assert!(problems
             .iter()
             .any(|p| p.index == 2 && p.kind == ProblemKind::Shadowed { by: 0 }));
-        assert_eq!(
-            problems
-                .iter()
-                .any(|p| p.index == 4 && p.kind == ProblemKind::MidiUnavailable),
-            !cfg!(feature = "midi")
-        );
+        // Reported in every build: MidiService is not connected to the GUI, so
+        // a MIDI binding never fires, even with `--features midi`.
+        assert!(problems
+            .iter()
+            .any(|p| p.index == 4 && p.kind == ProblemKind::MidiUnavailable));
         for p in problems {
             assert!(!p.message().is_empty());
         }
