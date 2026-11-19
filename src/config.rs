@@ -427,6 +427,17 @@ pub struct SoundConfigEntry {
     /// does not stop other sounds and does not depend on the active scene.
     #[serde(default)]
     pub oneshot_stinger: bool,
+
+    /// Stereo position, `-1.0` (left) ..= `1.0` (right); `0.0` = centre (the
+    /// sound is untouched). Written only when it differs from the centre.
+    #[serde(default, skip_serializing_if = "is_centre_pan")]
+    pub pan: f32,
+}
+
+/// `serde` helper: a centred pan is not written, so configs of sounds that
+/// were never panned stay byte-identical to the ones older versions wrote.
+fn is_centre_pan(pan: &f32) -> bool {
+    *pan == 0.0
 }
 
 impl Default for SoundConfigEntry {
@@ -442,6 +453,7 @@ impl Default for SoundConfigEntry {
             gain_db: 0.0,
             bus: Bus::default(),
             oneshot_stinger: false,
+            pan: 0.0,
         }
     }
 }
@@ -553,6 +565,12 @@ pub struct SceneItemConfig {
     /// Delay after activation before the sound starts, in milliseconds.
     #[serde(default)]
     pub delay_ms: u32,
+
+    /// Stereo position inside this scene, `-1.0..=1.0`. When it is non-zero it
+    /// replaces the sound's own `pan`; `0.0` (the default) means "use the
+    /// sound's pan". Written only when non-zero.
+    #[serde(default, skip_serializing_if = "is_centre_pan")]
+    pub pan: f32,
 }
 
 /// A random/periodic sound source of a scene (`[[library.scenes.emitters]]`):

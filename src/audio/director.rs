@@ -341,6 +341,8 @@ pub struct CatalogSound {
     pub bus: Bus,
     /// A stinger: one-shot over everything, spared by scene changes.
     pub stinger: bool,
+    /// The sound's own stereo position, `-1.0..=1.0` (see `director_pan.rs`).
+    pub pan: f32,
 }
 
 impl CatalogSound {
@@ -354,6 +356,7 @@ impl CatalogSound {
             gain_db: 0.0,
             bus: Bus::default(),
             stinger: false,
+            pan: 0.0,
         }
     }
 
@@ -457,6 +460,8 @@ pub enum DirectorCommand {
     StopSound(SoundId),
     SetVolume(SoundId, f32),
     SetLoop(SoundId, bool),
+    /// A sound's own pan, `-1.0..=1.0` (see `director_pan.rs`).
+    SetPan(SoundId, f32),
     SetMaster(f32),
     StopAll,
     /// Control the music layer (playlists).
@@ -728,7 +733,14 @@ impl Director {
 
         for start in &plan.starts {
             if start.delay_ms == 0 {
-                match self.start_sound(pb, start.sound, start.looped, start.volume, plan.fade_in) {
+                match self.start_sound(
+                    pb,
+                    Some(&plan.scene),
+                    start.sound,
+                    start.looped,
+                    start.volume,
+                    plan.fade_in,
+                ) {
                     Ok(()) => report.started.push(start.sound),
                     Err(e) => report.errors.push(format!("{}: {e}", start.library_id)),
                 }
@@ -773,6 +785,8 @@ impl Director {
                 report.retuned.push(retune.sound);
             }
         }
+
+        self.apply_scene_pans(pb, &plan.scene);
 
         for sound in &plan.stops {
             match pb.stop(*sound, plan.fade_out) {
@@ -845,6 +859,7 @@ impl Director {
                 looped: pb.is_looped(entry.sound),
                 start: SceneStart::OnEnter,
                 delay_ms: 0,
+                pan: 0.0,
             });
         }
         if items.is_empty() {
@@ -880,6 +895,7 @@ impl Director {
             }
             None => pb.volume(sound).unwrap_or(1.0),
         };
+        self.pan_before_start(pb, None, sound)?;
         pb.play_one_shot(sound, volume)?;
         self.stingers.insert(sound);
         self.publish(pb);
@@ -931,6 +947,7 @@ impl Director {
             }
             None => None,
         };
+        self.pan_before_start(pb, self.active_scene(), sound)?;
         pb.stop(sound, FadeSpec::NONE)?;
         pb.play(sound, looped, level, FadeSpec::NONE)?;
         self.publish(pb);
@@ -1033,9 +1050,14 @@ impl Director {
                 {
                     continue;
                 }
-                if let Err(e) =
-                    self.start_sound(pb, start.sound, start.looped, start.volume, start.fade)
-                {
+                if let Err(e) = self.start_sound(
+                    pb,
+                    Some(&start.scene),
+                    start.sound,
+                    start.looped,
+                    start.volume,
+                    start.fade,
+                ) {
                     tracing::warn!("Delayed start of {} failed: {e}", start.sound);
                 }
                 ran = true;
@@ -1092,6 +1114,10 @@ impl Director {
                 self.set_sound_looped(pb, sound, looped)?;
                 DirectorOutcome::Done
             }
+            DirectorCommand::SetPan(sound, pan) => {
+                self.set_sound_pan(pb, sound, pan)?;
+                DirectorOutcome::Done
+            }
             DirectorCommand::SetMaster(volume) => {
                 self.set_master_volume(pb, volume)?;
                 DirectorOutcome::Done
@@ -1113,6 +1139,7 @@ impl Director {
     fn start_sound<P: Playback + ?Sized>(
         &self,
         pb: &P,
+        scene: Option<&str>,
         sound: SoundId,
         looped: bool,
         volume: f32,
@@ -1121,6 +1148,7 @@ impl Director {
         if let Some(entry) = self.catalog_sound(sound) {
             pb.set_bus(sound, entry.bus)?;
         }
+        self.pan_before_start(pb, scene, sound)?;
         pb.play(sound, looped, Some(volume), fade_in)
     }
 
@@ -1177,6 +1205,7 @@ pub fn import_scene(
                 looped: item.looped,
                 start: item.start,
                 delay_ms: item.delay_ms,
+                pan: item.pan,
             },
         );
     }
@@ -1210,6 +1239,7 @@ pub fn sync_from_library(
                 gain_db: sound.gain_db,
                 bus: sound.bus,
                 stinger: sound.oneshot_stinger,
+                pan: sound.pan,
             })
         })
         .collect();
@@ -1658,6 +1688,7 @@ mod tests {
             looped,
             start: SceneStart::OnEnter,
             delay_ms: 0,
+            pan: 0.0,
         }
     }
 

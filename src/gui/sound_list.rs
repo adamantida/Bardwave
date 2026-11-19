@@ -932,7 +932,10 @@ fn sound_row(
     }
 
     // Right-click: add to a scene, flag as a stinger.
-    resp.context_menu(|ui| crate::gui::scenes::sound_context_menu(ui, state, sound));
+    resp.context_menu(|ui| {
+        crate::gui::scenes::sound_context_menu(ui, state, sound);
+        crate::gui::pan_ui::sound_pan_section(ui, state, sound);
+    });
 
     if action_is_none(&action) && resp.hovered() {
         resp.on_hover_text(sound.path.to_string_lossy());

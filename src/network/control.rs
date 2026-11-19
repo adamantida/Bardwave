@@ -412,6 +412,7 @@ impl Board {
                 gain_db: entry.gain_db,
                 bus: entry.bus,
                 stinger: entry.oneshot_stinger,
+                pan: crate::audio::director_pan::sanitize_pan(entry.pan),
             });
             sounds.push(BoardSound {
                 library_id,

@@ -39,6 +39,7 @@ fn item(sound: &str, volume: f32, looped: bool) -> SceneItemConfig {
         looped,
         start: SceneStart::OnEnter,
         delay_ms: 0,
+        pan: 0.0,
     }
 }
 

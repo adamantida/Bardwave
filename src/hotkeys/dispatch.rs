@@ -307,6 +307,7 @@ mod tests {
             looped: false,
             start: SceneStart::OnEnter,
             delay_ms: 0,
+            pan: 0.0,
         }
     }
 

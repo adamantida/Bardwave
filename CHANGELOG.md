@@ -27,6 +27,7 @@ Read this before relying on the items below. They are implemented and covered by
 
 **Scenes and transitions**
 - Scenes (`[[library.scenes]]`): named sets of sounds with per-item volume, loop, automatic/manual start and start delay, a button colour, `fade_in_ms` / `fade_out_ms`, `stop_others`.
+- Pan controls: a centred slider (notch at zero, double click resets, tooltip like `L 40%`) in the right-click menu of a sound and in every row of the scene editor. `pan` (`-1.0..=1.0`, default `0`, not written when centred) is stored per library sound and per scene item; a non-zero item value overrides the sound's pan inside that scene. The Director applies it when a sound starts and live while it plays.
 - Crossfade between scenes with equal-power or linear curves; re-activating a scene mid-transition continues from the current levels. The mixer fades are now parametrised (previously a fixed 10 ms click guard).
 - "Save current mix as scene", scene editor, scene deck with a shared transition control (*Auto* = each scene's own fades), *Stop scene* and *Stop all* with a fade.
 - Stingers: one-shot sounds layered over everything, independent of the active scene (`oneshot_stinger`), with pads in the console.

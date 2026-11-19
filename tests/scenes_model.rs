@@ -569,6 +569,7 @@ fn validate_reports_dangling_references_from_a_damaged_config() {
                         looped: false,
                         start: SceneStart::OnEnter,
                         delay_ms: 0,
+                        pan: 0.0,
                     },
                     SceneItemConfig {
                         sound: ghost_sound.to_string(),
@@ -576,6 +577,7 @@ fn validate_reports_dangling_references_from_a_damaged_config() {
                         looped: false,
                         start: SceneStart::OnEnter,
                         delay_ms: 0,
+                        pan: 0.0,
                     },
                     // Not a UUID at all: cannot be represented, dropped on load.
                     SceneItemConfig {
@@ -584,6 +586,7 @@ fn validate_reports_dangling_references_from_a_damaged_config() {
                         looped: false,
                         start: SceneStart::OnEnter,
                         delay_ms: 0,
+                        pan: 0.0,
                     },
                 ],
                 emitters: vec![
@@ -892,6 +895,7 @@ fn damaged_scene_numbers_are_clamped_on_load() {
                 looped: false,
                 start: SceneStart::OnEnter,
                 delay_ms: 0,
+                pan: 0.0,
             }],
             emitters: vec![EmitterConfig {
                 sounds: vec![sound.to_string()],

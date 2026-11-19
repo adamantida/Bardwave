@@ -36,6 +36,16 @@ pub enum AudioCommand {
         looped: bool,
         response: Sender<anyhow::Result<()>>,
     },
+    /// Pan of a sound, `-1.0..=1.0` (see `gui::pan_ui`).
+    SetPan {
+        id: SoundId,
+        pan: f32,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Re-apply the library's pans to the sounds that play now.
+    SyncPans {
+        response: Sender<anyhow::Result<()>>,
+    },
     /// Set master volume
     SetMasterVolume {
         volume: f32,

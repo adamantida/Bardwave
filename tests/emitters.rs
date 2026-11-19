@@ -40,6 +40,7 @@ fn scene(id: &str, emitters: Vec<EmitterConfig>) -> SceneConfig {
             looped: true,
             start: SceneStart::OnEnter,
             delay_ms: 0,
+            pan: 0.0,
         }],
         emitters,
         ..Default::default()

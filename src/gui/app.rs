@@ -1761,6 +1761,15 @@ impl SoundSharedApp {
                         }
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
+                    AudioCommand::SetPan { id, pan, response } => {
+                        let result = self.director.set_sound_pan(&*engine, id, pan);
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::SyncPans { response } => {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        self.director.apply_pans(&*engine);
+                        let _ = response.send(Ok(()));
+                    }
                     AudioCommand::SetMasterVolume { volume, response } => {
                         let result = self.director.set_master_volume(&*engine, volume);
                         if result.is_ok() {
@@ -1992,7 +2001,9 @@ impl SoundSharedApp {
                     AudioCommand::PlayStinger { response, .. } => {
                         let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
                     }
-                    AudioCommand::SetBusVolume { response, .. }
+                    AudioCommand::SetPan { response, .. }
+                    | AudioCommand::SyncPans { response }
+                    | AudioCommand::SetBusVolume { response, .. }
                     | AudioCommand::Duck { response, .. }
                     | AudioCommand::DuckRelease { response, .. }
                     | AudioCommand::DuckHold { response, .. }
