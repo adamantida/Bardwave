@@ -35,6 +35,12 @@ pub fn sound_library_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) 
         hairline(ui);
         ui.add_space(Metrics::MD);
 
+        // Scene deck: scene buttons, stingers, transition time.
+        crate::gui::scenes::scenes_deck(ui, state);
+        ui.add_space(Metrics::MD);
+        hairline(ui);
+        ui.add_space(Metrics::MD);
+
         // Reserve the master strip at the bottom; the list takes the rest.
         let master_h = Metrics::ROW_H - 8.0;
         let list_h = (ui.available_height() - master_h - Metrics::MD).max(80.0);
@@ -747,6 +753,9 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
     } else if tag_resp.hovered() {
         tag_resp.on_hover_text("Change group");
     }
+
+    // Right-click: add to a scene, flag as a stinger.
+    resp.context_menu(|ui| crate::gui::scenes::sound_context_menu(ui, state, sound));
 
     if action_is_none(&action) && resp.hovered() {
         resp.on_hover_text(sound.path.to_string_lossy());
