@@ -63,6 +63,7 @@ use tokio::sync::watch;
 
 use crate::audio::engine::{AudioEngine, EngineError, SoundId};
 use crate::audio::mixer::{Bus as MixerBus, DuckSettings, FadeCurve as MixerCurve};
+use crate::audio::playlist::{MusicLayer, MusicPlayback, PlaylistCommand};
 use crate::config::{Bus, FadeCurve, SceneConfig, SceneItemConfig, SceneStart};
 
 /// Levels closer than this count as equal (no retune needed).
@@ -149,6 +150,11 @@ pub trait Playback {
     /// Volume of a bus. Default: nothing (mocks).
     fn set_bus_volume(&self, _bus: Bus, _volume: f32) -> PlaybackResult {
         Ok(())
+    }
+    /// Position, seek, pause and "track ended" for the music layer
+    /// (playlists). Default: not offered.
+    fn music(&self) -> Option<&dyn MusicPlayback> {
+        None
     }
 }
 
@@ -283,6 +289,10 @@ impl Playback for AudioEngine {
 
     fn set_bus_volume(&self, bus: Bus, volume: f32) -> PlaybackResult {
         AudioEngine::set_bus_volume(self, mixer_bus(bus), volume)
+    }
+
+    fn music(&self) -> Option<&dyn MusicPlayback> {
+        Some(self)
     }
 }
 
@@ -438,6 +448,8 @@ pub enum DirectorCommand {
     SetLoop(SoundId, bool),
     SetMaster(f32),
     StopAll,
+    /// Control the music layer (playlists).
+    Playlist(PlaylistCommand),
 }
 
 /// What [`Director::execute`] returns.
@@ -461,7 +473,7 @@ struct PendingStart {
 
 /// The control core. See the module docs.
 pub struct Director {
-    catalog: Vec<CatalogSound>,
+    pub(crate) catalog: Vec<CatalogSound>,
     scenes: Vec<SceneConfig>,
     active: Option<String>,
     pending: Vec<PendingStart>,
@@ -469,6 +481,8 @@ pub struct Director {
     stingers: HashSet<SoundId>,
     state_tx: watch::Sender<DirectorState>,
     last_refresh: Option<Instant>,
+    /// Playlists and the music player (see `audio::playlist`).
+    pub(crate) music: MusicLayer,
 }
 
 impl Default for Director {
@@ -489,6 +503,7 @@ impl Director {
             stingers: HashSet::new(),
             state_tx,
             last_refresh: None,
+            music: MusicLayer::default(),
         }
     }
 
@@ -656,7 +671,11 @@ impl Director {
         if scene.stop_others {
             plan.stops = playing
                 .into_iter()
-                .filter(|sound| !in_scene.contains(sound) && !self.is_stinger(*sound))
+                .filter(|sound| {
+                    !in_scene.contains(sound)
+                        && !self.is_stinger(*sound)
+                        && !self.music_reserves(scene, *sound)
+                })
                 .collect();
         }
         Ok(plan)
@@ -745,6 +764,7 @@ impl Director {
         }
 
         self.active = Some(plan.scene);
+        self.music_on_scene(pb, &mut report);
         self.last_refresh = Some(now);
         self.publish(pb);
         Ok(report)
@@ -774,6 +794,7 @@ impl Director {
                     Err(e) => report.errors.push(format!("{}: {e}", entry.id)),
                 }
             }
+            self.music_on_scene_stopped(pb, fade.ms);
         }
         self.publish(pb);
         Ok(report)
@@ -860,6 +881,7 @@ impl Director {
             .unwrap_or_default();
         self.pending.clear();
         self.active = None;
+        self.music_halt();
         let result = pb.stop_all(FadeSpec::new(ms, curve));
         self.publish(pb);
         Ok(result?)
@@ -959,7 +981,11 @@ impl Director {
 
     /// When [`tick`](Self::tick) next has work (the earliest delayed start).
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.pending.iter().map(|p| p.due).min()
+        self.pending
+            .iter()
+            .map(|p| p.due)
+            .chain(self.music_deadline())
+            .min()
     }
 
     /// Run what is due. Call it regularly from the engine's thread (once per
@@ -970,7 +996,7 @@ impl Director {
 
     /// [`tick`](Self::tick) with an explicit clock, for tests.
     pub fn tick_at<P: Playback + ?Sized>(&mut self, pb: &P, now: Instant) {
-        let mut ran = false;
+        let mut ran = self.music_tick(pb, now);
         if self.pending.iter().any(|p| p.due <= now) {
             let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
                 .into_iter()
@@ -1048,6 +1074,10 @@ impl Director {
             }
             DirectorCommand::StopAll => {
                 self.stop_all(pb)?;
+                DirectorOutcome::Done
+            }
+            DirectorCommand::Playlist(command) => {
+                self.playlist_command(pb, command)?;
                 DirectorOutcome::Done
             }
         })
@@ -1160,6 +1190,7 @@ pub fn sync_from_library(
         })
         .collect();
     director.sync_library(config.scenes, sounds);
+    director.set_playlists(config.playlists);
 }
 
 /// An in-memory [`Playback`] with a simulated gain per track. Used by the unit

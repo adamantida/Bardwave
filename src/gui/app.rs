@@ -1705,6 +1705,15 @@ impl SoundSharedApp {
                         mirror_playing(&self.sounds, engine);
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
+                    cmd => match cmd.into_playlist() {
+                        Ok((command, response)) => {
+                            sync_director(&mut self.director, &self.library, &self.sounds);
+                            let result = self.director.playlist_command(&*engine, command);
+                            mirror_playing(&self.sounds, engine);
+                            let _ = response.send(result.map_err(|e| e.into()));
+                        }
+                        Err(other) => warn!("Unhandled audio command: {other:?}"),
+                    },
                 }
             } else {
                 // Engine not available - handle each variant separately due to different response types
@@ -1747,6 +1756,11 @@ impl SoundSharedApp {
                     }
                     AudioCommand::PlayStinger { response, .. } => {
                         let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                    }
+                    cmd => {
+                        if let Ok((_, response)) = cmd.into_playlist() {
+                            let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                        }
                     }
                 };
             }
