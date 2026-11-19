@@ -103,6 +103,18 @@ impl LibraryUi {
         }
     }
 
+    /// Stop the local preview on an engine the caller already has locked.
+    ///
+    /// Every "stop everything" path (button, hotkey, timer, remote control)
+    /// ends the headphone preview too; those paths hold the engine lock, so
+    /// this takes the engine instead of locking it again.
+    pub(crate) fn stop_preview_on(&mut self, engine: &crate::audio::AudioEngine) {
+        if let Some(preview) = self.preview.take() {
+            // A track that already ended is gone from the mixer; that is fine.
+            let _ = engine.stop_track(preview.track);
+        }
+    }
+
     /// A new dialog identity; answers meant for an older dialog are ignored.
     pub(crate) fn next_token(&mut self) -> u64 {
         self.token += 1;

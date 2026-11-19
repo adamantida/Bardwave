@@ -686,6 +686,10 @@ impl SoundSharedApp {
         if !matches!(route, Route::Duck(_)) {
             sync_director(&mut self.director, &self.library, &self.sounds);
         }
+        if matches!(event.action, HotkeyAction::StopAll) {
+            // Like the Stop all button: the headphone preview goes too.
+            self.lib_ui.stop_preview_on(engine);
+        }
         let result: Result<(), String> = match route {
             Route::Duck(op) => {
                 run_duck_op(&mut self.director, engine, op).map_err(|e| e.to_string())
@@ -1823,6 +1827,44 @@ mod ui_tests {
             h.app.update(ctx)
         });
         assert!(!h.app.mix_view().ducked);
+    }
+
+    fn fake_preview() -> crate::gui::library_ui::PreviewTrack {
+        crate::gui::library_ui::PreviewTrack {
+            sound: Default::default(),
+            path: std::path::PathBuf::from("/nowhere/x.wav"),
+            track: uuid::Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn the_stop_all_hotkey_also_stops_the_headphone_preview() {
+        let mut h = harness(
+            config_with_hotkeys(vec![hk("F8", HotkeyAction::StopAll)]),
+            true,
+        );
+        h.app.lib_ui.preview = Some(fake_preview());
+        frame(&h.ctx, vec![key(egui::Key::F8, true)], |ctx| {
+            h.app.update(ctx)
+        });
+        assert!(h.app.lib_ui.preview.is_none());
+    }
+
+    #[test]
+    fn a_fade_out_command_also_stops_the_headphone_preview() {
+        let mut h = harness(Config::default(), true);
+        h.app.lib_ui.preview = Some(fake_preview());
+        let (response, _rx) = crossbeam_channel::bounded(1);
+        h.app
+            .app_state
+            .audio_cmd_tx
+            .send(crate::gui::types::AudioCommand::StopAllFade {
+                fade_ms: 500,
+                response,
+            })
+            .unwrap();
+        h.app.process_audio_commands();
+        assert!(h.app.lib_ui.preview.is_none());
     }
 
     #[test]

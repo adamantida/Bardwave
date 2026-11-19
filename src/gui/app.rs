@@ -1923,6 +1923,7 @@ impl SoundSharedApp {
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
                     AudioCommand::StopAll { response } => {
+                        self.lib_ui.stop_preview_on(&*engine);
                         let result = self.director.stop_all(&*engine);
                         if result.is_ok() {
                             for entry in self.sounds.lock().unwrap().values_mut() {
@@ -1932,6 +1933,7 @@ impl SoundSharedApp {
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
                     AudioCommand::StopAllFade { fade_ms, response } => {
+                        self.lib_ui.stop_preview_on(&*engine);
                         let result = self.director.stop_all_with_fade(&*engine, fade_ms);
                         mirror_playing(&self.sounds, engine);
                         let _ = response.send(result.map_err(|e| e.into()));

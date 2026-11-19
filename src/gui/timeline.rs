@@ -643,6 +643,9 @@ impl SoundSharedApp {
                 Some(engine) => {
                     sync_director(&mut self.director, &self.library, &self.sounds);
                     for event in &events {
+                        if matches!(event.action, TimerAction::StopAll { .. }) {
+                            self.lib_ui.stop_preview_on(engine);
+                        }
                         let run = self.director.run_timer_action(engine, &event.action);
                         let summary = action_summary(&event.action, &catalog);
                         lines.extend(log_lines(event, &summary, &run.warnings));
