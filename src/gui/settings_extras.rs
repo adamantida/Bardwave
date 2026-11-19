@@ -28,6 +28,8 @@ use crate::gui::theme::{hairline, micro_label, Metrics, Palette};
 use crate::gui::types::{AppState, AudioCommand};
 use crate::gui::widgets::{glyph, glyph_font, level_slider, BtnKind, ConsoleButton};
 
+pub mod kit;
+
 /// A press shorter than this is a click (latch); a longer one is a hold.
 pub const HOLD_AFTER: Duration = Duration::from_millis(350);
 
@@ -79,11 +81,92 @@ pub struct MixUi {
     /// The loudness target while it is being edited (applied when the edit
     /// ends, so dragging does not restart measurements for every value).
     target_edit: Option<f32>,
+    /// The interface scale while its slider is being dragged (applied when
+    /// the pointer lets go: the window would otherwise resize under the cursor
+    /// and the thumb would jump).
+    scale_edit: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------
 // Pure logic
 // ---------------------------------------------------------------------------
+
+/// Step of the interface scale slider, as a fraction (5 %).
+pub const UI_SCALE_STEP: f32 = 0.05;
+
+/// Slider position `0..=1` of an interface scale.
+pub fn scale_to_position(scale: f32) -> f32 {
+    let scale = crate::config::clamp_ui_scale(scale);
+    (scale - crate::config::UI_SCALE_MIN)
+        / (crate::config::UI_SCALE_MAX - crate::config::UI_SCALE_MIN)
+}
+
+/// Interface scale of a slider position, snapped to [`UI_SCALE_STEP`] so a
+/// drag lands on round percentages (and on exactly 100 %).
+pub fn position_to_scale(position: f32) -> f32 {
+    let raw = crate::config::UI_SCALE_MIN
+        + position.clamp(0.0, 1.0) * (crate::config::UI_SCALE_MAX - crate::config::UI_SCALE_MIN);
+    let snapped = (raw / UI_SCALE_STEP).round() * UI_SCALE_STEP;
+    // Round-tripping through steps leaves float dust (1.0000001): clean it.
+    crate::config::clamp_ui_scale((snapped * 100.0).round() / 100.0)
+}
+
+/// `1.3` -> `130%`.
+pub fn format_scale(scale: f32) -> String {
+    format!("{:.0}%", crate::config::clamp_ui_scale(scale) * 100.0)
+}
+
+/// egui pixels-per-point for an interface scale on a monitor whose native
+/// ratio is `native` (`None`/nonsense counts as 1.0). On a 2x display the
+/// scale multiplies the 2x, so 130 % stays sharp.
+pub fn target_pixels_per_point(native: Option<f32>, scale: f32) -> f32 {
+    let native = native.filter(|n| n.is_finite() && *n > 0.0).unwrap_or(1.0);
+    native * crate::config::clamp_ui_scale(scale)
+}
+
+/// Make the window use `scale`. Cheap to call every frame: it only touches
+/// egui when the effective ratio differs. Keyboard zoom (Ctrl +/-) is switched
+/// off so the slider stays the one source of truth.
+pub fn apply_ui_scale(ctx: &egui::Context, scale: f32) {
+    if ctx.options(|o| o.zoom_with_keyboard) {
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+    }
+    let target = target_pixels_per_point(ctx.native_pixels_per_point(), scale);
+    if (ctx.pixels_per_point() - target).abs() > 1e-3 {
+        ctx.set_pixels_per_point(target);
+    }
+    keep_window_usable(ctx);
+}
+
+/// Smallest window the layout is designed for, in egui points (the same
+/// numbers `GuiApp::native_options` asks for).
+pub const MIN_WINDOW: egui::Vec2 = egui::vec2(960.0, 620.0);
+
+/// The size the window must grow to when it is `current` points big and the
+/// layout needs `min`; `None` when it already fits.
+pub fn grown_window(current: egui::Vec2, min: egui::Vec2) -> Option<egui::Vec2> {
+    (current.x + 0.5 < min.x || current.y + 0.5 < min.y)
+        .then(|| egui::vec2(current.x.max(min.x), current.y.max(min.y)))
+}
+
+/// A larger scale shrinks the usable area (960 px at 130 % is 738 points), and
+/// the OS minimum size was set for the old scale. Whenever the pixels-per-point
+/// change, state the layout's minimum again (the OS then keeps the window at
+/// least that big in the new unit) and grow a window that has become too small.
+fn keep_window_usable(ctx: &egui::Context) {
+    let id = egui::Id::new("bardwave_min_window_ppp");
+    let ppp = ctx.pixels_per_point();
+    let seen: Option<f32> = ctx.data(|d| d.get_temp(id));
+    if seen.is_some_and(|seen| (seen - ppp).abs() < 1e-3) {
+        return;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, ppp));
+    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_WINDOW));
+    let inner = ctx.input(|i| i.viewport().inner_rect);
+    if let Some(size) = inner.and_then(|rect| grown_window(rect.size(), MIN_WINDOW)) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+    }
+}
 
 /// Click-or-hold recognition for the DUCK button.
 ///
@@ -314,10 +397,10 @@ pub fn mix_section(ui: &mut Ui, state: &mut SoundSharedApp) {
                     .color(Palette::WHITE),
             );
         });
-        ui.add_space(2.0);
+        ui.add_space(Metrics::SM);
     }
 
-    ui.add_space(Metrics::SM);
+    ui.add_space(Metrics::XS);
 
     // ---- DUCK + Hotkeys ----
     let hotkeys_w = 112.0;
@@ -367,13 +450,81 @@ pub fn mix_section(ui: &mut Ui, state: &mut SoundSharedApp) {
     });
     crate::gui::timeline::timers_button(ui, state);
 
-    ui.add_space(Metrics::SM);
+    ui.add_space(Metrics::MD);
     duck_settings(ui, state, &view);
 
-    ui.add_space(Metrics::MD);
+    ui.add_space(Metrics::LG);
     hairline(ui);
-    ui.add_space(Metrics::MD);
+    ui.add_space(Metrics::LG);
     normalize_controls(ui, state, &view);
+
+    ui.add_space(Metrics::LG);
+    hairline(ui);
+    ui.add_space(Metrics::LG);
+    interface_section(ui, state);
+}
+
+/// The INTERFACE block: the window scale slider. The scale is stored in
+/// `[gui] ui_scale` and applied to the running window by [`apply_ui_scale`].
+fn interface_section(ui: &mut Ui, state: &mut SoundSharedApp) {
+    let saved = state.app_state.config.lock().unwrap().gui.scale();
+    let shown = state.extras.mix.scale_edit.unwrap_or(saved);
+
+    ui.label(micro_label("Interface"));
+    ui.add_space(Metrics::SM);
+
+    let mut commit: Option<f32> = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = Metrics::SM;
+        ui.add_sized([68.0, 18.0], egui::Label::new(micro_label("Scale")));
+        let width = (ui.available_width() - 100.0).max(60.0);
+        let mut position = scale_to_position(shown);
+        let slider = level_slider(ui, &mut position, width, "ui_scale");
+        slider.widget_info(|| {
+            egui::WidgetInfo::slider(
+                true,
+                f64::from(shown),
+                format!("Interface scale {}", format_scale(shown)),
+            )
+        });
+        if slider.changed() {
+            state.extras.mix.scale_edit = Some(position_to_scale(position));
+        }
+        // Apply once the pointer is up (keyboard steps are applied at once).
+        let holding = slider.is_pointer_button_down_on() || slider.dragged();
+        if !holding {
+            commit = state.extras.mix.scale_edit.take();
+        }
+        ui.label(
+            RichText::new(format_scale(shown))
+                .font(glyph_font(11.0))
+                .color(Palette::WHITE),
+        );
+        let reset = ConsoleButton::ghost("Reset")
+            .small()
+            .width(64.0)
+            .enabled((shown - 1.0).abs() > f32::EPSILON)
+            .tooltip("Back to 100 %")
+            .id_salt("ui_scale_reset")
+            .show(ui);
+        if reset.clicked() {
+            state.extras.mix.scale_edit = None;
+            commit = Some(1.0);
+        }
+    });
+    kit::note_under(
+        ui,
+        "Makes everything larger or smaller, for a small laptop screen or a big monitor. \
+         Applied at once and remembered.",
+        Palette::ZINC_500,
+    );
+
+    if let Some(scale) = commit {
+        if (scale - saved).abs() > f32::EPSILON {
+            state.app_state.config.lock().unwrap().gui.ui_scale = scale;
+            state.library_dirty = true;
+        }
+    }
 }
 
 /// Depth, timings and the buses the duck acts on.
@@ -382,7 +533,7 @@ fn duck_settings(ui: &mut Ui, state: &mut SoundSharedApp, view: &MixView) {
         .id_salt("mix_duck_settings")
         .default_open(false)
         .show(ui, |ui| {
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::SM);
 
             // Level the ducked buses drop to (1.0 = no ducking).
             let mut amount = view.duck_amount.clamp(0.0, 1.0);
@@ -398,7 +549,7 @@ fn duck_settings(ui: &mut Ui, state: &mut SoundSharedApp, view: &MixView) {
                         .color(Palette::ZINC_300),
                 );
             });
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::SM);
 
             ui.horizontal(|ui| {
                 ui.add_sized([68.0, 18.0], egui::Label::new(micro_label("Attack")));
@@ -429,7 +580,7 @@ fn duck_settings(ui: &mut Ui, state: &mut SoundSharedApp, view: &MixView) {
                     state.edit_audio_config(|audio| audio.duck_release_ms = release);
                 }
             });
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::SM);
 
             ui.horizontal(|ui| {
                 ui.add_sized([68.0, 18.0], egui::Label::new(micro_label("Ducks")));
@@ -441,7 +592,7 @@ fn duck_settings(ui: &mut Ui, state: &mut SoundSharedApp, view: &MixView) {
                     }
                 }
             });
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::SM);
         });
 }
 
@@ -472,6 +623,7 @@ fn normalize_controls(ui: &mut Ui, state: &mut SoundSharedApp, view: &MixView) {
             state.request_normalize(enabled, target);
         }
     });
+    ui.add_space(Metrics::SM);
 
     ui.horizontal(|ui| {
         ui.add_sized([68.0, 18.0], egui::Label::new(micro_label("Target")));
@@ -495,18 +647,10 @@ fn normalize_controls(ui: &mut Ui, state: &mut SoundSharedApp, view: &MixView) {
             state.request_normalize(view.normalize, target);
         }
     });
-    ui.add_space(2.0);
-    ui.add(
-        egui::Label::new(
-            RichText::new(normalize_status(
-                view.normalize,
-                view.target_lufs,
-                view.measuring,
-            ))
-            .font(glyph_font(Metrics::MICRO))
-            .color(Palette::ZINC_500),
-        )
-        .wrap(),
+    kit::note_under(
+        ui,
+        normalize_status(view.normalize, view.target_lufs, view.measuring),
+        Palette::ZINC_500,
     );
 }
 
@@ -655,6 +799,9 @@ mod tests {
         assert_eq!(BUSES.len(), 3);
     }
 }
+
+#[cfg(test)]
+mod panel_tests;
 
 #[cfg(test)]
 mod ui_tests {

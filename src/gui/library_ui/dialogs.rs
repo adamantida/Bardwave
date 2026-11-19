@@ -12,6 +12,7 @@ use egui::{Color32, Context, RichText, Ui, Vec2};
 
 use crate::gui::app::SoundSharedApp;
 use crate::gui::groups::Library;
+use crate::gui::settings_extras::kit;
 use crate::gui::theme::{
     alpha, hairline, micro_label, micro_label_accent, panel_title, Metrics, Palette,
 };
@@ -80,43 +81,24 @@ fn paint_scrim(ctx: &Context) {
 }
 
 fn modal(ctx: &Context, width: f32, add: impl FnOnce(&mut Ui)) {
-    egui::Window::new("library_modal")
-        .id(egui::Id::new("library_modal"))
-        .order(egui::Order::Foreground)
-        .title_bar(false)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .frame(crate::gui::theme::panel_frame())
-        .show(ctx, |ui| {
-            ui.set_width(width);
-            add(ui);
-        });
+    kit::modal_window(ctx, "library_modal", width, add);
 }
 
 fn header(ui: &mut Ui, title: &str, subtitle: &str) {
     ui.label(micro_label_accent("Library"));
-    ui.add_space(2.0);
+    ui.add_space(Metrics::XS);
     ui.label(panel_title(title));
-    ui.add_space(2.0);
+    ui.add_space(Metrics::XS);
     ui.label(micro_label(subtitle));
-    ui.add_space(Metrics::MD);
+    ui.add_space(Metrics::LG);
 }
 
 fn body(ui: &mut Ui, text: impl Into<String>) {
-    ui.label(
-        RichText::new(text.into())
-            .font(glyph_font(11.0))
-            .color(Palette::ZINC_300),
-    );
+    ui.add(egui::Label::new(kit::note_text(text, 11.0, Palette::ZINC_300)).wrap());
 }
 
 fn dim(ui: &mut Ui, text: impl Into<String>) {
-    ui.label(
-        RichText::new(text.into())
-            .font(glyph_font(10.0))
-            .color(Palette::ZINC_500),
-    );
+    ui.add(egui::Label::new(kit::note_text(text, 10.0, Palette::ZINC_500)).wrap());
 }
 
 fn problem(ui: &mut Ui, text: impl Into<String>, safety: bool) {
@@ -131,11 +113,7 @@ fn problem(ui: &mut Ui, text: impl Into<String>, safety: bool) {
         .rounding(egui::Rounding::same(Metrics::R_SM))
         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(text.into())
-                    .font(glyph_font(11.0))
-                    .color(color),
-            );
+            ui.add(egui::Label::new(kit::note_text(text, 11.0, color)).wrap());
         });
 }
 
@@ -189,7 +167,7 @@ fn scroll_list(ui: &mut Ui, id: &str, max_height: f32, add: impl FnOnce(&mut Ui)
         .max_height(max_height)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.spacing_mut().item_spacing.y = Metrics::XS;
             add(ui);
         });
 }

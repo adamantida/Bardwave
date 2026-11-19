@@ -335,7 +335,7 @@ pub fn top_bar_controls(ui: &mut Ui, state: &mut SoundSharedApp) {
         });
     }
 
-    ui.add_space(Metrics::XS);
+    ui.add_space(Metrics::SM);
     let dir = recordings_dir(&config.lock().unwrap());
     let pick = IconButton::new(glyph::FOLDER)
         .size(26.0)

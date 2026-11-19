@@ -21,7 +21,7 @@
 //! [`HotkeyDispatcher`]: they use the Director's own duck state, so a hotkey,
 //! the DUCK button and the phone panel all agree on what is ducked.
 
-use egui::{Context, Event, Modifiers, RichText, Ui, Vec2};
+use egui::{Context, Event, Modifiers, RichText, Ui};
 use uuid::Uuid;
 
 use crate::audio::director::{Director, DirectorError, Playback};
@@ -29,6 +29,7 @@ use crate::audio::{DuckTarget, PlaylistCommand};
 use crate::config::{HotkeyAction, HotkeyConfig};
 use crate::gui::app::{mirror_playing, sync_director, Dialog, SoundSharedApp};
 use crate::gui::groups::Library;
+use crate::gui::settings_extras::kit;
 use crate::gui::theme::Metrics;
 use crate::gui::theme::{alpha, hairline, micro_label, micro_label_accent, panel_title, Palette};
 use crate::gui::types::AppState;
@@ -859,288 +860,251 @@ pub fn show_hotkeys_dialog(ctx: &Context, state: &mut SoundSharedApp) {
     let mut text_error: Option<String> = None;
     let mut intents: Vec<Intent> = Vec::new();
 
-    egui::Window::new("hotkeys_modal")
-        .id(egui::Id::new("hotkeys_modal"))
-        .order(egui::Order::Foreground)
-        .title_bar(false)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .frame(crate::gui::theme::panel_frame())
-        .show(ctx, |ui| {
-            ui.set_width(DIALOG_W);
-            ui.label(micro_label_accent("Settings"));
-            ui.add_space(2.0);
-            ui.label(panel_title("Hotkeys"));
-            ui.add_space(2.0);
-            ui.label(micro_label(
-                "Click a key to change it. Keys fire while this window is focused.",
-            ));
-            ui.add_space(Metrics::MD);
+    kit::modal_window(ctx, "hotkeys_modal", DIALOG_W, |ui| {
+        ui.label(micro_label_accent("Settings"));
+        ui.add_space(2.0);
+        ui.label(panel_title("Hotkeys"));
+        ui.add_space(2.0);
+        ui.label(micro_label(
+            "Click a key to change it. Keys fire while this window is focused.",
+        ));
+        ui.add_space(Metrics::LG);
 
-            // ---- Global shortcuts ----
-            let mut global = global_on;
-            if ui
-                .checkbox(
-                    &mut global,
-                    RichText::new("GLOBAL HOTKEYS (WHEN THE WINDOW IS NOT FOCUSED)")
-                        .font(glyph_font(Metrics::MICRO))
-                        .color(Palette::ZINC_300)
-                        .extra_letter_spacing(0.8),
-                )
-                .changed()
-            {
-                intents.push(Intent::SetGlobal(global));
-            }
-            ui.add(
-                egui::Label::new(
-                    RichText::new(global_hint(platform))
-                        .font(glyph_font(Metrics::MICRO))
-                        .color(Palette::ZINC_500),
-                )
-                .wrap(),
-            );
-            ui.add_space(Metrics::XS);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(service_line)
-                        .font(glyph_font(Metrics::MICRO))
-                        .color(if service_problem {
-                            Palette::AMBER_400
-                        } else if global_on {
-                            Palette::ROSE_400
-                        } else {
-                            Palette::ZINC_500
-                        }),
-                )
-                .wrap(),
-            );
+        // ---- Global shortcuts ----
+        let mut global = global_on;
+        if ui
+            .checkbox(
+                &mut global,
+                RichText::new("GLOBAL HOTKEYS (WHEN THE WINDOW IS NOT FOCUSED)")
+                    .font(glyph_font(Metrics::MICRO))
+                    .color(Palette::ZINC_300)
+                    .extra_letter_spacing(0.8),
+            )
+            .changed()
+        {
+            intents.push(Intent::SetGlobal(global));
+        }
+        kit::note_under(ui, global_hint(platform), Palette::ZINC_500);
+        kit::note_under(
+            ui,
+            service_line,
+            if service_problem {
+                Palette::AMBER_400
+            } else if global_on {
+                Palette::ROSE_400
+            } else {
+                Palette::ZINC_500
+            },
+        );
 
-            ui.add_space(Metrics::MD);
-            hairline(ui);
-            ui.add_space(Metrics::MD);
+        ui.add_space(Metrics::LG);
+        hairline(ui);
+        ui.add_space(Metrics::LG);
 
-            // ---- Bindings ----
-            ui.label(micro_label(format!("Bindings ({})", hotkeys.len())));
-            ui.add_space(Metrics::SM);
-            egui::ScrollArea::vertical()
-                .id_salt("hotkeys_scroll")
-                .max_height(230.0)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = Metrics::SM;
-                    if hotkeys.is_empty() {
-                        ui.label(micro_label(
-                            "No hotkeys yet. Add one below: pick an action, press a key.",
-                        ));
-                    }
-                    for (index, hotkey) in hotkeys.iter().enumerate() {
-                        binding_row(
-                            ui,
-                            index,
-                            hotkey,
-                            &statuses[index],
-                            &catalog,
-                            platform,
-                            capture == Some(CaptureTarget::Row(index)),
-                            &mut intents,
-                        );
+        // ---- Bindings ----
+        ui.label(micro_label(format!("Bindings ({})", hotkeys.len())));
+        ui.add_space(Metrics::SM);
+        egui::ScrollArea::vertical()
+            .id_salt("hotkeys_scroll")
+            .max_height(330.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = Metrics::SM;
+                if hotkeys.is_empty() {
+                    kit::empty_state(
+                        ui,
+                        "No hotkeys yet",
+                        "Pick an action below, press Capture key and press the combination, \
+                             then Add hotkey. Try Ctrl+1 for a scene or F5 for Stop All.",
+                    );
+                }
+                for (index, hotkey) in hotkeys.iter().enumerate() {
+                    binding_row(
+                        ui,
+                        index,
+                        hotkey,
+                        &statuses[index],
+                        &catalog,
+                        platform,
+                        capture == Some(CaptureTarget::Row(index)),
+                        &mut intents,
+                    );
+                }
+            });
+
+        ui.add_space(Metrics::LG);
+        hairline(ui);
+        ui.add_space(Metrics::LG);
+
+        // ---- New binding ----
+        ui.label(micro_label("New hotkey"));
+        ui.add_space(Metrics::SM);
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("hk_new_kind")
+                .width(200.0)
+                .selected_text(draft.kind.label())
+                .show_ui(ui, |ui| {
+                    for kind in ActionKind::ALL {
+                        if ui
+                            .selectable_value(&mut draft.kind, kind, kind.label())
+                            .changed()
+                        {
+                            draft.target = None;
+                        }
                     }
                 });
-
-            ui.add_space(Metrics::MD);
-            hairline(ui);
-            ui.add_space(Metrics::MD);
-
-            // ---- New binding ----
-            ui.label(micro_label("New hotkey"));
-            ui.add_space(Metrics::SM);
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("hk_new_kind")
-                    .width(200.0)
-                    .selected_text(draft.kind.label())
+            if draft.kind.needs_target() {
+                let options = catalog.options(draft.kind);
+                let current = draft
+                    .target
+                    .as_deref()
+                    .and_then(|id| catalog.name_of(draft.kind, id))
+                    .unwrap_or(if options.is_empty() {
+                        "(none in the library)"
+                    } else {
+                        "Choose..."
+                    })
+                    .to_string();
+                egui::ComboBox::from_id_salt("hk_new_target")
+                    .width(ui.available_width().max(120.0))
+                    .selected_text(crate::gui::widgets::elide(&current, 28))
                     .show_ui(ui, |ui| {
-                        for kind in ActionKind::ALL {
-                            if ui
-                                .selectable_value(&mut draft.kind, kind, kind.label())
-                                .changed()
-                            {
-                                draft.target = None;
+                        for (id, name) in options {
+                            let selected = draft.target.as_deref().is_some_and(|t| same_id(t, id));
+                            if ui.selectable_label(selected, name).clicked() {
+                                draft.target = Some(id.clone());
                             }
                         }
                     });
-                if draft.kind.needs_target() {
-                    let options = catalog.options(draft.kind);
-                    let current = draft
-                        .target
-                        .as_deref()
-                        .and_then(|id| catalog.name_of(draft.kind, id))
-                        .unwrap_or(if options.is_empty() {
-                            "(none in the library)"
-                        } else {
-                            "Choose..."
-                        })
-                        .to_string();
-                    egui::ComboBox::from_id_salt("hk_new_target")
-                        .width(ui.available_width().max(120.0))
-                        .selected_text(crate::gui::widgets::elide(&current, 28))
-                        .show_ui(ui, |ui| {
-                            for (id, name) in options {
-                                let selected = draft
-                                    .target
-                                    .as_deref()
-                                    .is_some_and(|t| same_id(t, id));
-                                if ui.selectable_label(selected, name).clicked() {
-                                    draft.target = Some(id.clone());
-                                }
-                            }
-                        });
+            }
+        });
+        ui.add_space(Metrics::SM);
+        ui.horizontal(|ui| {
+            let capturing_draft = capture == Some(CaptureTarget::Draft);
+            let (label, kind_hint) = if capturing_draft {
+                ("Press a key...  (Esc cancels)".to_string(), true)
+            } else {
+                match &draft.key {
+                    Some(b) => (b.label_for(platform), false),
+                    None => ("Capture key".to_string(), false),
                 }
-            });
-            ui.add_space(Metrics::SM);
-            ui.horizontal(|ui| {
-                let capturing_draft = capture == Some(CaptureTarget::Draft);
-                let (label, kind_hint) = if capturing_draft {
-                    ("Press a key...  (Esc cancels)".to_string(), true)
-                } else {
-                    match &draft.key {
-                        Some(b) => (b.label_for(platform), false),
-                        None => ("Capture key".to_string(), false),
-                    }
-                };
-                let button = if kind_hint {
-                    ConsoleButton::primary(label)
-                } else {
-                    ConsoleButton::ghost(label)
-                };
-                if button
-                    .width(210.0)
-                    .height(Metrics::BTN_H)
-                    .tooltip(
-                        "Click, then press the combination. The numeric keypad and the Win/Super key \
+            };
+            let button = if kind_hint {
+                ConsoleButton::primary(label)
+            } else {
+                ConsoleButton::ghost(label)
+            };
+            if button
+                .width(210.0)
+                .height(Metrics::BTN_H)
+                .tooltip(
+                    "Click, then press the combination. The numeric keypad and the Win/Super key \
                          cannot be captured: type them instead.",
-                    )
-                    .id_salt("hk_capture_draft")
-                    .show(ui)
-                    .clicked()
-                {
-                    intents.push(if capturing_draft {
-                        Intent::CancelCapture
-                    } else {
-                        Intent::Capture(CaptureTarget::Draft)
-                    });
-                }
-
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut key_text)
-                        .hint_text("or type: Ctrl+Shift+1")
-                        .desired_width(ui.available_width().max(100.0))
-                        .font(glyph_font(12.0))
-                        .margin(egui::Margin::symmetric(10.0, 8.0)),
-                );
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    match parse_key_text(&key_text, platform) {
-                        Ok(binding) => draft.key = Some(binding),
-                        Err(e) => text_error = Some(e),
-                    }
-                }
-            });
-
-            // What the draft would do to existing bindings.
-            let draft_action = draft.kind.build(draft.target.as_deref());
-            let plan = draft
-                .key
-                .as_ref()
-                .map(|b| plan_add(&hotkeys, b, platform));
-            ui.add_space(Metrics::XS);
-            if let Some(error) = text_error.clone().or_else(|| {
-                notice
-                    .as_ref()
-                    .filter(|(_, is_error)| *is_error)
-                    .map(|(text, _)| text.clone())
-            }) {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(error)
-                            .font(glyph_font(Metrics::MICRO))
-                            .color(Palette::ROSE_400),
-                    )
-                    .wrap(),
-                );
-            } else if let (Some(AddPlan::Replace(index)), Some(b)) = (plan, &draft.key) {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!(
-                            "{} is already bound in #{} ({}): adding replaces that binding.",
-                            b.label_for(platform),
-                            index + 1,
-                            action_label(&hotkeys[index].action, &catalog)
-                        ))
-                        .font(glyph_font(Metrics::MICRO))
-                        .color(Palette::AMBER_400),
-                    )
-                    .wrap(),
-                );
-            } else if let Some(b) = &draft.key {
-                if global_on && !b.is_global_safe() {
-                    ui.label(
-                        RichText::new(
-                            "Without Ctrl / Alt / Cmd this key only works while the window is focused.",
-                        )
-                        .font(glyph_font(Metrics::MICRO))
-                        .color(Palette::ZINC_500),
-                    );
-                } else if !b.is_locally_matchable(platform) {
-                    ui.label(
-                        RichText::new(
-                            "This key cannot be seen by the window: it only works as a global hotkey.",
-                        )
-                        .font(glyph_font(Metrics::MICRO))
-                        .color(Palette::AMBER_400),
-                    );
-                }
+                )
+                .id_salt("hk_capture_draft")
+                .show(ui)
+                .clicked()
+            {
+                intents.push(if capturing_draft {
+                    Intent::CancelCapture
+                } else {
+                    Intent::Capture(CaptureTarget::Draft)
+                });
             }
 
-            ui.add_space(Metrics::MD);
-            hairline(ui);
-            ui.add_space(Metrics::MD);
-
-            ui.horizontal(|ui| {
-                let can_add = draft.key.is_some() && draft_action.is_some();
-                let add_label = match plan {
-                    Some(AddPlan::Replace(_)) => "Replace",
-                    _ => "Add hotkey",
-                };
-                if ConsoleButton::primary(add_label)
-                    .glyph(glyph::PLUS)
-                    .width(170.0)
-                    .height(Metrics::BTN_H)
-                    .enabled(can_add)
-                    .tooltip(if can_add {
-                        "Save this binding"
-                    } else {
-                        "Choose an action (and its target) and a key first"
-                    })
-                    .id_salt("hk_add")
-                    .show(ui)
-                    .clicked()
-                    && can_add
-                {
-                    intents.push(Intent::AddDraft);
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut key_text)
+                    .hint_text("or type: Ctrl+Shift+1")
+                    .desired_width(ui.available_width().max(100.0))
+                    .font(glyph_font(12.0))
+                    .margin(egui::Margin::symmetric(10.0, 8.0)),
+            );
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                match parse_key_text(&key_text, platform) {
+                    Ok(binding) => draft.key = Some(binding),
+                    Err(e) => text_error = Some(e),
                 }
-                ui.add_space(Metrics::SM);
-                if ConsoleButton::ghost("Done")
-                    .glyph(glyph::CHECK)
-                    .width(120.0)
-                    .height(Metrics::BTN_H)
-                    .id_salt("hk_close")
-                    .show(ui)
-                    .clicked()
-                {
-                    intents.push(Intent::Close);
-                }
-            });
+            }
         });
+
+        // What the draft would do to existing bindings.
+        let draft_action = draft.kind.build(draft.target.as_deref());
+        let plan = draft.key.as_ref().map(|b| plan_add(&hotkeys, b, platform));
+        ui.add_space(Metrics::XS);
+        if let Some(error) = text_error.clone().or_else(|| {
+            notice
+                .as_ref()
+                .filter(|(_, is_error)| *is_error)
+                .map(|(text, _)| text.clone())
+        }) {
+            kit::note_colored(ui, error, Palette::ROSE_400);
+        } else if let (Some(AddPlan::Replace(index)), Some(b)) = (plan, &draft.key) {
+            kit::note_colored(
+                ui,
+                format!(
+                    "{} is already bound in #{} ({}): adding replaces that binding.",
+                    b.label_for(platform),
+                    index + 1,
+                    action_label(&hotkeys[index].action, &catalog)
+                ),
+                Palette::AMBER_400,
+            );
+        } else if let Some(b) = &draft.key {
+            if global_on && !b.is_global_safe() {
+                kit::note_colored(
+                    ui,
+                    "Without Ctrl / Alt / Cmd this key only works while the window is focused.",
+                    Palette::ZINC_500,
+                );
+            } else if !b.is_locally_matchable(platform) {
+                kit::note_colored(
+                    ui,
+                    "This key cannot be seen by the window: it only works as a global hotkey.",
+                    Palette::AMBER_400,
+                );
+            }
+        }
+
+        ui.add_space(Metrics::LG);
+        hairline(ui);
+        ui.add_space(Metrics::MD);
+
+        ui.horizontal(|ui| {
+            let can_add = draft.key.is_some() && draft_action.is_some();
+            let add_label = match plan {
+                Some(AddPlan::Replace(_)) => "Replace",
+                _ => "Add hotkey",
+            };
+            if ConsoleButton::primary(add_label)
+                .glyph(glyph::PLUS)
+                .width(170.0)
+                .height(Metrics::BTN_H)
+                .enabled(can_add)
+                .tooltip(if can_add {
+                    "Save this binding"
+                } else {
+                    "Choose an action (and its target) and a key first"
+                })
+                .id_salt("hk_add")
+                .show(ui)
+                .clicked()
+                && can_add
+            {
+                intents.push(Intent::AddDraft);
+            }
+            ui.add_space(Metrics::SM);
+            if ConsoleButton::ghost("Done")
+                .glyph(glyph::CHECK)
+                .width(120.0)
+                .height(Metrics::BTN_H)
+                .id_salt("hk_close")
+                .show(ui)
+                .clicked()
+            {
+                intents.push(Intent::Close);
+            }
+        });
+    });
 
     state.extras.hotkeys.draft = draft;
     state.extras.hotkeys.key_text = key_text;
@@ -1237,14 +1201,7 @@ fn binding_row(
                 });
             });
             if let Some(message) = status.message() {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(message)
-                            .font(glyph_font(Metrics::MICRO))
-                            .color(Palette::AMBER_400),
-                    )
-                    .wrap(),
-                );
+                kit::note_under(ui, message, Palette::AMBER_400);
             }
         });
 }

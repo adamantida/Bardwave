@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use egui::{Context, RichText, Ui, Vec2};
+use egui::{Context, RichText, Ui};
 use uuid::Uuid;
 
 use crate::audio::timeline::{
@@ -25,6 +25,7 @@ use crate::audio::timeline::{
 use crate::config::{TimerAction, TimerConfig, TimerTrigger, MIN_TIMER_MS};
 use crate::gui::app::{mirror_playing, sync_director, Dialog, SoundSharedApp};
 use crate::gui::hotkeys_ui::Catalog;
+use crate::gui::settings_extras::kit;
 use crate::gui::theme::{
     alpha, hairline, micro_label, micro_label_accent, panel_title, Metrics, Palette,
 };
@@ -764,6 +765,7 @@ fn timer_row(
                             .font(glyph_font(12.0))
                             .color(Palette::WHITE),
                     );
+                    ui.add_space(2.0);
                     ui.label(
                         RichText::new(elide(&row.detail, 52))
                             .font(glyph_font(Metrics::MICRO))
@@ -802,14 +804,7 @@ fn timer_row(
                 });
             });
             if let Some(message) = &row.warning {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(message)
-                            .font(glyph_font(Metrics::MICRO))
-                            .color(Palette::AMBER_400),
-                    )
-                    .wrap(),
-                );
+                kit::note_under(ui, message.as_str(), Palette::AMBER_400);
             }
         });
 }
@@ -912,11 +907,12 @@ fn draw_form(ui: &mut Ui, form: &mut TimerForm, catalog: &Catalog, intents: &mut
 
     if let Some(message) = &form.error {
         ui.add_space(Metrics::XS);
-        crate::gui::dialog::error_line(ui, message);
+        kit::error_line(ui, message);
     }
     ui.add_space(Metrics::SM);
     ui.horizontal(|ui| {
         if ConsoleButton::primary("Save timer")
+            .width(130.0)
             .height(Metrics::BTN_H_SM)
             .id_salt("timer_form_save")
             .show(ui)
@@ -925,6 +921,7 @@ fn draw_form(ui: &mut Ui, form: &mut TimerForm, catalog: &Catalog, intents: &mut
             intents.push(Intent::Save);
         }
         if ConsoleButton::ghost("Cancel")
+            .width(100.0)
             .height(Metrics::BTN_H_SM)
             .id_salt("timer_form_cancel")
             .show(ui)
@@ -944,161 +941,160 @@ pub fn show_timers_dialog(ctx: &Context, state: &mut SoundSharedApp) {
     let mut intents: Vec<Intent> = Vec::new();
     let buttons = controls(snapshot.status);
 
-    egui::Window::new("timers_modal")
-        .id(egui::Id::new("timers_modal"))
-        .order(egui::Order::Foreground)
-        .title_bar(false)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .frame(crate::gui::theme::panel_frame())
-        .show(ctx, |ui| {
-            ui.set_width(DIALOG_W);
-            ui.label(micro_label_accent("Session"));
-            ui.add_space(2.0);
-            ui.label(panel_title("Timers"));
-            ui.add_space(2.0);
-            ui.label(micro_label(
-                "Timers run only while the app is open. Press Start when the game begins.",
-            ));
-            ui.add_space(Metrics::MD);
+    kit::modal_window(ctx, "timers_modal", DIALOG_W, |ui| {
+        ui.label(micro_label_accent("Session"));
+        ui.add_space(2.0);
+        ui.label(panel_title("Timers"));
+        ui.add_space(2.0);
+        ui.label(micro_label(
+            "Timers run only while the app is open. Press Start when the game begins.",
+        ));
+        ui.add_space(Metrics::LG);
 
-            // ---- Transport ----
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = Metrics::SM;
-                if ConsoleButton::primary(buttons.start_label)
-                    .glyph(glyph::PLAY)
-                    .height(Metrics::BTN_H_SM)
-                    .enabled(buttons.start_enabled)
-                    .id_salt("timers_start")
-                    .show(ui)
-                    .clicked()
-                {
-                    intents.push(Intent::Start);
-                }
-                if ConsoleButton::ghost("Pause timers")
-                    .height(Metrics::BTN_H_SM)
-                    .enabled(buttons.pause_enabled)
-                    .tooltip("Freeze every countdown; Resume continues where they stopped")
-                    .id_salt("timers_pause")
-                    .show(ui)
-                    .clicked()
-                {
-                    intents.push(Intent::Pause);
-                }
-                if ConsoleButton::ghost("Reset")
-                    .height(Metrics::BTN_H_SM)
-                    .enabled(buttons.reset_enabled)
-                    .tooltip("Stop and disarm every timer; Start counts from zero again")
-                    .id_salt("timers_reset")
-                    .show(ui)
-                    .clicked()
-                {
-                    intents.push(Intent::Reset);
-                }
-                ui.add_space(Metrics::SM);
-                ui.label(
-                    RichText::new(status_line(&snapshot).to_uppercase())
-                        .font(glyph_font(Metrics::MICRO))
-                        .color(match snapshot.status {
-                            TimelineStatus::Running => Palette::ROSE_400,
-                            TimelineStatus::Paused => Palette::AMBER_400,
-                            TimelineStatus::Stopped => Palette::ZINC_500,
-                        }),
-                );
-            });
-
-            ui.add_space(Metrics::MD);
-            hairline(ui);
-            ui.add_space(Metrics::MD);
-
-            // ---- List ----
-            ui.label(micro_label(format!("Timers ({})", timers.len())));
+        // ---- Transport ----
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = Metrics::SM;
+            if ConsoleButton::primary(buttons.start_label)
+                .width(130.0)
+                .glyph(glyph::PLAY)
+                .height(Metrics::BTN_H_SM)
+                .enabled(buttons.start_enabled)
+                .id_salt("timers_start")
+                .show(ui)
+                .clicked()
+            {
+                intents.push(Intent::Start);
+            }
+            if ConsoleButton::ghost("Pause timers")
+                .width(130.0)
+                .height(Metrics::BTN_H_SM)
+                .enabled(buttons.pause_enabled)
+                .tooltip("Freeze every countdown; Resume continues where they stopped")
+                .id_salt("timers_pause")
+                .show(ui)
+                .clicked()
+            {
+                intents.push(Intent::Pause);
+            }
+            if ConsoleButton::ghost("Reset")
+                .width(90.0)
+                .height(Metrics::BTN_H_SM)
+                .enabled(buttons.reset_enabled)
+                .tooltip("Stop and disarm every timer; Start counts from zero again")
+                .id_salt("timers_reset")
+                .show(ui)
+                .clicked()
+            {
+                intents.push(Intent::Reset);
+            }
             ui.add_space(Metrics::SM);
-            egui::ScrollArea::vertical()
-                .id_salt("timers_scroll")
-                .max_height(240.0)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = Metrics::SM;
-                    if timers.is_empty() {
-                        ui.label(micro_label(
-                            "No timers yet. Add one below, for example: after 10:00 activate a scene.",
-                        ));
-                    }
-                    for (index, cfg) in timers.iter().enumerate() {
-                        let live = snapshot.timers.iter().find(|view| view.id == cfg.id);
-                        let is_next = snapshot
-                            .next
-                            .and_then(|i| snapshot.timers.get(i))
-                            .is_some_and(|view| view.id == cfg.id);
-                        let row = row_view(cfg, live, is_next, &catalog);
-                        timer_row(ui, index, cfg, &row, &mut intents);
-                    }
-                });
-
-            ui.add_space(Metrics::MD);
-            hairline(ui);
-            ui.add_space(Metrics::MD);
-
-            // ---- Form or "new" button ----
-            match form.as_mut() {
-                Some(form) => draw_form(ui, form, &catalog, &mut intents),
-                None => {
-                    if ConsoleButton::ghost("New timer")
-                        .glyph(glyph::PLUS)
-                        .height(Metrics::BTN_H_SM)
-                        .id_salt("timers_new")
-                        .show(ui)
-                        .clicked()
-                    {
-                        intents.push(Intent::New);
-                    }
-                }
-            }
-
-            // ---- Log ----
-            if !state.extras.timers.log.is_empty() {
-                ui.add_space(Metrics::MD);
-                hairline(ui);
-                ui.add_space(Metrics::SM);
-                ui.label(micro_label("Fired"));
-                ui.add_space(Metrics::XS);
-                egui::ScrollArea::vertical()
-                    .id_salt("timers_log")
-                    .max_height(84.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for line in &state.extras.timers.log {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&line.text)
-                                        .font(glyph_font(Metrics::MICRO))
-                                        .color(if line.warning {
-                                            Palette::AMBER_400
-                                        } else {
-                                            Palette::ZINC_400
-                                        }),
-                                )
-                                .wrap(),
-                            );
-                        }
-                    });
-            }
-
-            ui.add_space(Metrics::MD);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ConsoleButton::ghost("Close")
-                    .height(Metrics::BTN_H_SM)
-                    .id_salt("timers_close")
-                    .show(ui)
-                    .clicked()
-                {
-                    intents.push(Intent::Close);
-                }
-            });
+            ui.label(
+                RichText::new(status_line(&snapshot).to_uppercase())
+                    .font(glyph_font(Metrics::MICRO))
+                    .color(match snapshot.status {
+                        TimelineStatus::Running => Palette::ROSE_400,
+                        TimelineStatus::Paused => Palette::AMBER_400,
+                        TimelineStatus::Stopped => Palette::ZINC_500,
+                    }),
+            );
         });
 
+        ui.add_space(Metrics::LG);
+        hairline(ui);
+        ui.add_space(Metrics::LG);
+
+        // ---- List ----
+        ui.label(micro_label(format!("Timers ({})", timers.len())));
+        ui.add_space(Metrics::SM);
+        egui::ScrollArea::vertical()
+            .id_salt("timers_scroll")
+            .max_height(240.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = Metrics::SM;
+                if timers.is_empty()
+                    && kit::empty_state_action(
+                        ui,
+                        "No timers yet",
+                        "A timer does something at a set time: after 10 minutes start the \
+                         Alarm scene, or every 30 minutes ring a bell.",
+                        "New timer",
+                        "timers_empty_new",
+                    )
+                {
+                    intents.push(Intent::New);
+                }
+                for (index, cfg) in timers.iter().enumerate() {
+                    let live = snapshot.timers.iter().find(|view| view.id == cfg.id);
+                    let is_next = snapshot
+                        .next
+                        .and_then(|i| snapshot.timers.get(i))
+                        .is_some_and(|view| view.id == cfg.id);
+                    let row = row_view(cfg, live, is_next, &catalog);
+                    timer_row(ui, index, cfg, &row, &mut intents);
+                }
+            });
+
+        ui.add_space(Metrics::LG);
+        hairline(ui);
+        ui.add_space(Metrics::LG);
+
+        // ---- Form or "new" button ----
+        match form.as_mut() {
+            Some(form) => draw_form(ui, form, &catalog, &mut intents),
+            None => {
+                if ConsoleButton::ghost("New timer")
+                    .width(150.0)
+                    .glyph(glyph::PLUS)
+                    .height(Metrics::BTN_H_SM)
+                    .id_salt("timers_new")
+                    .show(ui)
+                    .clicked()
+                {
+                    intents.push(Intent::New);
+                }
+            }
+        }
+
+        // ---- Log ----
+        if !state.extras.timers.log.is_empty() {
+            ui.add_space(Metrics::LG);
+            hairline(ui);
+            ui.add_space(Metrics::LG);
+            ui.label(micro_label("Fired"));
+            ui.add_space(Metrics::SM);
+            egui::ScrollArea::vertical()
+                .id_salt("timers_log")
+                .max_height(84.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for line in &state.extras.timers.log {
+                        kit::note_colored(
+                            ui,
+                            line.text.as_str(),
+                            if line.warning {
+                                Palette::AMBER_400
+                            } else {
+                                Palette::ZINC_400
+                            },
+                        );
+                    }
+                });
+        }
+
+        ui.add_space(Metrics::LG);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ConsoleButton::ghost("Close")
+                .width(110.0)
+                .height(Metrics::BTN_H_SM)
+                .id_salt("timers_close")
+                .show(ui)
+                .clicked()
+            {
+                intents.push(Intent::Close);
+            }
+        });
+    });
     apply_intents(state, &catalog, timers, &mut form, intents);
     // The form survives repaints; a closed dialog drops it.
     if matches!(state.dialog, Dialog::Timers) {
