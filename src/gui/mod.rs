@@ -22,6 +22,7 @@ pub mod hotkeys_ui;
 pub mod library_ui;
 pub mod motion;
 pub mod music;
+pub mod onboarding;
 pub mod pan_ui;
 pub mod profiles_ui;
 pub mod recorder_ui;
@@ -211,6 +212,8 @@ impl App for GuiApp {
         library_ui::show_library_dialogs(ctx, &mut self.state);
         // Profile switch / new / manage dialogs.
         profiles_ui::show_profile_dialogs(ctx, &mut self.state);
+        // First-run wizard card (an overlay, not a modal).
+        onboarding::show(ctx, &mut self.state);
 
         if self.state.tooltip_requested() {
             ctx.request_repaint();

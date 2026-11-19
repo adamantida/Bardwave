@@ -211,6 +211,11 @@ pub struct GuiConfig {
     /// Unix time (seconds) of the last update check; 0 = never.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub last_update_check: u64,
+
+    /// The first-run wizard ("Getting started") was finished or dismissed for
+    /// good, or the config already had a library when the wizard was added.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub onboarding_done: bool,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
