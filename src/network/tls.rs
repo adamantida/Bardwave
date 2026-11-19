@@ -57,7 +57,7 @@ pub const META_FILE: &str = "meta.json";
 /// validity for certificates that are not issued by a public CA.
 const VALIDITY_DAYS: i64 = 397;
 /// Replace a generated certificate when less than this is left.
-const RENEW_BEFORE_DAYS: i64 = 30;
+pub const RENEW_BEFORE_DAYS: i64 = 30;
 /// How long a client may take to finish the TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a client may take to send the request head.
@@ -309,6 +309,12 @@ fn date_at(unix_secs: i64) -> (i32, u8, u8) {
     civil_from_days(unix_secs.div_euclid(86_400))
 }
 
+/// The UTC calendar date (year, month, day) of a Unix time, for showing an
+/// expiry date in the GUI.
+pub fn date_utc(unix_secs: i64) -> (i32, u8, u8) {
+    date_at(unix_secs)
+}
+
 /// Load the operator's certificate and key.
 fn load_custom(cert: &Path, key: &Path) -> Result<TlsMaterial, TlsError> {
     let certs = CertificateDer::pem_file_iter(cert)
@@ -509,6 +515,14 @@ pub fn load_or_create(settings: &TlsSettings, sans: &SanSet) -> Result<TlsMateri
 /// certificate" button). Phones that trusted the old one will warn again.
 pub fn regenerate_self_signed(dir: &Path, sans: &SanSet) -> Result<TlsInfo, TlsError> {
     generate(dir, sans, now_unix()).map(|m| m.info)
+}
+
+/// Read and check the operator's own certificate and key without serving
+/// anything (the HTTPS settings in the GUI call this on a worker thread to tell
+/// the operator what is wrong before the next Start). Reads the same files, in
+/// the same order and with the same errors, as [`load_or_create`].
+pub fn check_custom(cert: &Path, key: &Path) -> Result<TlsInfo, TlsError> {
+    load_custom(cert, key).map(|material| material.info)
 }
 
 /// What is stored in `dir` right now, without generating anything (so the GUI

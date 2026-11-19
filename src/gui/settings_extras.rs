@@ -54,6 +54,8 @@ pub struct ConsoleExtras {
     pub audio: crate::gui::audio_settings::AudioSettingsUi,
     /// Update check (off by default, see `crate::updates`).
     pub updates: crate::updates::UpdateChecker,
+    /// HTTPS section (see `https_ui`).
+    pub https: crate::gui::https_ui::HttpsUi,
 }
 
 impl ConsoleExtras {
@@ -70,6 +72,7 @@ impl ConsoleExtras {
             ),
             audio: Default::default(),
             updates: crate::updates::UpdateChecker::new(),
+            https: Default::default(),
         }
     }
 }

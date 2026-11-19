@@ -98,7 +98,7 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 | `hotkeys_ui.rs` | `poll_hotkeys` once per frame, Hotkeys dialog (capture, conflicts, global switch) |
 | `settings_extras.rs` + `settings_extras/` | MIX section: bus faders, DUCK button, normalization, interface scale slider (`gui.ui_scale`), update-check block, hotkey and Timers entries |
 | `server_panel.rs` | SERVER panel: addresses, UPnP status, access key, GM link, QR |
-| `tls_section.rs` | HTTPS switch, certificate source and fingerprint, "New certificate" |
+| `https_ui.rs` | SECURE CONNECTION (HTTPS) section: On/Off, Self-signed / My certificate (paths, Browse…, background validation), fingerprint + Copy, expiry, Regenerate (asks first), apply/restart notices; pure view logic + tests (`tests/https_setting.rs`); guide in `docs/en/https.md`, `docs/ru/https.md` |
 | `audio_settings.rs` | AUDIO OUTPUT section: output and preview device choice with status |
 | `recorder_ui.rs` | REC button, time / size readout, recordings folder |
 | `profiles_ui.rs` | Profile menu: switch (restart), new, rename, delete with typed confirmation |
@@ -269,7 +269,7 @@ Bardwave/
     │                            # icons, control.html/js/css
     └── gui/{app,types,groups,sound_list,top_bar,dialog,widgets,theme,motion,scenes,music,hotkeys_ui,
              settings_extras,server_panel,library_ui,audio_settings,recorder_ui,profiles_ui,timeline,pan_ui,
-             onboarding,tls_section,gm_bridge}.rs, gui/library_ui/{logic,state,tasks,ops,toolbar,dialogs}.rs
+             onboarding,https_ui,gm_bridge}.rs, gui/library_ui/{logic,state,tasks,ops,toolbar,dialogs}.rs
 ```
 
 ---

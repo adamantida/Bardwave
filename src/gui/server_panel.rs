@@ -386,6 +386,13 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         hairline(ui);
         ui.add_space(Metrics::LG);
 
+        // ---- Secure connection (HTTPS): its own section ----
+        crate::gui::https_ui::https_section(ui, state, running);
+
+        ui.add_space(Metrics::LG);
+        hairline(ui);
+        ui.add_space(Metrics::LG);
+
         // ---- Configuration ----
         ui.label(micro_label("Configuration"));
         ui.add_space(Metrics::SM);
@@ -444,8 +451,6 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
             caution(ui, error, Palette::ROSE_400);
         }
 
-        ui.add_space(Metrics::MD);
-        crate::gui::tls_section::tls_section(ui, state, config_enabled);
         ui.add_space(Metrics::MD);
         ui.horizontal(|ui| {
             ui.label(micro_label(if config_enabled {
