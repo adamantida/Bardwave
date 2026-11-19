@@ -567,6 +567,30 @@ fn problems_are_logged_once_each() {
 }
 
 #[test]
+fn spawned_scene_log_does_not_wait_for_the_disk() {
+    let (lib, scene) = broken_library();
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    // A "hung mount": the existence check blocks until released.
+    let started = std::time::Instant::now();
+    let handle = lib
+        .spawn_log_scene_warnings_with(scene, move |_| {
+            let _ = gate.lock().unwrap().recv();
+            true
+        })
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "spawning blocked on the file system"
+    );
+    assert!(!handle.is_finished());
+    drop(release);
+    // The unknown sound is found without touching the disk and logged once.
+    assert_eq!(handle.join().unwrap(), 1);
+    assert_eq!(lib.log_scene_warnings(scene), 0);
+}
+
+#[test]
 fn load_logs_once_and_a_new_problem_is_logged_later() {
     let capture = Capture::default();
     let subscriber = tracing_subscriber::fmt()

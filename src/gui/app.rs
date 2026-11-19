@@ -1938,7 +1938,8 @@ impl SoundSharedApp {
                     }
                     AudioCommand::ActivateScene { id, response } => {
                         if let Ok(scene) = id.parse::<crate::gui::groups::SceneId>() {
-                            self.library.log_scene_warnings(scene);
+                            // Stats files: keep it off the render thread.
+                            let _ = self.library.spawn_log_scene_warnings(scene);
                         }
                         sync_director(&mut self.director, &self.library, &self.sounds);
                         crate::gui::scenes::patch_director(

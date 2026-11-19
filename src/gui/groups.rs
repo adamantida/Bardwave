@@ -2030,8 +2030,35 @@ impl Library {
     /// [`Library::log_all_warnings`] for one scene, meant for the moment it is
     /// activated. Repeated activations of a scene with the same problems log
     /// nothing more. Returns the number of newly logged problems.
+    ///
+    /// This stats every referenced file, so it must not run on the render
+    /// thread; use [`Library::spawn_log_scene_warnings`] there.
     pub fn log_scene_warnings(&self, scene: SceneId) -> usize {
         self.log_new(&self.scene_warnings(scene))
+    }
+
+    /// [`Library::log_scene_warnings`] on a short-lived worker thread, so a
+    /// slow or hung disk never stalls the caller (scene activation runs on
+    /// the render thread). The worker owns a clone of the library, which
+    /// shares the "already logged" memory with this one. The handle yields
+    /// the number of newly logged problems; callers may drop it.
+    pub fn spawn_log_scene_warnings(
+        &self,
+        scene: SceneId,
+    ) -> std::io::Result<std::thread::JoinHandle<usize>> {
+        self.spawn_log_scene_warnings_with(scene, |path| path.exists())
+    }
+
+    /// [`Library::spawn_log_scene_warnings`] with a custom existence check.
+    pub fn spawn_log_scene_warnings_with(
+        &self,
+        scene: SceneId,
+        exists: impl Fn(&Path) -> bool + Send + 'static,
+    ) -> std::io::Result<std::thread::JoinHandle<usize>> {
+        let library = self.clone();
+        std::thread::Builder::new()
+            .name("scene-warning-log".into())
+            .spawn(move || library.log_new(&library.scene_warnings_with(scene, exists)))
     }
 
     fn log_new(&self, warnings: &[SceneWarning]) -> usize {
