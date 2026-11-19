@@ -2,12 +2,17 @@
 //! Provides decoding, mixing, and playback functionality
 
 pub mod decoder;
+pub mod director;
 pub mod engine;
 pub mod loudness;
 pub mod mixer;
 pub mod youtube;
 
 pub use decoder::{AudioDecoder, DecodedAudio, DecoderError, TARGET_CHANNELS, TARGET_SAMPLE_RATE};
+pub use director::{
+    ActivationPlan, CatalogSound, Director, DirectorCommand, DirectorError, DirectorOutcome,
+    DirectorState, FadeSpec, Playback, SceneReport,
+};
 pub use engine::{
     AudioEngine, EngineError, EngineStats, LocalOutputState, LocalOutputStatus, SoundId,
     TrackHandle,

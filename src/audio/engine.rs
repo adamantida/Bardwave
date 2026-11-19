@@ -438,7 +438,7 @@ pub(crate) struct AudioEngineInner {
     sounds: RwLock<HashMap<SoundId, Arc<DecodedAudio>>>,
     /// Per-sound volume, applied to tracks of that sound as they are created
     /// and to the ones already playing
-    sound_volumes: RwLock<HashMap<SoundId, f32>>,
+    pub(crate) sound_volumes: RwLock<HashMap<SoundId, f32>>,
     /// Per-sound pan, applied to new tracks of that sound like the volume
     sound_pans: RwLock<HashMap<SoundId, f32>>,
     /// Per-sound bus, applied to new tracks of that sound like the volume
@@ -517,7 +517,7 @@ impl AudioEngineInner {
 /// High-level audio engine
 #[derive(Clone)]
 pub struct AudioEngine {
-    inner: Arc<AudioEngineInner>,
+    pub(crate) inner: Arc<AudioEngineInner>,
 }
 
 impl AudioEngine {

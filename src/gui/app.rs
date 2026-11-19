@@ -1,6 +1,6 @@
 //! GUI application state and logic
 
-use crate::audio::{AudioDecoder, AudioEngine, DecodedAudio, LocalOutputStatus, SoundId};
+use crate::audio::{AudioDecoder, AudioEngine, DecodedAudio, Director, LocalOutputStatus, SoundId};
 use crate::gui::groups::{GroupFilter, GroupId, Library};
 use crate::gui::types::{
     AppState, AudioCommand, ServerCommand, ServerStatus as AppServerStatus, SoundInfo,
@@ -133,6 +133,10 @@ pub struct SoundSharedApp {
     // Audio command receiver (for processing commands on main thread)
     audio_cmd_rx: Receiver<AudioCommand>,
 
+    /// The control core shared with the headless `/control` page: scenes,
+    /// stingers and every playback command go through it.
+    director: Director,
+
     // Local sound cache (synced from audio engine)
     sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
     sound_order: Arc<Mutex<Vec<SoundId>>>,
@@ -213,6 +217,29 @@ pub struct SoundSharedApp {
     output_meter: f32,
 }
 
+/// Hand the Director the current scenes and the loaded library sounds.
+fn sync_director(
+    director: &mut Director,
+    library: &Library,
+    sounds: &Mutex<HashMap<SoundId, SoundEntry>>,
+) {
+    let by_path: HashMap<PathBuf, SoundId> = sounds
+        .lock()
+        .unwrap()
+        .values()
+        .map(|entry| (entry.path.clone(), entry.id))
+        .collect();
+    crate::audio::director::sync_from_library(director, library, |path| by_path.get(path).copied());
+}
+
+/// Copy "is it playing" from the engine into the rows: scenes and delayed
+/// starts start sounds without going through the row's Play button.
+fn mirror_playing(sounds: &Mutex<HashMap<SoundId, SoundEntry>>, engine: &AudioEngine) {
+    for entry in sounds.lock().unwrap().values_mut() {
+        entry.playing = engine.is_sound_playing(entry.id).unwrap_or(false);
+    }
+}
+
 /// One file for the background decoder: the path and where to report.
 type DecodeJob = (String, Sender<anyhow::Result<SoundInfo>>);
 /// A finished decode: the job plus the decoded PCM (or the error text).
@@ -279,6 +306,7 @@ impl SoundSharedApp {
             app_state,
             audio_engine,
             audio_cmd_rx,
+            director: Director::new(),
             sounds: Arc::new(Mutex::new(HashMap::new())),
             sound_order: Arc::new(Mutex::new(Vec::new())),
             master_volume: Arc::new(Mutex::new(initial_master_vol)),
@@ -1380,6 +1408,9 @@ impl SoundSharedApp {
             }
         }
 
+        // Delayed scene starts, and the rows of sounds a scene started.
+        self.run_director();
+
         // Feed the engine the library files that did not fit the channel on
         // the previous pass.
         self.pump_pending_loads();
@@ -1402,13 +1433,29 @@ impl SoundSharedApp {
         let animating = self.output_meter > 0.0
             || self.youtube_busy
             || self.sounds.lock().unwrap().values().any(|s| s.playing);
-        ctx.request_repaint_after(Duration::from_millis(if self.youtube_busy {
+        let mut wait = Duration::from_millis(if self.youtube_busy {
             200
         } else if animating {
             33
         } else {
             500
-        }));
+        });
+        // Wake up for the next delayed scene start.
+        if let Some(due) = self.director.next_deadline() {
+            let until = due.saturating_duration_since(Instant::now());
+            wait = wait.min(until.max(Duration::from_millis(5)));
+        }
+        ctx.request_repaint_after(wait);
+    }
+
+    /// Run the Director's timers and mirror what it started into the rows.
+    fn run_director(&mut self) {
+        let guard = self.audio_engine.lock().unwrap();
+        let Some(engine) = guard.as_ref() else {
+            return;
+        };
+        self.director.tick(engine);
+        mirror_playing(&self.sounds, engine);
     }
 
     /// Register the files the decoder worker has finished.
@@ -1524,18 +1571,17 @@ impl SoundSharedApp {
                             .get(&id)
                             .map(|entry| entry.looped)
                             .unwrap_or(false);
-                        let result = engine.play_with_loop(id, looped);
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        let result = self.director.play_sound(&*engine, id, looped);
                         if result.is_ok() {
                             if let Some(entry) = self.sounds.lock().unwrap().get_mut(&id) {
                                 entry.playing = true;
                             }
                         }
-                        // Convert TrackHandle to () for response
-                        let response_result = result.map(|_| ()).map_err(|e| e.into());
-                        let _ = response.send(response_result);
+                        let _ = response.send(result.map_err(|e| e.into()));
                     }
                     AudioCommand::StopSound { id, response } => {
-                        let result = engine.stop_sound(id);
+                        let result = self.director.stop_sound(&*engine, id);
                         if result.is_ok() {
                             if let Some(entry) = self.sounds.lock().unwrap().get_mut(&id) {
                                 entry.playing = false;
@@ -1551,7 +1597,7 @@ impl SoundSharedApp {
                         // Per-sound level: it scales this sound only. Routing it to
                         // `set_master_volume` made one row's slider drag the whole
                         // mix, so the other sounds moved with it.
-                        let result = engine.set_sound_volume(id, volume);
+                        let result = self.director.set_sound_volume(&*engine, id, volume);
                         if result.is_ok() {
                             if let Some(entry) = self.sounds.lock().unwrap().get_mut(&id) {
                                 entry.volume = volume;
@@ -1560,7 +1606,7 @@ impl SoundSharedApp {
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
                     AudioCommand::SetMasterVolume { volume, response } => {
-                        let result = engine.set_master_volume(volume);
+                        let result = self.director.set_master_volume(&*engine, volume);
                         if result.is_ok() {
                             *self.master_volume.lock().unwrap() = volume;
                         }
@@ -1573,7 +1619,7 @@ impl SoundSharedApp {
                     } => {
                         // Applies to the live track, so flipping the toggle on a
                         // sound that is already playing takes effect immediately.
-                        let result = engine.set_sound_looped(id, looped);
+                        let result = self.director.set_sound_looped(&*engine, id, looped);
                         if result.is_ok() {
                             if let Some(entry) = self.sounds.lock().unwrap().get_mut(&id) {
                                 entry.looped = looped;
@@ -1590,6 +1636,7 @@ impl SoundSharedApp {
                             .map(|entry| entry.path.clone());
                         let result = engine.unload_sound(id);
                         if result.is_ok() {
+                            self.director.unregister_sound(id);
                             self.sounds.lock().unwrap().remove(&id);
                             self.sound_order.lock().unwrap().retain(|&x| x != id);
                             if let Some(path) = path {
@@ -1601,12 +1648,61 @@ impl SoundSharedApp {
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
                     AudioCommand::StopAll { response } => {
-                        let result = engine.stop_all();
+                        let result = self.director.stop_all(&*engine);
                         if result.is_ok() {
                             for entry in self.sounds.lock().unwrap().values_mut() {
                                 entry.playing = false;
                             }
                         }
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::StopAllFade { fade_ms, response } => {
+                        let result = self.director.stop_all_with_fade(&*engine, fade_ms);
+                        mirror_playing(&self.sounds, engine);
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::ActivateScene { id, response } => {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        let result = self.director.activate_scene(&*engine, &id);
+                        mirror_playing(&self.sounds, engine);
+                        let _ = response.send(match result {
+                            Ok(report) => {
+                                for problem in &report.errors {
+                                    warn!("Scene {id}: {problem}");
+                                }
+                                Ok(())
+                            }
+                            Err(e) => Err(e.into()),
+                        });
+                    }
+                    AudioCommand::StopScene { response } => {
+                        let result = self.director.stop_scene(&*engine);
+                        mirror_playing(&self.sounds, engine);
+                        let _ = response.send(result.map(|_| ()).map_err(|e| e.into()));
+                    }
+                    AudioCommand::SnapshotScene { name, response } => {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        let result = self
+                            .director
+                            .snapshot_to_scene(&*engine, &name)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|scene| {
+                                crate::audio::director::import_scene(&mut self.library, &scene)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("a scene named \"{}\" already exists", name)
+                                    })
+                            });
+                        if result.is_ok() {
+                            self.library_dirty = true;
+                        }
+                        // The Director holds the library's version of the scene.
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        let _ = response.send(result);
+                    }
+                    AudioCommand::PlayStinger { id, response } => {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        let result = self.director.play_stinger(&*engine, id);
+                        mirror_playing(&self.sounds, engine);
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
                 }
@@ -1636,6 +1732,21 @@ impl SoundSharedApp {
                     }
                     AudioCommand::StopAll { response } => {
                         let _ = response.send(Ok(()));
+                    }
+                    AudioCommand::StopAllFade { response, .. } => {
+                        let _ = response.send(Ok(()));
+                    }
+                    AudioCommand::StopScene { response } => {
+                        let _ = response.send(Ok(()));
+                    }
+                    AudioCommand::ActivateScene { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                    }
+                    AudioCommand::SnapshotScene { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                    }
+                    AudioCommand::PlayStinger { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
                     }
                 };
             }

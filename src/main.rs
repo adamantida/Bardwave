@@ -707,6 +707,13 @@ fn main() -> Result<()> {
         // Run control actions on this thread (the engine is not Send) until
         // Ctrl+C.
         loop {
+            // Wake up for the Director's next delayed scene start (or at
+            // least a few times a second).
+            let wait = board
+                .next_deadline()
+                .map(|due| due.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or(Duration::from_millis(250))
+                .min(Duration::from_millis(250));
             crossbeam_channel::select! {
                 recv(ctrlc_rx) -> _ => break,
                 recv(control_rx) -> command => {
@@ -718,6 +725,10 @@ fn main() -> Result<()> {
                     };
                     let _ = command.reply.send(result);
                 }
+                recv(crossbeam_channel::after(wait)) -> _ => {}
+            }
+            if let Some(engine) = audio_engine_shared.lock().unwrap().as_ref() {
+                board.tick(engine);
             }
         }
 
