@@ -17,9 +17,7 @@ Read this before relying on the items below. They are implemented and covered by
 
 ### Known limitations
 
-- The phone GM panel (`/control`) is served only with `--server-only`; the console window shows the link and QR code but does not serve the page yet.
-- In `--server-only` mode playlists are not loaded into the control core: the panel's Music block is disabled and a scene's music layer does not start there. Hotkeys do not run in headless mode.
-- The listener page understands `{"type":"now_playing"}`, but the server never sends it, so no scene or track name is shown to players.
+- In `--server-only` mode hotkeys and session timers (`[[timers]]`) do not run.
 - No HTTPS: the player key (`?k=`) and the GM key (`?g=`) travel in plain HTTP. Use a LAN, a VPN or a trusted tunnel for anything beyond that.
 - Loudness normalization skips streamed (long) files; a positive `gain_db` is audible only while the sound's own volume is below 1.0.
 

@@ -84,13 +84,13 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 - WebSocket broadcast of the **final mix** — players hear what the GM hears — as 20 ms **Opus** frames (~64 kbit/s VBR).
 - The listener page is **embedded in the binary**. It reconnects on its own (exponential back-off with jitter), shows a **link-quality** readout (latency, buffer, lost packets) with a hint when the network is weak, keeps the phone awake (**Wake Lock**), integrates with the lock-screen controls (**Media Session**), remembers the player's own volume, and is an installable **PWA** (manifest and icons; no service worker, the stream needs none).
 - **Access key** in the shared link, **live listener counter** in the console, automatic LAN address detection that ignores VPN/TUN adapters, optional UPnP port forwarding for remote players.
-- The page also understands a `now_playing` text message (scene / track name). The server does **not** send it yet, so no scene name appears on players' screens today.
+- The page also understands a `now_playing` text message (scene / track name). The server sends it on connect and whenever the scene or track changes.
 
 ### Phone control panel
 
 - A mobile page, `/control`, with scene buttons, stinger pads, per-sound faders, master volume, bus faders, *Duck*, *Stop scene* and *Stop all*, live through a WebSocket (several devices see the same state).
 - Has its **own token** (`gm_token`) that is never the player key. The console shows the link with a **QR code**.
-- **Limitation:** the console window does not serve this page yet — it is only served in `--server-only` mode. In that mode playlists are not loaded into the control core, so the page's Music block is disabled and a scene's music layer does not start. See [Game-master panel](#game-master-panel-phone).
+- Served both by the console window (while the server is started) and by `--server-only`; the Music block drives the playlists in both. See [Game-master panel](#game-master-panel-phone).
 
 ### Engineering
 
@@ -208,7 +208,7 @@ On **Start** the console asks your router to forward the port to this PC (UPnP I
 
 ### Game-master panel (phone)
 
-`/control` is a mobile page for driving the session from a phone. **It is served only in headless mode (`--server-only`)**; the console window shows the link and a QR code but does not serve the page yet and says so.
+`/control` is a mobile page for driving the session from a phone. **The console window serves it while the server is started, and so does headless mode (`--server-only`)**; the console shows the link and a QR code.
 
 ```bash
 Bardwave.exe --server-only        # soundshared --server-only from a source build
@@ -223,7 +223,7 @@ On the machine that runs Bardwave the control page opens without a key. From ano
 
 What the page does: scenes, stingers, *Stop scene*, *Stop all* (with fade), master and bus volume, *Duck*, and per-sound play/stop, loop and volume, over a WebSocket (`/ws/control`) that sends the full state after every change, so several devices stay in sync. The same actions exist as a REST API under `/api/control/…`.
 
-Limits of headless mode today: no hotkeys, no playlist control (the page's Music block is disabled and a scene's music layer is not started because playlists are not loaded into the headless control core), and the library is the one saved in `config.toml` — edit it in the console, then restart the server.
+Limits of headless mode today: no hotkeys and no session timers (`[[timers]]` run only in the console), and the library is the one saved in `config.toml` — edit it in the console, then restart the server.
 
 Started from Explorer or a shortcut, the server opens a console window with its log; close it or press Ctrl+C to stop.
 
@@ -428,7 +428,7 @@ The broadcaster encodes the 48 kHz / stereo f32 mix to Opus before sending it ov
 {"type":"format","data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":960}}
 ```
 
-Other text messages: `welcome` on connect, `ping`/`pong` heartbeats, and `now_playing` (understood by the page, not yet sent by the server). Clients must ignore types they do not know.
+Other text messages: `welcome` on connect, `ping`/`pong` heartbeats, and `now_playing` (scene / track names, sent on connect and on every change). Clients must ignore types they do not know.
 
 **Client decode:** The browser decodes each Opus packet with the bundled `opus-decoder` WASM module, which returns per-channel `Float32Array`s. The listener interleaves them into a stereo buffer before pushing to the Web Audio ring buffer.
 
@@ -488,9 +488,7 @@ Honest list of what is **not** done yet:
 - [x] Tags, search, folder import, bundles, ducking and normalization, PWA listener page
 - [x] Packaging scripts and workflows: Windows installer, AppImage and `.deb`, macOS `.app`/`.dmg`
 - [ ] Verify the installers, the macOS app, global hotkeys on macOS and MIDI on real hardware (above)
-- [ ] Serve the GM panel from the console window too, not only with `--server-only`; load playlists into the headless control core so the phone's Music block works
 - [ ] Wire the MIDI module into the console (devices, learn mode)
-- [ ] Send `now_playing` (scene / track name) to the listener page
 - [ ] HTTPS or another encrypted path for remote GM access
 - [ ] Update check through the GitHub API, screenshots and a short demo GIF in this README, a FAQ (firewall, VPN, UPnP)
 - [ ] Code-signed Windows build and a signed/notarized macOS build (needs certificates)
