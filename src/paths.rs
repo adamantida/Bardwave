@@ -224,19 +224,43 @@ pub fn active_profile() -> Option<String> {
     ACTIVE_PROFILE.get_or_init(|| None).clone()
 }
 
+/// Resolve and create the data directory of `profile` under `root`: the root
+/// itself for the default profile, `<root>/profiles/<name>` otherwise. Fails
+/// (instead of quietly using the root) when the folder cannot be created, so a
+/// profile never ends up writing over the default profile's data.
+pub fn prepare_data_dir(root: &Path, profile: Option<&str>) -> Result<PathBuf, String> {
+    let dir = crate::profiles::profile_dir(root, profile)
+        .map_err(|e| format!("invalid profile name: {e}"))?;
+    if profile.is_some() {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create the profile folder {}: {e}", dir.display()))?;
+    }
+    Ok(dir)
+}
+
+/// Make sure the active profile's folder exists; call once at startup, before
+/// anything is read or written, and exit with the message on `Err`.
+pub fn ensure_data_dir() -> Result<(), String> {
+    prepare_data_dir(&root_dir(), active_profile().as_deref()).map(|_| ())
+}
+
 /// The directory for config and library of the active profile: the root itself
-/// for the default profile, `<root>/profiles/<name>` otherwise (created on
-/// first use; falls back to the root if it cannot be created).
+/// for the default profile, `<root>/profiles/<name>` otherwise. Never falls back
+/// to the root for a named profile; startup checks creation with
+/// [`ensure_data_dir`] and exits on failure.
 pub fn data_dir() -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let root = root_dir();
-        match active_profile() {
-            None => root,
-            Some(name) => match crate::profiles::profile_dir(&root, Some(&name)) {
-                Ok(dir) if std::fs::create_dir_all(&dir).is_ok() => dir,
-                _ => root,
-            },
+        let profile = active_profile();
+        match prepare_data_dir(&root, profile.as_deref()) {
+            Ok(dir) => dir,
+            Err(e) => {
+                // Startup already reported this and exited; keep the profile's
+                // own path so writes fail loudly rather than hit the root.
+                tracing::error!("{e}");
+                crate::profiles::profile_dir(&root, profile.as_deref()).unwrap_or(root)
+            }
         }
     })
     .clone()
@@ -285,6 +309,22 @@ mod tests {
         has_portable_flag: false,
         writable: false,
     };
+
+    #[test]
+    fn profile_dir_that_cannot_be_created_is_an_error_not_the_root() {
+        let root = std::env::temp_dir().join(format!("bw-paths-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // `profiles` is a file, so <root>/profiles/Camp cannot be created.
+        std::fs::write(root.join("profiles"), b"x").unwrap();
+        assert!(prepare_data_dir(&root, Some("Camp")).is_err());
+        // The default profile and a creatable profile still work.
+        assert_eq!(prepare_data_dir(&root, None).unwrap(), root);
+        std::fs::remove_file(root.join("profiles")).unwrap();
+        let dir = prepare_data_dir(&root, Some("Camp")).unwrap();
+        assert!(dir.is_dir() && dir != root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn writable_exe_dir_keeps_the_v1_4_layout_on_every_os() {

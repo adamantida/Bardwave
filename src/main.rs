@@ -524,6 +524,18 @@ fn main() -> Result<()> {
     match soundshared::profiles::parse_profile_arg(&args) {
         Ok(profile) => {
             soundshared::paths::set_active_profile(profile.clone());
+            if let Err(message) = soundshared::paths::ensure_data_dir() {
+                if !server_only {
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Bardwave")
+                        .set_description(&message)
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                }
+                eprintln!("Error: {message}");
+                std::process::exit(2);
+            }
             soundshared::profiles::record_launch(
                 &soundshared::paths::root_dir(),
                 profile.as_deref(),
