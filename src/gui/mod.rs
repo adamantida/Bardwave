@@ -16,10 +16,12 @@
 pub mod app;
 pub mod dialog;
 pub mod groups;
+pub mod hotkeys_ui;
 pub mod motion;
 pub mod scenes;
 pub mod music;
 pub mod server_panel;
+pub mod settings_extras;
 pub mod sound_list;
 pub mod theme;
 pub mod top_bar;

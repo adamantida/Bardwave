@@ -29,6 +29,7 @@ use crate::gui::theme::{
 };
 use crate::gui::widgets::{glyph, occupancy_cells, signal_dot, ConsoleButton};
 use egui::{Align, Layout, RichText, Sense, Ui, Vec2};
+use qrcode::{Color as QrColor, EcLevel, QrCode};
 
 /// Renders the network server panel at the given size.
 pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
@@ -277,6 +278,16 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
             });
         });
 
+        // ---- Game-master panel link ----
+        // Next to the players' link, but a different secret: it opens the
+        // controls, so it is shown masked and never offered to players.
+        let gm_base = if running {
+            server.bind_url.clone()
+        } else {
+            None
+        };
+        gm_link_block(ui, state, gm_base.as_deref());
+
         ui.add_space(Metrics::LG);
 
         // ---- Listener occupancy ----
@@ -364,6 +375,13 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                 state.set_copied_feedback(true);
             }
         });
+
+        ui.add_space(Metrics::LG);
+        hairline(ui);
+        ui.add_space(Metrics::LG);
+
+        // ---- Mix: bus faders, duck, loudness, hotkeys ----
+        crate::gui::settings_extras::mix_section(ui, state);
 
         ui.add_space(Metrics::LG);
         hairline(ui);
@@ -517,4 +535,604 @@ fn config_input(
             )
         })
         .inner
+}
+
+// ---------------------------------------------------------------------------
+// Game-master panel link
+// ---------------------------------------------------------------------------
+
+/// Quiet zone around a QR code, in modules (the standard asks for four).
+const QR_QUIET_MODULES: usize = 4;
+
+/// Side of the QR code on screen, in points, before rounding to whole points
+/// per module.
+const QR_TARGET_PX: usize = 176;
+
+/// State of the game-master block: the QR toggle, the "replace key?" question
+/// and the QR texture.
+#[derive(Default)]
+pub struct GmLinkUi {
+    /// The QR code is hidden until asked for: the link is a secret and the
+    /// screen may be in view of the players.
+    qr_visible: bool,
+    /// Waiting for the operator to confirm a new key.
+    confirm_regen: bool,
+    qr: Option<QrTexture>,
+}
+
+/// The QR code of one link, uploaded as a texture.
+struct QrTexture {
+    link: String,
+    handle: egui::TextureHandle,
+    /// Side on screen, in points.
+    size: f32,
+}
+
+/// The link with the key cut short (`.../control?g=ab12...`), safe to show.
+pub fn masked_gm_link(link: &str, token: &str) -> String {
+    const SHOWN: usize = 4;
+    if token.is_empty() {
+        return link.to_string();
+    }
+    let hidden: String = token.chars().take(SHOWN).collect::<String>() + "…";
+    link.replace(token, &hidden)
+}
+
+/// A QR code as a grid of modules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QrMatrix {
+    /// Modules per side (without the quiet zone).
+    pub width: usize,
+    /// Row-major, `true` = dark.
+    pub dark: Vec<bool>,
+}
+
+impl QrMatrix {
+    /// The module at column `x`, row `y` (light outside the grid).
+    pub fn is_dark(&self, x: usize, y: usize) -> bool {
+        x < self.width && y < self.width && self.dark[y * self.width + x]
+    }
+}
+
+/// Encode `text`. Medium error correction: a phone camera reading a screen
+/// does not need more, and a lower version keeps the modules big.
+pub fn qr_matrix(text: &str) -> Result<QrMatrix, String> {
+    let code = QrCode::with_error_correction_level(text.as_bytes(), EcLevel::M)
+        .map_err(|e| e.to_string())?;
+    Ok(QrMatrix {
+        width: code.width(),
+        dark: code
+            .to_colors()
+            .into_iter()
+            .map(|c| c == QrColor::Dark)
+            .collect(),
+    })
+}
+
+/// One pixel per module plus the quiet zone, black on white. Drawn scaled with
+/// nearest-neighbour sampling.
+pub fn qr_image(matrix: &QrMatrix, quiet: usize) -> egui::ColorImage {
+    let side = matrix.width + 2 * quiet;
+    let mut pixels = vec![egui::Color32::WHITE; side * side];
+    for y in 0..matrix.width {
+        for x in 0..matrix.width {
+            if matrix.is_dark(x, y) {
+                pixels[(y + quiet) * side + x + quiet] = egui::Color32::BLACK;
+            }
+        }
+    }
+    egui::ColorImage {
+        size: [side, side],
+        pixels,
+    }
+}
+
+/// On-screen side for an image of `modules` pixels: a whole number of points
+/// per module (so modules stay crisp), as close to `target` as it gets.
+pub fn qr_display_size(modules: usize, target: usize) -> f32 {
+    let scale = (target / modules.max(1)).max(1);
+    (modules * scale) as f32
+}
+
+impl SoundSharedApp {
+    /// The game-master link for the server at `base_url`, `None` while there
+    /// is no token.
+    pub fn gm_link(&self, base_url: &str) -> Option<String> {
+        self.app_state.gm.share_url(base_url)
+    }
+
+    /// Issue a new game-master key. The old link stops working at once and
+    /// every phone connected with it is disconnected; the players' link is
+    /// not touched. Saved with the next config flush.
+    pub fn regenerate_gm_token(&mut self) {
+        let key = crate::network::generate_key();
+        self.app_state.gm.set(Some(key.clone()));
+        self.app_state.config.lock().unwrap().server.gm_token = Some(key);
+        self.library_dirty = true;
+        self.extras.gm.qr = None;
+        self.extras.gm.confirm_regen = false;
+        tracing::info!("Issued a new game-master key");
+    }
+}
+
+/// The inset well the links are shown in; returns whether it was clicked.
+fn link_well(ui: &mut Ui, text: &str, active: bool, hover: &str) -> bool {
+    let well_w = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(well_w, 34.0), Sense::click());
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        egui::Rounding::same(Metrics::R_SM),
+        Palette::WELL,
+        egui::Stroke::new(1.0_f32, Palette::BORDER),
+    );
+    let color = if active {
+        Palette::ROSE_500
+    } else {
+        Palette::ZINC_600
+    };
+    let galley = painter.layout_no_wrap(
+        crate::gui::widgets::elide(text, 38),
+        crate::gui::widgets::glyph_font(11.0),
+        color,
+    );
+    painter.galley(
+        egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    crate::gui::widgets::paint_icon(
+        painter,
+        glyph::COPY,
+        egui::pos2(rect.right() - 16.0, rect.center().y),
+        14.0,
+        if active {
+            Palette::ZINC_400
+        } else {
+            Palette::ZINC_600
+        },
+    );
+    let response = if active {
+        response
+            .on_hover_text(hover)
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    active && response.clicked()
+}
+
+/// One small caution line.
+fn caution(ui: &mut Ui, text: &str, color: egui::Color32) {
+    ui.add(
+        egui::Label::new(
+            RichText::new(text.to_uppercase())
+                .font(crate::gui::widgets::glyph_font(Metrics::MICRO_TINY))
+                .color(color)
+                .extra_letter_spacing(0.6),
+        )
+        .wrap(),
+    );
+}
+
+/// "GM PANEL LINK": the link to the remote control panel (with its own key), a
+/// QR code for the phone and the control to replace the key. `base_url` is the
+/// address of the running server, `None` while it is stopped.
+fn gm_link_block(ui: &mut Ui, state: &mut SoundSharedApp, base_url: Option<&str>) {
+    ui.add_space(Metrics::MD);
+    ui.label(micro_label("GM panel link"));
+    ui.add_space(Metrics::SM);
+
+    let token = state.app_state.gm.current();
+    let Some(token) = token else {
+        // `gm_token = ""`: only this computer may open the panel.
+        caution(
+            ui,
+            "Remote panel is off: it opens on this computer only",
+            Palette::ZINC_500,
+        );
+        ui.add_space(Metrics::SM);
+        if ConsoleButton::ghost("Create GM key")
+            .glyph(glyph::PLUS)
+            .height(34.0)
+            .tooltip("Make a key so the panel can be opened from a phone.")
+            .id_salt("gm_create_key")
+            .show(ui)
+            .clicked()
+        {
+            state.regenerate_gm_token();
+        }
+        return;
+    };
+
+    let link = base_url.and_then(|base| state.gm_link(base));
+    let shown = match &link {
+        // Without the scheme the whole masked key fits the well.
+        Some(link) => masked_gm_link(link, &token)
+            .trim_start_matches("http://")
+            .to_string(),
+        None => "Start the server to get the link".to_string(),
+    };
+    if link_well(
+        ui,
+        &shown,
+        link.is_some(),
+        "Click to copy the game-master link (with its key)",
+    ) {
+        if let Some(link) = &link {
+            ui.output_mut(|o| o.copied_text = link.clone());
+            state.set_copied_feedback(true);
+        }
+    }
+
+    ui.add_space(Metrics::XS);
+    caution(
+        ui,
+        "Do not share with players: this link controls the console",
+        Palette::AMBER_400,
+    );
+    if !state.app_state.gm_panel_served {
+        ui.add_space(2.0);
+        caution(
+            ui,
+            "This window does not serve the phone panel yet (it runs with --server-only)",
+            Palette::ZINC_500,
+        );
+    }
+
+    ui.add_space(Metrics::SM);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = Metrics::SM;
+        let qr_label = if state.extras.gm.qr_visible {
+            "Hide QR"
+        } else {
+            "Show QR"
+        };
+        if ConsoleButton::ghost(qr_label)
+            .small()
+            .width(110.0)
+            .enabled(link.is_some())
+            .tooltip(
+                "A QR code of the link for a phone camera. Anyone who sees it can control \
+                 the console.",
+            )
+            .id_salt("gm_qr_toggle")
+            .show(ui)
+            .clicked()
+        {
+            let gm = &mut state.extras.gm;
+            gm.qr_visible = !gm.qr_visible;
+            if !gm.qr_visible {
+                gm.qr = None;
+            }
+        }
+        if ConsoleButton::ghost("New key")
+            .small()
+            .glyph(glyph::REFRESH)
+            .width(110.0)
+            .tooltip("Replace the game-master key (asks first)")
+            .id_salt("gm_new_key")
+            .show(ui)
+            .clicked()
+        {
+            state.extras.gm.confirm_regen = true;
+        }
+    });
+
+    if state.extras.gm.confirm_regen {
+        ui.add_space(Metrics::SM);
+        caution(
+            ui,
+            "The current link stops working at once and every phone using it is \
+             disconnected. Players' links are not affected.",
+            Palette::AMBER_400,
+        );
+        ui.add_space(Metrics::SM);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = Metrics::SM;
+            if ConsoleButton::danger("Replace key")
+                .small()
+                .width(110.0)
+                .id_salt("gm_new_key_yes")
+                .show(ui)
+                .clicked()
+            {
+                state.regenerate_gm_token();
+            }
+            if ConsoleButton::ghost("Cancel")
+                .small()
+                .width(110.0)
+                .id_salt("gm_new_key_no")
+                .show(ui)
+                .clicked()
+            {
+                state.extras.gm.confirm_regen = false;
+            }
+        });
+    }
+
+    // The QR code, only while asked for and only for the current link.
+    match (&link, state.extras.gm.qr_visible) {
+        (Some(link), true) => {
+            let stale = state
+                .extras
+                .gm
+                .qr
+                .as_ref()
+                .is_none_or(|qr| qr.link != *link);
+            if stale {
+                state.extras.gm.qr = qr_matrix(link).ok().map(|matrix| {
+                    let image = qr_image(&matrix, QR_QUIET_MODULES);
+                    let modules = image.size[0];
+                    QrTexture {
+                        link: link.clone(),
+                        handle: ui.ctx().load_texture(
+                            "gm_link_qr",
+                            image,
+                            egui::TextureOptions::NEAREST,
+                        ),
+                        size: qr_display_size(modules, QR_TARGET_PX),
+                    }
+                });
+            }
+            ui.add_space(Metrics::SM);
+            match &state.extras.gm.qr {
+                Some(qr) => {
+                    ui.vertical_centered(|ui| {
+                        ui.add(egui::Image::new((qr.handle.id(), Vec2::splat(qr.size))));
+                    });
+                }
+                None => caution(ui, "The link is too long for a QR code", Palette::ROSE_400),
+            }
+        }
+        _ => state.extras.gm.qr = None,
+    }
+}
+
+#[cfg(test)]
+mod gm_tests {
+    use super::*;
+
+    #[test]
+    fn the_link_is_masked_but_keeps_its_shape() {
+        let link = "http://192.168.1.5:8080/control?g=abcd1234efgh5678";
+        assert_eq!(
+            masked_gm_link(link, "abcd1234efgh5678"),
+            "http://192.168.1.5:8080/control?g=abcd…"
+        );
+        // No token: nothing to hide, nothing changes.
+        assert_eq!(masked_gm_link("http://x/control", ""), "http://x/control");
+        assert!(!masked_gm_link(link, "abcd1234efgh5678").contains("efgh"));
+    }
+
+    #[test]
+    fn qr_codes_have_the_standard_geometry() {
+        let m = qr_matrix("http://192.168.1.5:8080/control?g=abcd1234efgh5678").unwrap();
+        // Version v has 4v + 17 modules per side.
+        assert!(m.width >= 21 && (m.width - 17) & 3 == 0, "{}", m.width);
+        assert_eq!(m.dark.len(), m.width * m.width);
+        // Finder pattern: a 7x7 dark ring with a 3x3 dark centre and a light
+        // ring between them, in three corners.
+        let finder = |ox: usize, oy: usize| {
+            (0..7).all(|i| {
+                m.is_dark(ox + i, oy)
+                    && m.is_dark(ox + i, oy + 6)
+                    && m.is_dark(ox, oy + i)
+                    && m.is_dark(ox + 6, oy + i)
+            }) && (2..5).all(|y| (2..5).all(|x| m.is_dark(ox + x, oy + y)))
+                && !m.is_dark(ox + 1, oy + 1)
+        };
+        assert!(finder(0, 0));
+        assert!(finder(m.width - 7, 0));
+        assert!(finder(0, m.width - 7));
+        // No finder pattern in the fourth corner.
+        assert!(!finder(m.width - 7, m.width - 7));
+    }
+
+    #[test]
+    fn qr_is_deterministic_and_depends_on_the_text() {
+        let a = qr_matrix("http://10.0.0.2:8080/control?g=aaaaaaaaaaaaaaaa").unwrap();
+        let b = qr_matrix("http://10.0.0.2:8080/control?g=aaaaaaaaaaaaaaaa").unwrap();
+        let c = qr_matrix("http://10.0.0.2:8080/control?g=bbbbbbbbbbbbbbbb").unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn oversized_text_is_an_error_not_a_panic() {
+        assert!(qr_matrix(&"x".repeat(10_000)).is_err());
+    }
+
+    #[test]
+    fn the_image_adds_a_white_quiet_zone() {
+        let m = qr_matrix("http://10.0.0.2:8080/control?g=aaaaaaaaaaaaaaaa").unwrap();
+        let image = qr_image(&m, QR_QUIET_MODULES);
+        let side = m.width + 2 * QR_QUIET_MODULES;
+        assert_eq!(image.size, [side, side]);
+        assert_eq!(image.pixels.len(), side * side);
+        // Border is white, the top-left finder corner is black.
+        assert!(image.pixels[..side]
+            .iter()
+            .all(|p| *p == egui::Color32::WHITE));
+        let q = QR_QUIET_MODULES;
+        assert_eq!(image.pixels[q * side + q], egui::Color32::BLACK);
+        // Dark module count is preserved.
+        let dark = image
+            .pixels
+            .iter()
+            .filter(|p| **p == egui::Color32::BLACK)
+            .count();
+        assert_eq!(dark, m.dark.iter().filter(|d| **d).count());
+    }
+
+    #[test]
+    fn display_size_is_a_whole_number_of_points_per_module() {
+        // 33 modules + 8 quiet = 41; 176 / 41 = 4 points per module.
+        assert_eq!(qr_display_size(41, 176), 164.0);
+        assert_eq!(qr_display_size(29, 176), 174.0);
+        // Never below one point per module.
+        assert_eq!(qr_display_size(500, 176), 500.0);
+    }
+}
+
+#[cfg(test)]
+mod gm_ui_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::gui::hotkeys_ui::test_support::*;
+
+    const TOKEN: &str = "abcd1234efgh5678";
+    const BASE: &str = "http://192.168.1.5:8080";
+
+    fn harness_with_token(token: Option<&str>) -> Harness {
+        let mut config = Config::default();
+        config.server.gm_token = token.map(str::to_string);
+        harness(config, false)
+    }
+
+    fn draw(h: &mut Harness, base: Option<&str>) -> String {
+        settle(&h.ctx, 2, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| gm_link_block(ui, &mut h.app, base));
+        })
+    }
+
+    #[test]
+    fn the_link_is_built_from_the_server_address_and_the_gm_token() {
+        let h = harness_with_token(Some(TOKEN));
+        assert_eq!(
+            h.app.gm_link(BASE).as_deref(),
+            Some("http://192.168.1.5:8080/control?g=abcd1234efgh5678")
+        );
+        let none = harness_with_token(None);
+        assert_eq!(none.app.gm_link(BASE), None);
+    }
+
+    #[test]
+    fn the_block_shows_a_masked_link_and_warns_against_sharing_it() {
+        let mut h = harness_with_token(Some(TOKEN));
+        let text = draw(&mut h, Some(BASE));
+        assert!(text.contains("GM PANEL LINK"), "{text}");
+        assert!(text.contains("192.168.1.5:8080/CONTROL?G=ABCD"), "{text}");
+        assert!(
+            !text.contains("EFGH5678"),
+            "the key must not be shown: {text}"
+        );
+        assert!(text.contains("DO NOT SHARE WITH PLAYERS"), "{text}");
+        assert!(text.contains("SHOW QR"), "{text}");
+        assert!(text.contains("NEW KEY"), "{text}");
+        // The QR code is not drawn until asked for.
+        assert!(h.app.extras.gm.qr.is_none());
+    }
+
+    #[test]
+    fn a_stopped_server_has_no_link() {
+        let mut h = harness_with_token(Some(TOKEN));
+        let text = draw(&mut h, None);
+        assert!(text.contains("START THE SERVER TO GET THE LINK"), "{text}");
+        h.app.extras.gm.qr_visible = true;
+        draw(&mut h, None);
+        assert!(h.app.extras.gm.qr.is_none());
+    }
+
+    #[test]
+    fn the_qr_code_follows_the_toggle_and_the_current_link() {
+        let mut h = harness_with_token(Some(TOKEN));
+        h.app.extras.gm.qr_visible = true;
+        draw(&mut h, Some(BASE));
+        let first = h.app.extras.gm.qr.as_ref().expect("a QR texture");
+        assert_eq!(
+            first.link,
+            "http://192.168.1.5:8080/control?g=abcd1234efgh5678"
+        );
+        assert!(first.size >= 100.0);
+
+        // A new key: the old image is gone and the next frame draws the new one.
+        h.app.regenerate_gm_token();
+        assert!(h.app.extras.gm.qr.is_none());
+        draw(&mut h, Some(BASE));
+        let second = h.app.extras.gm.qr.as_ref().expect("a QR texture");
+        assert_ne!(second.link, first_link_for_compare());
+        assert!(second.link.contains(&h.gm.current().unwrap()));
+
+        // Hiding drops the texture.
+        h.app.extras.gm.qr_visible = false;
+        draw(&mut h, Some(BASE));
+        assert!(h.app.extras.gm.qr.is_none());
+    }
+
+    fn first_link_for_compare() -> String {
+        format!("{BASE}/control?g={TOKEN}")
+    }
+
+    #[test]
+    fn a_new_key_revokes_the_old_one_at_once_and_is_saved() {
+        let mut h = harness_with_token(Some(TOKEN));
+        let listener_key = h.app.access_key();
+        assert!(h.gm.allows(Some(TOKEN)));
+        h.app.regenerate_gm_token();
+        let new = h.gm.current().expect("a token");
+        assert_ne!(new, TOKEN);
+        assert!(!h.gm.allows(Some(TOKEN)), "the old key must stop working");
+        assert!(h.gm.allows(Some(&new)));
+        assert_eq!(
+            h.config.lock().unwrap().server.gm_token.as_deref(),
+            Some(new.as_str())
+        );
+        assert!(h.app.library_dirty, "the new key must reach config.toml");
+        // The players' key is a different secret and is not touched.
+        assert_eq!(h.app.access_key(), listener_key);
+    }
+
+    #[test]
+    fn replacing_the_key_asks_first_and_says_what_happens() {
+        let mut h = harness_with_token(Some(TOKEN));
+        h.app.extras.gm.confirm_regen = true;
+        let text = draw(&mut h, Some(BASE));
+        assert!(text.contains("STOPS WORKING AT ONCE"), "{text}");
+        assert!(text.contains("REPLACE KEY"), "{text}");
+        assert!(text.contains("CANCEL"), "{text}");
+        // Nothing changed yet.
+        assert_eq!(h.gm.current().as_deref(), Some(TOKEN));
+    }
+
+    #[test]
+    fn without_a_token_the_panel_is_local_only_and_a_key_can_be_created() {
+        let mut h = harness_with_token(None);
+        let text = draw(&mut h, Some(BASE));
+        assert!(text.contains("REMOTE PANEL IS OFF"), "{text}");
+        assert!(text.contains("CREATE GM KEY"), "{text}");
+        assert!(!text.contains("SHOW QR"), "{text}");
+        h.app.regenerate_gm_token();
+        assert!(h.gm.remote_enabled());
+    }
+
+    #[test]
+    fn the_block_says_when_this_window_does_not_serve_the_panel() {
+        let mut h = harness_with_token(Some(TOKEN));
+        assert!(!draw(&mut h, Some(BASE)).contains("SERVER-ONLY"));
+        h.app.app_state.gm_panel_served = false;
+        let text = draw(&mut h, Some(BASE));
+        assert!(text.contains("--SERVER-ONLY"), "{text}");
+    }
+
+    #[test]
+    fn the_whole_column_renders_with_the_new_sections() {
+        let mut h = harness_with_token(Some(TOKEN));
+        let text = settle(&h.ctx, 2, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                server_panel(ui, &mut h.app, Vec2::new(340.0, 2000.0));
+            });
+        });
+        for expected in [
+            "NETWORK SERVER",
+            "ACCESS KEY",
+            "GM PANEL LINK",
+            "LISTENERS",
+            "MIX",
+            "NORMALIZE LOUDNESS",
+            "CONFIGURATION",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+    }
 }
