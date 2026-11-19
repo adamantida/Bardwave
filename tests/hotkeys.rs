@@ -336,6 +336,17 @@ fn midi_note_runs_a_scene() {
         .handle(&mut director, &pb, &mut NoExtras, &events[0])
         .unwrap();
     assert_eq!(director.active_scene(), Some("storm"));
-    // A keyboard-only map ignores the MIDI entry without complaint.
-    assert!(HotkeyMap::build(&hotkeys).problems().is_empty());
+}
+
+/// Nothing connects a MIDI device to the app yet, so a MIDI binding must be
+/// reported as unavailable in every build, `--features midi` included.
+#[test]
+fn midi_binding_is_reported_unavailable_in_every_build() {
+    let hotkeys = vec![HotkeyConfig {
+        key: "Midi:Ch1:Note60".into(),
+        action: HotkeyAction::StopAll,
+    }];
+    let problems = HotkeyMap::build(&hotkeys).problems().to_vec();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].kind, ProblemKind::MidiUnavailable);
 }
