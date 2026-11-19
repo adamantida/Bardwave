@@ -475,6 +475,31 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let server_only = args.iter().any(|a| a == "--server-only");
 
+    // `--profile <name>` selects a campaign profile (own config.toml and
+    // library under `profiles/<name>/`); without it the default profile is the
+    // root config, exactly as before. Decided before any path is used.
+    match soundshared::profiles::parse_profile_arg(&args) {
+        Ok(profile) => {
+            soundshared::paths::set_active_profile(profile.clone());
+            soundshared::profiles::record_launch(
+                &soundshared::paths::root_dir(),
+                profile.as_deref(),
+            );
+        }
+        Err(message) => {
+            if !server_only {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Bardwave")
+                    .set_description(&message)
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+            }
+            eprintln!("Error: {message}");
+            std::process::exit(2);
+        }
+    }
+
     attach_parent_console(server_only);
 
     // Load configuration. A broken config.toml used to end the process
@@ -805,6 +830,14 @@ fn main() -> Result<()> {
         }
 
         info!("SoundShared stopped");
+
+        // A profile switch was requested in the GUI: start the new process now
+        // that this one has released its port and audio device.
+        match soundshared::profiles::launch_pending_switch() {
+            Some(Ok(target)) => info!("Started profile {:?}", target),
+            Some(Err(e)) => error!("Could not start the other profile: {}", e),
+            None => {}
+        }
         gui_result.map_err(|e| SoundSharedError::Other(e.to_string()))
     }
 }

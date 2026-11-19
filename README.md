@@ -174,6 +174,14 @@ Click **YouTube** next to *Add Sound*, paste a video or music link and press **A
 
 The Windows installer deliberately does not install a `config.toml` (its presence would switch to portable mode), and a `config.toml` that an elevated run left in a read-only `Program Files` does not pin the directory either. Existing v1.4.0 folders keep working unchanged. To reset Bardwave, delete the data directory. Uninstalling never deletes it.
 
+### Profiles (several campaigns)
+
+Each campaign can have its own `config.toml` and library. The **default profile** is the data directory above, exactly as before; nothing is migrated. Any other profile lives in `<data directory>/profiles/<name>/` with its own `config.toml` and `bardwave-library/`. The log, the downloaded tools and the list of recent profiles (`recent.toml`) stay shared in the data directory.
+
+- Start a profile from the command line: `soundshared --profile "Curse of Strahd"` (`--profile default` is the default profile). Names are letters, digits, spaces, `-` and `_`, up to 32 characters.
+- In the console, the **Profile** menu in the top bar lists the recent profiles, switches (Bardwave saves, closes and starts again with the other profile), creates a profile (optionally copying the current library), renames and deletes other profiles, and opens the data folder. Deleting a profile that is not empty asks you to type its name; there is no trash.
+- Only one profile runs at a time, so two profiles may use the same server port.
+
 ### Connect your players
 
 The SERVER panel shows these addresses:

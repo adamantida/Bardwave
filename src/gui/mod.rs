@@ -20,6 +20,7 @@ pub mod hotkeys_ui;
 pub mod library_ui;
 pub mod motion;
 pub mod music;
+pub mod profiles_ui;
 pub mod scenes;
 pub mod server_panel;
 pub mod settings_extras;
@@ -66,7 +67,10 @@ impl GuiApp {
             viewport: ViewportBuilder::default()
                 .with_inner_size([1280.0, 800.0])
                 .with_min_inner_size([960.0, 620.0])
-                .with_title("Bardwave — Broadcast Console")
+                .with_title(format!(
+                    "Bardwave — Broadcast Console{}",
+                    profiles_ui::title_suffix()
+                ))
                 .with_icon(window_icon()),
             centered: true,
             ..Default::default()
@@ -199,6 +203,8 @@ impl App for GuiApp {
         dialog::show_dialogs(ctx, &mut self.state);
         // Library modals (add folder, bundles, tags, path prefix).
         library_ui::show_library_dialogs(ctx, &mut self.state);
+        // Profile switch / new / manage dialogs.
+        profiles_ui::show_profile_dialogs(ctx, &mut self.state);
 
         if self.state.tooltip_requested() {
             ctx.request_repaint();

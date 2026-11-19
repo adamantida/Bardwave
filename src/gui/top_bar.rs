@@ -32,6 +32,10 @@ pub fn top_bar(ui: &mut Ui, state: &mut SoundSharedApp) {
             vertical_divider(ui);
             ui.add_space(Metrics::XL);
             quick_clear(ui, state);
+            ui.add_space(Metrics::XL);
+            vertical_divider(ui);
+            ui.add_space(Metrics::XL);
+            crate::gui::profiles_ui::profile_menu(ui, state);
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(Metrics::PANEL_PAD);

@@ -25,6 +25,9 @@ Read this before relying on the items below. They are implemented and covered by
 
 ### Added
 
+**Profiles**
+- Several campaigns with their own config and library: `--profile <name>` and a Profile menu in the top bar (switch by restart, new with optional library copy, rename, delete with typed confirmation, open data folder). The default profile is the existing root config, nothing is migrated; recent profiles are kept in `recent.toml`.
+
 **Scenes and transitions**
 - Scenes (`[[library.scenes]]`): named sets of sounds with per-item volume, loop, automatic/manual start and start delay, a button colour, `fade_in_ms` / `fade_out_ms`, `stop_others`.
 - Crossfade between scenes with equal-power or linear curves; re-activating a scene mid-transition continues from the current levels. The mixer fades are now parametrised (previously a fixed 10 ms click guard).
