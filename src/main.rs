@@ -615,6 +615,8 @@ fn main() -> Result<()> {
             control_feed.clone(),
         )
     });
+    // The console shows the game-master link and can replace the token.
+    let app_state = app_state.with_gm(gm_auth.guard().clone(), control_routes.is_some());
     thread::spawn(move || {
         if let Err(e) = run_server_and_get_handle(
             server_config_clone,

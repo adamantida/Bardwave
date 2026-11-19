@@ -239,6 +239,15 @@ pub struct AppState {
     /// Access key of the listener stream, shared with the server: the
     /// console puts it into every link it copies and can issue a new one.
     pub access: crate::network::AccessGuard,
+
+    /// Game-master token of the remote control panel, shared with the server:
+    /// the console shows the link and can replace the token (the old one stops
+    /// working at once).
+    pub gm: crate::network::GmGuard,
+
+    /// Whether this process actually serves `/control` (today only with
+    /// `--server-only`). The console says so next to the game-master link.
+    pub gm_panel_served: bool,
 }
 
 impl AppState {
@@ -257,7 +266,17 @@ impl AppState {
             upnp_status: Default::default(),
             network_notes: Default::default(),
             access: Default::default(),
+            gm: Default::default(),
+            gm_panel_served: false,
         }
+    }
+
+    /// Use `gm` as the remote panel's token guard; `served` says whether the
+    /// `/control` routes are mounted in this process.
+    pub fn with_gm(mut self, gm: crate::network::GmGuard, served: bool) -> Self {
+        self.gm = gm;
+        self.gm_panel_served = served;
+        self
     }
 
     /// Use `access` as the stream's access key guard.

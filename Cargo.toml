@@ -91,6 +91,10 @@ rtrb = "0.3.6"
 # Library bundles (.zip export/import); deflate only, via flate2 (pure Rust)
 zip = { version = "=2.6.1", default-features = false, features = ["deflate-flate2", "flate2"] }
 
+# QR code of the game-master panel link, drawn offline into an egui texture
+# (pure Rust; no image/svg backends needed)
+qrcode = { version = "0.14.1", default-features = false }
+
 # System-wide hotkeys (console not focused); see src/hotkeys.rs
 global-hotkey = "0.7.0"
 # MIDI input for hotkey bindings, only with `--features midi` (off by default)

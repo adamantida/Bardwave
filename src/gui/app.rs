@@ -60,6 +60,9 @@ pub enum Dialog {
     /// its validation error; the download itself runs on a worker thread and
     /// reports into [`SoundSharedApp::youtube_result_rx`].
     AddYouTube { url: String, error: Option<String> },
+    /// Hotkey bindings. The editor state lives in
+    /// [`ConsoleExtras`](crate::gui::settings_extras::ConsoleExtras).
+    Hotkeys,
 }
 
 /// How long the library may stay unsaved before it is flushed to disk.
@@ -128,24 +131,24 @@ pub struct ServerState {
 /// Main GUI application state
 pub struct SoundSharedApp {
     // Reference to shared app state
-    app_state: AppState,
+    pub(crate) app_state: AppState,
 
     // Audio engine (must stay on main thread due to cpal::Stream not being Send)
-    audio_engine: Arc<Mutex<Option<AudioEngine>>>,
+    pub(crate) audio_engine: Arc<Mutex<Option<AudioEngine>>>,
 
     // Audio command receiver (for processing commands on main thread)
     audio_cmd_rx: Receiver<AudioCommand>,
 
     /// The control core shared with the headless `/control` page: scenes,
     /// stingers and every playback command go through it.
-    director: Director,
+    pub(crate) director: Director,
 
     // Local sound cache (synced from audio engine)
-    sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
+    pub(crate) sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
     sound_order: Arc<Mutex<Vec<SoundId>>>,
 
     // Master volume cache
-    master_volume: Arc<Mutex<f32>>,
+    pub(crate) master_volume: Arc<Mutex<f32>>,
 
     // Server state cache
     server_state: Arc<Mutex<ServerState>>,
@@ -167,13 +170,13 @@ pub struct SoundSharedApp {
     server_status_tx: Sender<AppServerStatus>,
 
     // Sound library + groups (the operator's saved collection)
-    library: Library,
+    pub(crate) library: Library,
     /// Which group the library panel is filtered to.
     group_filter: GroupFilter,
     /// Name shown in the group-name field of the currently open modal.
-    dialog: Dialog,
+    pub(crate) dialog: Dialog,
     /// Set when the library changed and needs writing to config.toml.
-    library_dirty: bool,
+    pub(crate) library_dirty: bool,
     /// Last time the library was flushed to disk.
     last_persist: Instant,
     /// Master volume stashed while muted.
@@ -218,10 +221,13 @@ pub struct SoundSharedApp {
     youtube_busy: bool,
     /// MASTER OUTPUT meter position (0..1, dB scale with peak decay).
     output_meter: f32,
+    /// Hotkeys, bus faders / ducking / normalization and the game-master link
+    /// state (see `hotkeys_ui`, `settings_extras`, `server_panel`).
+    pub(crate) extras: crate::gui::settings_extras::ConsoleExtras,
 }
 
 /// Hand the Director the current scenes and the loaded library sounds.
-fn sync_director(
+pub(crate) fn sync_director(
     director: &mut Director,
     library: &Library,
     sounds: &Mutex<HashMap<SoundId, SoundEntry>>,
@@ -237,7 +243,7 @@ fn sync_director(
 
 /// Copy "is it playing" from the engine into the rows: scenes and delayed
 /// starts start sounds without going through the row's Play button.
-fn mirror_playing(sounds: &Mutex<HashMap<SoundId, SoundEntry>>, engine: &AudioEngine) {
+pub(crate) fn mirror_playing(sounds: &Mutex<HashMap<SoundId, SoundEntry>>, engine: &AudioEngine) {
     for entry in sounds.lock().unwrap().values_mut() {
         entry.playing = engine.is_sound_playing(entry.id).unwrap_or(false);
     }
@@ -286,7 +292,17 @@ impl SoundSharedApp {
         audio_cmd_rx: Receiver<AudioCommand>,
         cc: &eframe::CreationContext<'_>,
     ) -> Self {
-        let (decode_tx, decoded_rx) = spawn_decoder(cc.egui_ctx.clone());
+        Self::with_context(&cc.egui_ctx, app_state, audio_engine, audio_cmd_rx)
+    }
+
+    /// [`SoundSharedApp::new`] from a bare egui context (headless tests).
+    pub fn with_context(
+        ctx: &egui::Context,
+        app_state: AppState,
+        audio_engine: Arc<Mutex<Option<AudioEngine>>>,
+        audio_cmd_rx: Receiver<AudioCommand>,
+    ) -> Self {
+        let (decode_tx, decoded_rx) = spawn_decoder(ctx.clone());
         // Create channels for receiving updates from background threads
         let (server_status_tx, server_status_rx) = bounded(1);
         let (bind_result_tx, bind_result_rx) = bounded(4);
@@ -298,12 +314,16 @@ impl SoundSharedApp {
             let config = app_state.config.lock().unwrap();
             (
                 config.audio.master_volume,
-                Library::from_config(&config.library),
+                Library::from_full_config(&config),
                 config.server.host.clone(),
                 config.server.port,
                 crate::gui::motion::reduced_motion(config.gui.reduce_motion),
             )
         };
+
+        // Hotkeys: the bindings come with the library; the system-wide service
+        // starts here because eframe creates the app on the main thread.
+        let extras = crate::gui::settings_extras::ConsoleExtras::new(ctx, &app_state, &library);
 
         let mut app = Self {
             app_state,
@@ -347,6 +367,7 @@ impl SoundSharedApp {
             youtube_status: Arc::new(Mutex::new(String::new())),
             youtube_busy: false,
             output_meter: 0.0,
+            extras,
         };
 
         // Request initial server status
@@ -1348,7 +1369,8 @@ impl SoundSharedApp {
         let sounds = snapshot.sounds.len();
 
         let mut config = self.app_state.config.lock().unwrap();
-        config.library = snapshot;
+        // `[library]` and `[[hotkeys]]` together.
+        self.library.write_config(&mut config);
         if let Err(e) = config.save() {
             error!("Failed to save library to config.toml: {}", e);
             return;
@@ -1380,6 +1402,9 @@ impl SoundSharedApp {
 
     /// Update function called each frame - process audio commands on main thread
     pub fn update(&mut self, ctx: &Context) {
+        // Keyboard shortcuts first, before any widget can see the key events.
+        self.poll_hotkeys(ctx);
+
         // Process pending audio commands (runs on main thread where AudioEngine lives)
         self.process_audio_commands();
         self.finish_decoded();

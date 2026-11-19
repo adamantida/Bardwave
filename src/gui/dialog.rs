@@ -26,7 +26,10 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
     // A click on the scrim or `Esc` dismisses the modal — except while a
     // YouTube download is running: that modal closes when the worker reports
     // back, so the download cannot be forgotten mid-flight.
-    let escaped = ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !state.youtube_busy();
+    // While the hotkey editor waits for a key, Esc cancels the capture instead.
+    let escaped = ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        && !state.youtube_busy()
+        && !state.hotkeys_capturing();
     if escaped {
         state.close_dialog();
         return;
@@ -34,6 +37,8 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
 
     match dialog {
         Dialog::None => {}
+
+        Dialog::Hotkeys => crate::gui::hotkeys_ui::show_hotkeys_dialog(ctx, state),
 
         Dialog::NewGroup { name, error } => {
             let mut field = name;
