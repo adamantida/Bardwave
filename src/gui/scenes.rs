@@ -1418,7 +1418,7 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
             if labelled(stop_scene, "Stop the active scene").clicked() {
                 actions.push(DeckAction::StopScene);
             }
-            let stop_all = ConsoleButton::danger("Stop All")
+            let stop_all = ConsoleButton::danger("Fade Out")
                 .glyph(glyph::STOP)
                 .small()
                 .width(104.0)
