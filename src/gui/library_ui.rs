@@ -26,6 +26,7 @@
 //! players' stream. A second click on the same sound stops it.
 
 mod dialogs;
+mod layout;
 pub mod logic;
 mod ops;
 mod state;
