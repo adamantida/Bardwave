@@ -364,7 +364,7 @@ impl SoundSharedApp {
             server_status_rx,
             server_status_tx,
             library,
-            lib_ui: crate::gui::library_ui::LibraryUi::new(cc.egui_ctx.clone()),
+            lib_ui: crate::gui::library_ui::LibraryUi::new(ctx.clone()),
             group_filter: GroupFilter::All,
             dialog: Dialog::None,
             library_dirty: false,
