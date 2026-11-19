@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f6f5f4" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+<!-- The address of this page may carry the game master token (?g=): never pass it on. -->
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+<title>Bardwave GM</title>
+<link rel="stylesheet" href="/control.css">
+</head>
+<body data-conn="connecting">
+<header class="top">
+  <div class="top-row">
+    <h1 class="brand">Bardwave <span>GM</span></h1>
+    <p class="conn" id="conn" role="status" aria-live="polite">
+      <span class="dot" aria-hidden="true"></span><span id="connText">Connecting…</span>
+    </p>
+  </div>
+  <div class="top-row actions">
+    <button type="button" class="btn big" id="duck" aria-pressed="false">Duck</button>
+    <button type="button" class="btn big danger" id="stopAll">Stop all</button>
+  </div>
+</header>
+
+<main id="app" class="ctl-root">
+  <noscript><p class="note">The game master panel needs JavaScript.</p></noscript>
+
+  <section class="card" aria-labelledby="hMaster">
+    <h2 id="hMaster">Master volume</h2>
+    <div class="slider-row">
+      <input type="range" min="0" max="100" step="1" value="0" id="master" aria-label="Master volume">
+      <output class="pct" id="masterPct" for="master">0%</output>
+    </div>
+  </section>
+
+  <section class="card" id="secScenes" aria-labelledby="hScenes" hidden>
+    <div class="card-head">
+      <h2 id="hScenes">Scenes</h2>
+      <button type="button" class="btn small" id="stopScene">Stop scene</button>
+    </div>
+    <div class="grid scenes" id="scenes"></div>
+  </section>
+
+  <section class="card" id="secStingers" aria-labelledby="hStingers" hidden>
+    <h2 id="hStingers">Stingers</h2>
+    <div class="grid pads" id="stingers"></div>
+  </section>
+
+  <section class="card" id="secPlaylist" aria-labelledby="hPlaylist" hidden>
+    <h2 id="hPlaylist">Music</h2>
+    <div class="now">
+      <p class="now-title" id="nowTitle">Nothing playing</p>
+      <p class="now-sub" id="nowSub"></p>
+    </div>
+    <div class="transport" role="group" aria-label="Playlist transport">
+      <button type="button" class="btn" id="plPrev" aria-label="Previous track">Prev</button>
+      <button type="button" class="btn primary" id="plToggle">Play</button>
+      <button type="button" class="btn" id="plNext" aria-label="Next track">Next</button>
+      <button type="button" class="btn" id="plStop">Stop</button>
+    </div>
+    <div class="grid lists" id="playlists"></div>
+    <p class="note" id="plNote" hidden>Playlist control is not available on this server version.</p>
+  </section>
+
+  <section class="card" aria-labelledby="hBuses">
+    <h2 id="hBuses">Mixer</h2>
+    <div class="buses" id="buses"></div>
+  </section>
+
+  <section class="card wide" aria-labelledby="hSounds">
+    <h2 id="hSounds">Sounds</h2>
+    <p class="note" id="soundsEmpty" hidden>The library is empty. Add sounds in the console and restart the server.</p>
+    <ul class="sounds" id="sounds"></ul>
+  </section>
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="/control.js"></script>
+</body>
+</html>
