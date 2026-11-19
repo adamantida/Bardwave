@@ -252,6 +252,9 @@ pub struct AppState {
     /// Where the phone panel's commands arrive and its state goes, when the
     /// console serves the panel (see `gui::gm_bridge`).
     pub gm_panel: Option<crate::gui::gm_bridge::GmPanelLink>,
+    /// Scene / track titles the console publishes for the listeners' page
+    /// (shared with the broadcaster, see `BroadcasterConfig::now_playing`).
+    pub now_playing: crate::network::broadcast::NowPlayingFeed,
 }
 
 impl AppState {
@@ -273,7 +276,14 @@ impl AppState {
             gm: Default::default(),
             gm_panel_served: false,
             gm_panel: None,
+            now_playing: Default::default(),
         }
+    }
+
+    /// Use `feed` as the listeners' "now playing" feed.
+    pub fn with_now_playing(mut self, feed: crate::network::broadcast::NowPlayingFeed) -> Self {
+        self.now_playing = feed;
+        self
     }
 
     /// Use `gm` as the remote panel's token guard; `served` says whether the

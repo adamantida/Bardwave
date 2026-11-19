@@ -567,6 +567,10 @@ fn main() -> Result<()> {
     #[allow(clippy::arc_with_non_send_sync)]
     let audio_engine_shared = Arc::new(Mutex::new(Some(audio_engine)));
 
+    // Scene / track titles for the listeners, published by the console (or by
+    // the headless board) and forwarded by the broadcaster.
+    let now_playing = soundshared::network::broadcast::NowPlayingFeed::new();
+
     // Create network server config. The listener page is embedded in the binary
     // (build_router), so there is no static directory to point at any more.
     let server_config = ServerConfig {
@@ -574,7 +578,10 @@ fn main() -> Result<()> {
         bind_addr: parse_bind_host(&config.server.host)
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))),
         upnp: config.server.upnp,
-        broadcaster_config: BroadcasterConfig::default(),
+        broadcaster_config: BroadcasterConfig {
+            now_playing: now_playing.clone(),
+            ..BroadcasterConfig::default()
+        },
         websocket_config: WebSocketConfig::default(),
         access: access.clone(),
     };
@@ -586,7 +593,8 @@ fn main() -> Result<()> {
         Arc::new(Mutex::new(0)),
         Arc::new(Mutex::new(config.clone())),
     )
-    .with_access(access.clone());
+    .with_access(access.clone())
+    .with_now_playing(now_playing.clone());
 
     // Spawn server thread (does NOT auto-start - waits for Start command from GUI).
     // The thread learns about process shutdown from its own Stop command / the
@@ -764,6 +772,12 @@ fn main() -> Result<()> {
             if let Some(engine) = audio_engine_shared.lock().unwrap().as_ref() {
                 board.tick(engine);
             }
+            now_playing.publish(
+                soundshared::network::broadcast::NowPlaying::from_director_with_library(
+                    board.director(),
+                    &config.library,
+                ),
+            );
             // Gains measured in the background go into the saved library.
             let updates = board.take_gain_updates();
             if !updates.is_empty()

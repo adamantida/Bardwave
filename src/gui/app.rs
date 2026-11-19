@@ -1554,6 +1554,17 @@ impl SoundSharedApp {
         self.director.tick(engine);
         mirror_playing(&self.sounds, engine);
         self.music.observe(&self.director, Instant::now());
+        // Scene and track names for the listeners' page.
+        let library = &self.library;
+        self.app_state
+            .now_playing
+            .publish(crate::network::broadcast::NowPlaying::from_director(
+                &self.director,
+                |id| {
+                    let id = uuid::Uuid::parse_str(id).ok()?;
+                    library.sound_by_id(id).map(crate::gui::music::sound_label)
+                },
+            ));
         // Loudness measured in the background: store the gains in the library.
         for update in self.director.take_gain_updates() {
             let path = uuid::Uuid::parse_str(&update.library_id)
