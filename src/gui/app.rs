@@ -73,6 +73,9 @@ pub enum Dialog {
     /// Hotkey bindings. The editor state lives in
     /// [`ConsoleExtras`](crate::gui::settings_extras::ConsoleExtras).
     Hotkeys,
+    /// Session timers (see [`crate::gui::timeline`]); the editor state lives
+    /// in [`ConsoleExtras`](crate::gui::settings_extras::ConsoleExtras).
+    Timers,
 }
 
 /// How long the library may stay unsaved before it is flushed to disk.
@@ -1495,6 +1498,9 @@ impl SoundSharedApp {
         // Delayed scene starts, and the rows of sounds a scene started.
         self.run_director();
 
+        // Session timers that fired (see `gui::timeline`).
+        self.run_timers();
+
         // Scene deck: replies to its commands, the active scene, its repaints.
         self.scene_frame(ctx);
 
@@ -1533,6 +1539,7 @@ impl SoundSharedApp {
             wait = wait.min(until.max(Duration::from_millis(5)));
         }
         wait = wait.min(self.music.repaint_hint(&self.dialog));
+        wait = wait.min(self.timers_repaint_hint());
         ctx.request_repaint_after(wait);
     }
 

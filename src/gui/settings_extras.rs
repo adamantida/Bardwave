@@ -46,6 +46,8 @@ pub struct ConsoleExtras {
     pub mix: MixUi,
     /// Game-master link (QR, confirmation).
     pub gm: GmLinkUi,
+    /// Session timers: the timeline thread and the Timers dialog.
+    pub timers: crate::gui::timeline::TimersUi,
 }
 
 impl ConsoleExtras {
@@ -56,6 +58,10 @@ impl ConsoleExtras {
             hotkeys: HotkeyUi::start(ctx, app_state, library),
             mix: MixUi::default(),
             gm: GmLinkUi::default(),
+            timers: crate::gui::timeline::TimersUi::start(
+                ctx,
+                app_state.config.lock().unwrap().timers.clone(),
+            ),
         }
     }
 }
@@ -353,6 +359,7 @@ pub fn mix_section(ui: &mut Ui, state: &mut SoundSharedApp) {
             state.open_hotkeys();
         }
     });
+    crate::gui::timeline::timers_button(ui, state);
 
     ui.add_space(Metrics::SM);
     duck_settings(ui, state, &view);
