@@ -2,9 +2,10 @@
 //! High-level API for sound management and playback
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -19,9 +20,25 @@ use uuid::Uuid;
 
 use self::device_adapter::{DeviceAdapter, StreamResampler};
 use crate::audio::decoder::{
-    AudioDecoder, DecodedAudio, DecoderError, TARGET_CHANNELS, TARGET_SAMPLE_RATE,
+    AudioDecoder, DecodedAudio, DecoderError, TrackMeta, TARGET_CHANNELS, TARGET_SAMPLE_RATE,
 };
 use crate::audio::mixer::{AudioMixer, Bus, DuckSettings, FadeCurve, MixedOutput, MixerConfig};
+use crate::audio::stream_source::{
+    should_stream, StreamEvent, StreamSource, DEFAULT_STREAM_THRESHOLD_SECS,
+};
+
+/// How long starting a streamed track waits for its first audio to be decoded
+/// (normally a few milliseconds), so the first callbacks do not underrun.
+const STREAM_START_WAIT: Duration = Duration::from_millis(30);
+
+/// A long file that is not held in memory: every play opens it afresh and
+/// decodes it on the fly (see [`StreamSource`]).
+#[derive(Debug, Clone)]
+struct StreamSound {
+    path: PathBuf,
+    meta: TrackMeta,
+    duration_secs: f32,
+}
 
 /// Sample rate of the mix pipeline: what the mixer produces, what the network
 /// forwarder publishes and what every web listener receives. The local device
@@ -436,6 +453,10 @@ pub(crate) struct AudioEngineInner {
     mixer: Arc<AudioMixer>,
     /// Loaded sounds: SoundId -> Arc<DecodedAudio>
     sounds: RwLock<HashMap<SoundId, Arc<DecodedAudio>>>,
+    /// Loaded sounds that are streamed from disk instead of held in memory
+    stream_sounds: RwLock<HashMap<SoundId, StreamSound>>,
+    /// Files longer than this many seconds are streamed (0 = never)
+    stream_threshold_secs: AtomicU32,
     /// Per-sound volume, applied to tracks of that sound as they are created
     /// and to the ones already playing
     pub(crate) sound_volumes: RwLock<HashMap<SoundId, f32>>,
@@ -531,6 +552,8 @@ impl AudioEngine {
         let inner = Arc::new(AudioEngineInner {
             mixer,
             sounds: RwLock::new(HashMap::new()),
+            stream_sounds: RwLock::new(HashMap::new()),
+            stream_threshold_secs: AtomicU32::new(DEFAULT_STREAM_THRESHOLD_SECS),
             sound_volumes: RwLock::new(HashMap::new()),
             sound_pans: RwLock::new(HashMap::new()),
             sound_buses: RwLock::new(HashMap::new()),
@@ -560,6 +583,8 @@ impl AudioEngine {
         let inner = Arc::new(AudioEngineInner {
             mixer,
             sounds: RwLock::new(HashMap::new()),
+            stream_sounds: RwLock::new(HashMap::new()),
+            stream_threshold_secs: AtomicU32::new(DEFAULT_STREAM_THRESHOLD_SECS),
             sound_volumes: RwLock::new(HashMap::new()),
             sound_pans: RwLock::new(HashMap::new()),
             sound_buses: RwLock::new(HashMap::new()),
@@ -915,9 +940,115 @@ impl AudioEngine {
         self.inner.running.load(Ordering::Acquire)
     }
 
-    /// Load a sound from a file path
+    /// Files longer than `secs` seconds are streamed from disk by
+    /// [`load_sound`](Self::load_sound) instead of being decoded into memory.
+    /// `0` turns streaming off. Sounds already loaded are not affected.
+    pub fn set_stream_threshold_secs(&self, secs: u32) {
+        self.inner
+            .stream_threshold_secs
+            .store(secs, Ordering::Relaxed);
+    }
+
+    /// The current streaming threshold, in seconds.
+    pub fn stream_threshold_secs(&self) -> u32 {
+        self.inner.stream_threshold_secs.load(Ordering::Relaxed)
+    }
+
+    /// Load a sound from a file path.
+    ///
+    /// A file longer than the streaming threshold (see
+    /// [`set_stream_threshold_secs`](Self::set_stream_threshold_secs)) is not
+    /// decoded: only its header is read, and every play decodes it on the fly.
+    /// Short files are decoded into memory, as before.
     pub fn load_sound<P: AsRef<Path>>(&self, path: P) -> Result<SoundId, EngineError> {
-        let decoded = AudioDecoder::decode_file(path.as_ref())?;
+        let path = path.as_ref();
+        let threshold = self.stream_threshold_secs();
+        if threshold > 0 {
+            // A file the header probe cannot read falls through to the full
+            // decode, which reports the real error.
+            if let Ok(probe) = AudioDecoder::probe_file(path) {
+                let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                if should_stream(probe.duration_secs, bytes, threshold) {
+                    return Ok(self.register_stream_sound(path, probe.meta, probe.duration_secs));
+                }
+            }
+        }
+        self.load_sound_decoded(path)
+    }
+
+    /// Load a sound as a stream regardless of its length.
+    pub fn load_sound_streaming<P: AsRef<Path>>(&self, path: P) -> Result<SoundId, EngineError> {
+        let probe = AudioDecoder::probe_file(path.as_ref())?;
+        Ok(self.register_stream_sound(path.as_ref(), probe.meta, probe.duration_secs))
+    }
+
+    fn register_stream_sound(
+        &self,
+        path: &Path,
+        meta: TrackMeta,
+        duration_secs: Option<f64>,
+    ) -> SoundId {
+        let sound_id = SoundId::new();
+        info!(
+            "Loaded sound {} as a stream: {} ({})",
+            sound_id.0,
+            path.display(),
+            duration_secs.map_or("unknown length".to_string(), |d| format!("{d:.1}s"))
+        );
+        self.inner.stream_sounds.write().insert(
+            sound_id,
+            StreamSound {
+                path: path.to_path_buf(),
+                meta,
+                duration_secs: duration_secs.unwrap_or(0.0) as f32,
+            },
+        );
+        sound_id
+    }
+
+    /// Whether a sound is streamed from disk (not held in memory).
+    pub fn is_sound_streamed(&self, sound_id: SoundId) -> bool {
+        self.inner.stream_sounds.read().contains_key(&sound_id)
+    }
+
+    /// Title / artist / album of a streamed sound (`None` for sounds held in
+    /// memory, which do not keep their tags).
+    pub fn sound_meta(&self, sound_id: SoundId) -> Option<TrackMeta> {
+        self.inner
+            .stream_sounds
+            .read()
+            .get(&sound_id)
+            .map(|s| s.meta.clone())
+    }
+
+    /// Whether a sound of any kind is loaded.
+    fn has_sound(&self, sound_id: SoundId) -> bool {
+        self.inner.sounds.read().contains_key(&sound_id)
+            || self.inner.stream_sounds.read().contains_key(&sound_id)
+    }
+
+    /// Events of streamed tracks (a track played to its end), for playlists.
+    pub fn stream_events(&self) -> Receiver<StreamEvent> {
+        self.inner.mixer.stream_events()
+    }
+
+    /// Playback position of a track, in milliseconds.
+    pub fn track_position_ms(&self, track_id: Uuid) -> Result<u64, EngineError> {
+        Ok(self.inner.mixer.track_position_ms(track_id)?)
+    }
+
+    /// Jump to a position (milliseconds) in a track.
+    pub fn seek_track_ms(&self, track_id: Uuid, ms: u64) -> Result<(), EngineError> {
+        Ok(self.inner.mixer.seek_track_ms(track_id, ms)?)
+    }
+
+    /// Length of a track in milliseconds, when known.
+    pub fn track_duration_ms(&self, track_id: Uuid) -> Result<Option<u64>, EngineError> {
+        Ok(self.inner.mixer.track_duration_ms(track_id)?)
+    }
+
+    fn load_sound_decoded(&self, path: &Path) -> Result<SoundId, EngineError> {
+        let decoded = AudioDecoder::decode_file(path)?;
         let sound_id = SoundId::new();
         let audio = Arc::new(decoded);
 
@@ -997,12 +1128,22 @@ impl AudioEngine {
         fade_in: Option<(u32, FadeCurve)>,
         preview: bool,
     ) -> Result<TrackHandle, EngineError> {
-        let audio = {
-            let sounds = self.inner.sounds.read();
-            sounds
-                .get(&sound_id)
-                .cloned()
-                .ok_or(EngineError::SoundNotFound(sound_id))?
+        let memory = self.inner.sounds.read().get(&sound_id).cloned();
+        let stream = match memory {
+            Some(_) => None,
+            None => {
+                let sound = self
+                    .inner
+                    .stream_sounds
+                    .read()
+                    .get(&sound_id)
+                    .cloned()
+                    .ok_or(EngineError::SoundNotFound(sound_id))?;
+                let source = StreamSource::open(&sound.path)?;
+                // A moment for the first audio to be decoded; not under any lock.
+                source.wait_ready(STREAM_START_WAIT);
+                Some(source)
+            }
         };
 
         // Forget tracks that finished or were stopped earlier, so neither the
@@ -1015,7 +1156,11 @@ impl AudioEngine {
                 .retain(|track_id, _| mixer.has_track(*track_id));
         }
 
-        let track_id = self.inner.mixer.add_track(audio, looped);
+        let track_id = match (memory, stream) {
+            (Some(audio), _) => self.inner.mixer.add_track(audio, looped),
+            (None, Some(source)) => self.inner.mixer.add_stream_track(source, looped),
+            (None, None) => return Err(EngineError::SoundNotFound(sound_id)),
+        };
 
         // A sound's volume outlives its tracks: a track created later must pick
         // up the volume the user already chose for that sound.
@@ -1108,7 +1253,7 @@ impl AudioEngine {
             ));
         }
 
-        if !self.inner.sounds.read().contains_key(&sound_id) {
+        if !self.has_sound(sound_id) {
             return Err(EngineError::SoundNotFound(sound_id));
         }
 
@@ -1124,7 +1269,7 @@ impl AudioEngine {
 
     /// Volume most recently set for a sound, or 1.0 when none was ever set.
     pub fn sound_volume(&self, sound_id: SoundId) -> Result<f32, EngineError> {
-        if !self.inner.sounds.read().contains_key(&sound_id) {
+        if !self.has_sound(sound_id) {
             return Err(EngineError::SoundNotFound(sound_id));
         }
 
@@ -1309,7 +1454,7 @@ impl AudioEngine {
                 crate::audio::mixer::MixerError::InvalidPan(pan),
             ));
         }
-        if !self.inner.sounds.read().contains_key(&sound_id) {
+        if !self.has_sound(sound_id) {
             return Err(EngineError::SoundNotFound(sound_id));
         }
         self.inner.sound_pans.write().insert(sound_id, pan);
@@ -1334,7 +1479,7 @@ impl AudioEngine {
     /// Applies to the sound's active tracks and is remembered for tracks
     /// created later.
     pub fn set_sound_bus(&self, sound_id: SoundId, bus: Bus) -> Result<(), EngineError> {
-        if !self.inner.sounds.read().contains_key(&sound_id) {
+        if !self.has_sound(sound_id) {
             return Err(EngineError::SoundNotFound(sound_id));
         }
         self.inner.sound_buses.write().insert(sound_id, bus);
@@ -1452,6 +1597,9 @@ impl AudioEngine {
 
     /// Get a loaded sound's metadata
     pub fn sound_info(&self, sound_id: SoundId) -> Result<(f32, u32, u32), EngineError> {
+        if let Some(stream) = self.inner.stream_sounds.read().get(&sound_id) {
+            return Ok((stream.duration_secs, TARGET_SAMPLE_RATE, TARGET_CHANNELS));
+        }
         let sounds = self.inner.sounds.read();
         let audio = sounds
             .get(&sound_id)
@@ -1461,13 +1609,16 @@ impl AudioEngine {
 
     /// List all loaded sound IDs
     pub fn list_sounds(&self) -> Vec<SoundId> {
-        self.inner.sounds.read().keys().copied().collect()
+        let mut ids: Vec<SoundId> = self.inner.sounds.read().keys().copied().collect();
+        ids.extend(self.inner.stream_sounds.read().keys().copied());
+        ids
     }
 
     /// Remove a sound from memory (stops any playing tracks first)
     pub fn unload_sound(&self, sound_id: SoundId) -> Result<(), EngineError> {
         self.stop_sound(sound_id)?;
         self.inner.sounds.write().remove(&sound_id);
+        self.inner.stream_sounds.write().remove(&sound_id);
         self.inner.sound_volumes.write().remove(&sound_id);
         self.inner.sound_pans.write().remove(&sound_id);
         self.inner.sound_buses.write().remove(&sound_id);
@@ -1482,7 +1633,7 @@ impl AudioEngine {
     /// Get mixer statistics
     pub fn stats(&self) -> EngineStats {
         EngineStats {
-            loaded_sounds: self.inner.sounds.read().len(),
+            loaded_sounds: self.inner.sounds.read().len() + self.inner.stream_sounds.read().len(),
             active_tracks: self.inner.active_tracks.read().len(),
             mixer_tracks: self.inner.mixer.track_count(),
             running: self.inner.running.load(Ordering::Acquire),
@@ -1871,6 +2022,21 @@ impl TrackHandle {
     /// Check if this track is playing
     pub fn is_playing(&self) -> Result<bool, EngineError> {
         self.engine.is_track_playing(self.track_id)
+    }
+
+    /// Playback position in milliseconds
+    pub fn position_ms(&self) -> Result<u64, EngineError> {
+        Ok(self.engine.mixer.track_position_ms(self.track_id)?)
+    }
+
+    /// Jump to a position in milliseconds
+    pub fn seek_ms(&self, ms: u64) -> Result<(), EngineError> {
+        Ok(self.engine.mixer.seek_track_ms(self.track_id, ms)?)
+    }
+
+    /// Length of the track in milliseconds, when known
+    pub fn duration_ms(&self) -> Result<Option<u64>, EngineError> {
+        Ok(self.engine.mixer.track_duration_ms(self.track_id)?)
     }
 
     /// Get the sound ID for this track
