@@ -380,11 +380,14 @@ mod shell_tests {
     fn the_player_bar_leaves_the_same_air_above_and_below_its_card() {
         assert_eq!(Metrics::PLAYER_GAP_TOP, Metrics::LG);
         const { assert!(Metrics::PLAYER_GAP_BOTTOM > 0.0) };
-        // Visible gap between the panels and the card equals the side pad.
+        // Visible gap between the panels and the card: bigger than the side
+        // pad and than the gap below the card.
         assert_eq!(
             Metrics::PLAYER_GAP_TOP + Metrics::CONTENT_BOTTOM_PAD,
-            Metrics::APP_PAD
+            Metrics::PLAYER_AIR_ABOVE
         );
+        const { assert!(Metrics::PLAYER_AIR_ABOVE > Metrics::APP_PAD) };
+        const { assert!(Metrics::PLAYER_AIR_ABOVE > Metrics::PLAYER_GAP_BOTTOM) };
         assert_eq!(
             Metrics::PLAYER_BAR_H,
             Metrics::PLAYER_GAP_TOP + Metrics::PLAYER_CARD_H + Metrics::PLAYER_GAP_BOTTOM
