@@ -33,7 +33,7 @@ use qrcode::{Color as QrColor, EcLevel, QrCode};
 
 /// Renders the network server panel at the given size.
 pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
-    console_panel(ui, size, |ui| {
+    console_panel(ui, "server_panel_scroll", size, |ui| {
         let server = state.get_server_state();
 
         // ---- Header ----
@@ -88,12 +88,6 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         ui.add(egui::Label::new(micro_label(subline).line_height(Some(NOTE_LINE_H))).wrap());
 
         ui.add_space(Metrics::LG);
-        hairline(ui);
-        ui.add_space(Metrics::LG);
-
-        // ---- Listen URL ----
-        ui.label(micro_label("Listen URL"));
-        ui.add_space(Metrics::SM);
 
         let url = server.bind_url.clone().unwrap_or_else(|| "—".to_string());
         let running = matches!(server.status, GuiServerStatus::Running);
@@ -103,6 +97,83 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         } else {
             url.clone()
         };
+
+        // ---- Controls ----
+        // Right under the status they belong to: the panel scrolls, and the
+        // button that starts or stops the server must never be the one that
+        // scrolls out of a short window, whatever the lines below grow to.
+        // Both buttons live on one line, so each needs an explicit width: with no
+        // width a `ConsoleButton` claims the whole row and pushes its neighbour
+        // outside the panel.
+        let copy_w = 124.0;
+        let primary_w = (ui.available_width() - copy_w - Metrics::SM).max(96.0);
+        ui.horizontal(|ui| {
+            // Widths above already include the one explicit gap.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            match &server.status {
+                GuiServerStatus::Stopped | GuiServerStatus::Error(_) => {
+                    let label = if matches!(server.status, GuiServerStatus::Error(_)) {
+                        "Retry Server"
+                    } else {
+                        "Start Server"
+                    };
+                    if ConsoleButton::primary(label)
+                        .glyph(glyph::BROADCAST)
+                        .width(primary_w)
+                        .height(40.0)
+                        .id_salt("server_start")
+                        .show(ui)
+                        .clicked()
+                    {
+                        state.request_start_server();
+                    }
+                }
+                GuiServerStatus::Starting => {
+                    let _ = ConsoleButton::primary("Starting")
+                        .glyph(glyph::REFRESH)
+                        .width(primary_w)
+                        .height(40.0)
+                        .enabled(false)
+                        .id_salt("server_starting")
+                        .show(ui);
+                }
+                GuiServerStatus::Running => {
+                    if ConsoleButton::danger("Stop Server")
+                        .glyph(glyph::STOP)
+                        .width(primary_w)
+                        .height(40.0)
+                        .id_salt("server_stop")
+                        .show(ui)
+                        .clicked()
+                    {
+                        state.request_stop_server();
+                    }
+                }
+            }
+
+            ui.add_space(Metrics::SM);
+            if ConsoleButton::ghost("Copy Link")
+                .glyph(glyph::COPY)
+                .width(copy_w)
+                .height(40.0)
+                .enabled(running)
+                .id_salt("server_copy")
+                .show(ui)
+                .clicked()
+                && running
+            {
+                ui.output_mut(|o| o.copied_text = share.clone());
+                state.set_copied_feedback(true);
+            }
+        });
+
+        ui.add_space(Metrics::LG);
+        hairline(ui);
+        ui.add_space(Metrics::LG);
+
+        // ---- Listen URL ----
+        ui.label(micro_label("Listen URL"));
+        ui.add_space(Metrics::SM);
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -289,76 +360,6 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(micro_label(format!("Peak {}", server.peak_listeners)));
             });
-        });
-
-        ui.add_space(Metrics::LG);
-        hairline(ui);
-        ui.add_space(Metrics::LG);
-
-        // ---- Controls ----
-        // Both buttons live on one line, so each needs an explicit width: with no
-        // width a `ConsoleButton` claims the whole row and pushes its neighbour
-        // outside the panel.
-        let copy_w = 124.0;
-        let primary_w = (ui.available_width() - copy_w - Metrics::SM).max(96.0);
-        ui.horizontal(|ui| {
-            // Widths above already include the one explicit gap.
-            ui.spacing_mut().item_spacing.x = 0.0;
-            match &server.status {
-                GuiServerStatus::Stopped | GuiServerStatus::Error(_) => {
-                    let label = if matches!(server.status, GuiServerStatus::Error(_)) {
-                        "Retry Server"
-                    } else {
-                        "Start Server"
-                    };
-                    if ConsoleButton::primary(label)
-                        .glyph(glyph::BROADCAST)
-                        .width(primary_w)
-                        .height(40.0)
-                        .id_salt("server_start")
-                        .show(ui)
-                        .clicked()
-                    {
-                        state.request_start_server();
-                    }
-                }
-                GuiServerStatus::Starting => {
-                    let _ = ConsoleButton::primary("Starting")
-                        .glyph(glyph::REFRESH)
-                        .width(primary_w)
-                        .height(40.0)
-                        .enabled(false)
-                        .id_salt("server_starting")
-                        .show(ui);
-                }
-                GuiServerStatus::Running => {
-                    if ConsoleButton::danger("Stop Server")
-                        .glyph(glyph::STOP)
-                        .width(primary_w)
-                        .height(40.0)
-                        .id_salt("server_stop")
-                        .show(ui)
-                        .clicked()
-                    {
-                        state.request_stop_server();
-                    }
-                }
-            }
-
-            ui.add_space(Metrics::SM);
-            if ConsoleButton::ghost("Copy Link")
-                .glyph(glyph::COPY)
-                .width(copy_w)
-                .height(40.0)
-                .enabled(running)
-                .id_salt("server_copy")
-                .show(ui)
-                .clicked()
-                && running
-            {
-                ui.output_mut(|o| o.copied_text = share.clone());
-                state.set_copied_feedback(true);
-            }
         });
 
         ui.add_space(Metrics::LG);

@@ -11,7 +11,21 @@
 //!   work), but not horizontally;
 //! * [`Kind::Overlap`]: two texts overlap by more than [`OVERLAP_TOLERANCE`] px
 //!   on both axes;
-//! * [`Kind::OffScreen`]: any painted content beyond the window.
+//! * [`Kind::OffScreen`]: any painted content beyond the window;
+//! * [`Kind::IdClash`]: egui's own "two widgets share an id" warning;
+//! * [`Kind::Hidden`]: a control the operator must reach without scrolling
+//!   (Stop all, Mute, Add sound, the server buttons) that is cut off or
+//!   scrolled out of view. The two main columns scroll as a whole, so this is
+//!   the check that tells a panel that no longer fits its window.
+//!
+//! The matrix tests at the bottom run every size x scale x state of the
+//! console and fail on any finding, so they are ordinary tests: a layout
+//! regression breaks `cargo test`.
+//!
+//! Scrolled-away rows are not defects, and the checker knows it: a vertical
+//! overflow is forgiven on the side where the clip is the edge of a scroll
+//! viewport (rows are painted under their own narrow clip that keeps the
+//! viewport's edge on the cut side). Horizontal overflow is never forgiven.
 //!
 //! Everything is measured in egui points. `size` of [`run_frame`] is the
 //! screen rect egui lays the console out in (the window's inner size in
@@ -207,23 +221,32 @@ fn collect(shape: &Shape, clip: Rect, out: &mut Vec<Item>) {
     }
 }
 
-/// `true` when `clip` is the content clip of a vertical scroll area.
+/// Which vertical edges of `clip` are the edges of a vertical scroll area's
+/// viewport: `(top, bottom)`.
 ///
 /// A scroll area clips its content vertically to its viewport grown by
 /// `margin` (egui's `clip_rect_margin`) and leaves the horizontal clip of the
 /// parent. `regions` are the rects of widgets and uis of the frame (the
-/// viewport is always one of them: the area's own ui); a clip counts when its
-/// y range is exactly some rect's y range plus the margin on both sides and
-/// its x range covers that rect. With `margin == 0` the clip must equal the
-/// rect's y range (explicit regions in tests).
-fn is_scroll_clip(clip: Rect, regions: &[Rect], margin: f32) -> bool {
+/// viewport is always one of them: the area's own ui). An edge counts when it
+/// lies exactly `margin` outside the same edge of some rect that overlaps the
+/// clip horizontally. The edges are judged one by one because a row inside a
+/// scroll area is painted under its own, narrower clip (the row's rect
+/// intersected with the viewport clip): that clip keeps the viewport's edge on
+/// the side where the row is cut and has the row's own edge on the other one.
+/// With `margin == 0` the edge must equal the rect's edge (explicit regions in
+/// tests).
+fn scroll_edges(clip: Rect, regions: &[Rect], margin: f32) -> (bool, bool) {
     const EPS: f32 = 0.6;
-    regions.iter().any(|r| {
-        (clip.min.y - (r.min.y - margin)).abs() <= EPS
-            && (clip.max.y - (r.max.y + margin)).abs() <= EPS
-            && clip.min.x <= r.min.x + 1.0
-            && clip.max.x >= r.max.x - 1.0
-    })
+    let overlapping = |r: &&Rect| r.min.x < clip.max.x && r.max.x > clip.min.x;
+    let top = regions
+        .iter()
+        .filter(overlapping)
+        .any(|r| (clip.min.y - (r.min.y - margin)).abs() <= EPS);
+    let bottom = regions
+        .iter()
+        .filter(overlapping)
+        .any(|r| (clip.max.y - (r.max.y + margin)).abs() <= EPS);
+    (top, bottom)
 }
 
 fn shorten(text: &str) -> String {
@@ -239,7 +262,7 @@ fn shorten(text: &str) -> String {
     }
 }
 
-/// How far `inner` leaves `outer`, per side, in points (0 when inside).
+/// How far `inner` leaves `outer`, per axis, in points (0 when inside).
 fn overshoot(inner: Rect, outer: Rect) -> Vec2 {
     let x = (outer.min.x - inner.min.x)
         .max(inner.max.x - outer.max.x)
@@ -250,9 +273,28 @@ fn overshoot(inner: Rect, outer: Rect) -> Vec2 {
     vec2(x, y)
 }
 
+/// Vertical overshoot of `inner` past `outer` as `(above, below)`, in points
+/// (0 when inside on that side).
+fn overshoot_y(inner: Rect, outer: Rect) -> (f32, f32) {
+    (
+        (outer.min.y - inner.min.y).max(0.0),
+        (inner.max.y - outer.max.y).max(0.0),
+    )
+}
+
+/// Vertical overshoot of `inner` past `outer`, forgiving the sides on which
+/// `outer` is the edge of a scroll viewport: content scrolled away there is
+/// cut by design.
+fn unscrolled_overshoot_y(inner: Rect, outer: Rect, edges: (bool, bool)) -> f32 {
+    let (above, below) = overshoot_y(inner, outer);
+    let above = if edges.0 { 0.0 } else { above };
+    let below = if edges.1 { 0.0 } else { below };
+    above.max(below)
+}
+
 /// Check painted shapes. `screen` is the window rect; `scroll_regions` are
 /// widget / ui rects among which the viewports of the scroll areas are found
-/// (see [`is_scroll_clip`]; their content may leave the clip and the window
+/// (see [`scroll_edges`]; their content may leave the clip and the window
 /// vertically, because it scrolls). Pure function of its input, so it is
 /// tested on synthetic frames. Returns the findings, the number of texts and
 /// the number of painted leaves.
@@ -309,15 +351,16 @@ pub fn analyze(
         if is_required(item) {
             continue;
         }
-        let scroll = is_scroll_clip(item.clip, scroll_regions, scroll_margin);
+        let edges = scroll_edges(item.clip, scroll_regions, scroll_margin);
         let is_text = item.text.is_some();
 
         // Off screen: any content beyond the window. Plain shapes get a
         // little more room: strokes are painted half a line outside.
         let screen_tol = if is_text { CLIP_TOLERANCE } else { 2.0 };
         let out = overshoot(item.bounds, screen);
-        // Scrolled-away content is below the window by design.
-        let out_y = if scroll { 0.0 } else { out.y };
+        // Scrolled-away content lies beyond the window by design, on the sides
+        // where its clip is a scroll viewport's edge.
+        let out_y = unscrolled_overshoot_y(item.bounds, screen, edges);
         if out.x > screen_tol || out_y > screen_tol {
             if is_text {
                 findings.push(Finding {
@@ -342,7 +385,7 @@ pub fn analyze(
         }
         let over = overshoot(item.bounds, item.clip);
         let bad_x = over.x > CLIP_TOLERANCE;
-        let bad_y = over.y > CLIP_TOLERANCE && !scroll;
+        let bad_y = unscrolled_overshoot_y(item.bounds, item.clip, edges) > CLIP_TOLERANCE;
         if bad_x || bad_y {
             if is_text {
                 findings.push(Finding {
@@ -854,6 +897,41 @@ mod tests {
     }
 
     #[test]
+    fn a_row_under_its_own_clip_is_forgiven_only_on_the_viewport_edge() {
+        // Rows of a scroll area are painted under their own clip: the row's
+        // rect cut by the viewport. Where the row is cut by the viewport's
+        // bottom edge the overflow is scrolling; a clip edge that is nobody's
+        // viewport edge is a real cut.
+        let ctx = Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, WINDOW);
+        let viewport = Rect::from_min_size(pos2(20.0, 20.0), vec2(200.0, 40.0));
+        let run = |ctx: &Context, clip: Rect, y: f32| {
+            ctx.run(raw_input(WINDOW), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(clip));
+                    child.set_clip_rect(clip);
+                    paint_text(&child, pos2(24.0, y), "Row under its own clip");
+                });
+            })
+        };
+        // Row starts below the viewport's bottom edge (60): its clip keeps that
+        // edge as its bottom, the text hangs out below it.
+        let row_clip = Rect::from_min_max(pos2(20.0, 50.0), pos2(220.0, 60.0));
+        let out = run(&ctx, row_clip, 52.0);
+        let (scrolled, _, _) = analyze(&out.shapes, screen, &[viewport], 0.0, &[]);
+        assert!(scrolled.is_empty(), "{scrolled:#?}");
+        // The same clip with no viewport behind it is a cut-off text.
+        let (cut, _, _) = analyze(&out.shapes, screen, &[], 0.0, &[]);
+        assert_eq!(cut.len(), 1, "{cut:#?}");
+        // A clip whose bottom is not the viewport's bottom is a real cut.
+        let other = Rect::from_min_max(pos2(20.0, 30.0), pos2(220.0, 45.0));
+        let out = run(&ctx, other, 38.0);
+        let (real, _, _) = analyze(&out.shapes, screen, &[viewport], 0.0, &[]);
+        assert_eq!(real.len(), 1, "{real:#?}");
+        assert_eq!(real[0].kind, Kind::ClipOverflow);
+    }
+
+    #[test]
     fn required_controls_must_be_visible_even_inside_a_scroll_area() {
         let ctx = Context::default();
         let screen = Rect::from_min_size(Pos2::ZERO, WINDOW);
@@ -971,7 +1049,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "enabled after layout fixes land"]
     fn the_console_has_no_layout_violations_in_any_size_scale_and_state() {
         let lines = matrix();
         for line in &lines {

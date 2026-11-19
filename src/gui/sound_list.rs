@@ -24,8 +24,8 @@ use crate::gui::library_ui::{
     library_toolbar, missing_row, paint_badge, preview_button, MissingAction,
 };
 use crate::gui::theme::{
-    alpha, console_panel, hairline, micro_label, micro_label_accent, panel_title, telemetry,
-    ui_font, Metrics, Palette,
+    alpha, console_panel_with_footer, hairline, micro_label, micro_label_accent, panel_title,
+    telemetry, ui_font, Metrics, Palette,
 };
 use crate::gui::widgets::{
     elide, format_duration, format_sample_rate, glyph, level_slider, segmented_meter,
@@ -38,57 +38,68 @@ use layout::{
 
 /// Renders the whole `01 / LIBRARY` panel at the given size.
 pub fn sound_library_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
-    console_panel(ui, size, |ui| {
-        header(ui, state);
-        ui.add_space(Metrics::MD);
-        hairline(ui);
-        ui.add_space(Metrics::MD);
+    console_panel_with_footer(
+        ui,
+        "library_panel_scroll",
+        size,
+        MASTER_FOOTER_H,
+        state,
+        |ui, state| {
+            header(ui, state);
+            ui.add_space(Metrics::MD);
+            hairline(ui);
+            ui.add_space(Metrics::MD);
 
-        // Scene deck: scene buttons, stingers, transition time.
-        crate::gui::scenes::scenes_deck(ui, state);
-        ui.add_space(Metrics::MD);
-        hairline(ui);
-        ui.add_space(Metrics::MD);
+            // Scene deck: scene buttons, stingers, transition time.
+            crate::gui::scenes::scenes_deck(ui, state);
+            ui.add_space(Metrics::MD);
+            hairline(ui);
+            ui.add_space(Metrics::MD);
 
-        // Reserve the master strip at the bottom; the list takes the rest.
-        let master_h = Metrics::ROW_H - 8.0;
-        let list_h = (ui.available_height() - master_h - Metrics::MD).max(80.0);
+            // The master strip is pinned below the scrolling body, so the list
+            // takes everything that is left of it.
+            let list_h = ui.available_height().max(80.0);
 
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), list_h),
-            Layout::left_to_right(Align::Min),
-            |ui| {
-                // Gaps are placed by hand, so the widths budgeted by
-                // `rail_width` are exact.
-                ui.spacing_mut().item_spacing.x = 0.0;
-                // The rail is the primary navigation: it narrows before the
-                // rows do and is dropped only when the rows would become too
-                // narrow to read. The decision uses the body width, not the
-                // outer panel size (which still contains the padding).
-                if let Some(rail_w) = rail_width(ui.available_width()) {
-                    group_rail(ui, state, list_h, rail_w);
-                    ui.add_space(Metrics::MD);
-                }
-                ui.allocate_ui_with_layout(
-                    Vec2::new(ui.available_width(), list_h),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        // Search, tag chips and library actions, then the rows
-                        // in whatever height is left.
-                        library_toolbar(ui, state);
-                        let rows_h = ui.available_height().max(80.0);
-                        sound_rows(ui, state, rows_h);
-                    },
-                );
-            },
-        );
-
-        ui.add_space(Metrics::MD);
-        hairline(ui);
-        ui.add_space(Metrics::BLOCK_GAP);
-        master_output(ui, state);
-    });
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), list_h),
+                Layout::left_to_right(Align::Min),
+                |ui| {
+                    // Gaps are placed by hand, so the widths budgeted by
+                    // `rail_width` are exact.
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    // The rail is the primary navigation: it narrows before the
+                    // rows do and is dropped only when the rows would become too
+                    // narrow to read. The decision uses the body width, not the
+                    // outer panel size (which still contains the padding).
+                    if let Some(rail_w) = rail_width(ui.available_width()) {
+                        group_rail(ui, state, list_h, rail_w);
+                        ui.add_space(Metrics::MD);
+                    }
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), list_h),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            // Search, tag chips and library actions, then the rows
+                            // in whatever height is left.
+                            library_toolbar(ui, state);
+                            let rows_h = ui.available_height().max(80.0);
+                            sound_rows(ui, state, rows_h);
+                        },
+                    );
+                },
+            );
+        },
+        |ui, state| {
+            hairline(ui);
+            ui.add_space(Metrics::BLOCK_GAP);
+            master_output(ui, state);
+        },
+    );
 }
+
+/// Height of the pinned footer of the library panel: hairline, gap and the
+/// master strip (a small button tall).
+const MASTER_FOOTER_H: f32 = 1.0 + Metrics::BLOCK_GAP + Metrics::BTN_H_SM;
 
 /// `01 / LIBRARY` + title + track count + `+ ADD SOUND`.
 fn header(ui: &mut Ui, state: &mut SoundSharedApp) {

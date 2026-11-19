@@ -369,10 +369,48 @@ pub fn card_panel<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)
 /// `egui` shrinks a `Frame` run to its content; the console needs the two main
 /// columns to fill the window instead, so the panel is painted into a rect that
 /// the shell sized and the content is laid out inside the panel padding.
+///
+/// `id_salt` names the panel's scroll area: the two columns are drawn from
+/// the same parent ui, so without distinct names their scroll areas would
+/// share one id (egui reports the clash and both columns would share a scroll
+/// offset).
 pub fn console_panel<R>(
     ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
     size: egui::Vec2,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    console_panel_with_footer(
+        ui,
+        id_salt,
+        size,
+        0.0,
+        &mut (),
+        |ui, _| add_contents(ui),
+        |_, _| {},
+    )
+}
+
+/// Air between the scrolling body of a panel and its pinned footer.
+pub const FOOTER_GAP: f32 = Metrics::MD;
+
+/// [`console_panel`] with a footer that does not scroll: the bottom
+/// `footer_h` points of the panel body belong to `add_footer`, the rest (minus
+/// [`FOOTER_GAP`]) to the scrolling contents. A control that must always be
+/// reachable (the master Mute) lives there, so a short window can never scroll
+/// it out of view. The footer is laid out at its own top-left; `footer_h` must
+/// cover what it paints.
+///
+/// Body and footer both get `shared`, the state they draw from: two closures
+/// could not each borrow it mutably.
+pub fn console_panel_with_footer<S, R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    size: egui::Vec2,
+    footer_h: f32,
+    shared: &mut S,
+    add_contents: impl FnOnce(&mut egui::Ui, &mut S) -> R,
+    add_footer: impl FnOnce(&mut egui::Ui, &mut S),
 ) -> R {
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     ui.painter().rect(
@@ -383,9 +421,39 @@ pub fn console_panel<R>(
     );
 
     let inner_rect = rect.shrink(Metrics::PANEL_PAD);
+    let (body_rect, footer_rect) = if footer_h > 0.0 {
+        let footer_top = (inner_rect.bottom() - footer_h).max(inner_rect.top());
+        (
+            egui::Rect::from_min_max(
+                inner_rect.min,
+                egui::pos2(
+                    inner_rect.right(),
+                    (footer_top - FOOTER_GAP).max(inner_rect.top()),
+                ),
+            ),
+            Some(egui::Rect::from_min_max(
+                egui::pos2(inner_rect.left(), footer_top),
+                inner_rect.max,
+            )),
+        )
+    } else {
+        (inner_rect, None)
+    };
+
+    if let Some(footer_rect) = footer_rect {
+        let mut footer = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("console_panel_footer")
+                .max_rect(footer_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        footer.spacing_mut().item_spacing.y = 0.0;
+        add_footer(&mut footer, shared);
+    }
+
     let mut inner = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(inner_rect)
+            .max_rect(body_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
 
@@ -400,8 +468,9 @@ pub fn console_panel<R>(
     // clips everything to the panel body; with the spacing above it stays hidden
     // at the default window size.
     egui::ScrollArea::vertical()
+        .id_salt(id_salt)
         .auto_shrink([false, false])
-        .show(&mut inner, |ui| add_contents(ui))
+        .show(&mut inner, |ui| add_contents(ui, shared))
         .inner
 }
 
@@ -437,4 +506,60 @@ pub fn panel_header(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), action_fn);
         }
     });
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+    use crate::gui::layout_probe::{run_frames, text_boxes};
+    use egui::{vec2, Rect};
+
+    /// Body far taller than the panel: the footer must stay inside the panel
+    /// and under the body's viewport, the body scrolls above it.
+    #[test]
+    fn the_footer_stays_put_while_the_body_overflows() {
+        let ctx = egui::Context::default();
+        let size = vec2(400.0, 300.0);
+        let mut panel = Rect::NOTHING;
+        let out = run_frames(&ctx, size, 2, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                panel = Rect::from_min_size(ui.cursor().min, size);
+                let mut shared = 0u32;
+                console_panel_with_footer(
+                    ui,
+                    "test_panel",
+                    size,
+                    40.0,
+                    &mut shared,
+                    |ui, _| {
+                        for i in 0..60 {
+                            ui.label(format!("Body row {i}"));
+                        }
+                    },
+                    |ui, _| {
+                        ui.label("Footer line");
+                    },
+                );
+            });
+        });
+        let boxes = text_boxes(&out);
+        let footer = boxes
+            .iter()
+            .find(|b| b.text == "FOOTER LINE")
+            .expect("the footer is painted");
+        assert!(panel.contains_rect(footer.rect), "{:?}", footer.rect);
+        // A scroll area clips a little (`clip_rect_margin`) beyond its viewport.
+        let body_bottom = panel.bottom() - Metrics::PANEL_PAD - 40.0 - FOOTER_GAP
+            + ctx.style().visuals.clip_rect_margin;
+        // No body row is visible below the footer's top: the viewport ends
+        // `FOOTER_GAP` above it.
+        for b in boxes.iter().filter(|b| b.text.starts_with("BODY ROW")) {
+            assert!(
+                b.clip.bottom() <= body_bottom + 0.5,
+                "{:?} clip {:?} reaches the footer",
+                b.text,
+                b.clip
+            );
+        }
+    }
 }
