@@ -33,10 +33,14 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-use crate::audio::decoder::{DecodedAudio, TARGET_SAMPLE_RATE};
+use crate::audio::decoder::{DecodedAudio, TrackMeta, TARGET_SAMPLE_RATE};
+use crate::audio::stream_source::{StreamEvent, StreamSource};
 
 /// Number of interleaved channels produced by the mixer.
 const CHANNELS: usize = 2;
+
+/// Events of streamed tracks that may wait for a listener.
+const STREAM_EVENT_CAPACITY: usize = 64;
 
 /// Errors that can occur in the mixer
 #[derive(Debug, thiserror::Error)]
@@ -419,13 +423,25 @@ enum PendingHalt {
     Stop,
 }
 
+/// Where a track's samples come from.
+#[derive(Debug)]
+enum TrackSource {
+    /// A sound decoded into memory (short effects, loops): the track reads it
+    /// at `TrackState::position`.
+    Memory(Arc<DecodedAudio>),
+    /// A long file decoded on a worker thread and read through a ring buffer.
+    /// It keeps its own position.
+    Stream(Box<StreamSource>),
+}
+
 /// Internal track state
 #[derive(Debug)]
 struct TrackState {
     _id: Uuid,
-    /// Decoded audio data
-    audio: Arc<DecodedAudio>,
-    /// Current playback position in frames
+    /// Where the samples come from
+    source: TrackSource,
+    /// Current playback position in frames (memory sources only: a stream
+    /// tracks its own)
     position: usize,
     /// Track volume (0.0 - 1.0): the gain the track ramps towards.
     volume: f32,
@@ -472,18 +488,25 @@ impl TrackState {
 
     /// The single place the mixer reads source samples from.
     ///
-    /// Copies up to `dst.len() / 2` interleaved stereo frames starting at
-    /// `self.position` into `dst`, wrapping when the track loops, and advances
-    /// `position` by the frames read. Returns the number of frames written;
-    /// fewer than asked for means a non-looping source ended.
+    /// Copies up to `dst.len() / 2` interleaved stereo frames into `dst`,
+    /// wrapping when the track loops, and advances the source by the frames
+    /// read. Returns the number of frames written; fewer than asked for means
+    /// a non-looping source ended.
     ///
-    /// A streaming source can replace the body (and [`give_back`](Self::give_back))
-    /// without touching the mix loop. It runs on the audio thread: no
-    /// allocation, no blocking.
+    /// A memory source copies from `self.position`; a stream source reads its
+    /// ring buffer (silence on underrun, see [`StreamSource::read`]). It runs
+    /// on the audio thread: no allocation, no blocking.
     fn fill_from_source(&mut self, dst: &mut [f32]) -> usize {
-        let total = self.audio.frames;
+        let audio = match &mut self.source {
+            TrackSource::Memory(audio) => audio,
+            TrackSource::Stream(stream) => {
+                stream.set_looped(self.looped);
+                return stream.read(dst);
+            }
+        };
+        let total = audio.frames;
         let want = dst.len() / CHANNELS;
-        let samples = &self.audio.samples;
+        let samples = &audio.samples;
         let mut pos = self.position.min(total);
         let mut written = 0;
         while written < want {
@@ -506,14 +529,52 @@ impl TrackState {
 
     /// Undo the last `frames` of [`fill_from_source`](Self::fill_from_source)
     /// that were read but not played (a fade-out ended in the middle of a chunk).
+    ///
+    /// A stream cannot take frames back out of its ring buffer: they are
+    /// dropped (at most one chunk, about 10 ms of a track that is fading out).
     fn give_back(&mut self, frames: usize) {
-        let total = self.audio.frames.max(1);
+        let TrackSource::Memory(audio) = &self.source else {
+            return;
+        };
+        let total = audio.frames.max(1);
         let frames = frames % total;
         self.position = if self.position >= frames {
             self.position - frames
         } else {
             self.position + total - frames
         };
+    }
+
+    /// Whether there is anything to play at all.
+    fn has_audio(&self) -> bool {
+        match &self.source {
+            TrackSource::Memory(audio) => audio.frames > 0,
+            TrackSource::Stream(_) => true,
+        }
+    }
+
+    /// The source is used up (a memory source at its end, a stream that played
+    /// out), so a resume has nothing left to continue.
+    fn at_end(&self) -> bool {
+        match &self.source {
+            TrackSource::Memory(audio) => self.position >= audio.frames,
+            TrackSource::Stream(stream) => stream.is_finished(),
+        }
+    }
+
+    /// Back to the start of the source.
+    fn rewind(&mut self) {
+        self.position = 0;
+        if let TrackSource::Stream(stream) = &mut self.source {
+            stream.rewind();
+        }
+    }
+
+    /// The source has played out.
+    fn mark_ended(&mut self) {
+        if let TrackSource::Memory(audio) = &self.source {
+            self.position = audio.frames;
+        }
     }
 
     /// Mix this track into `out` (adding), advancing it by `out.len() / 2`
@@ -600,7 +661,7 @@ impl TrackState {
         self.pan_l = pan_l;
         self.pan_r = pan_r;
         if finished {
-            self.position = self.audio.frames;
+            self.mark_ended();
             self.playing = false;
             self.halt = None;
             self.fade = None;
@@ -608,7 +669,7 @@ impl TrackState {
             self.playing = false;
             self.fade = None;
             match self.halt.take() {
-                Some(PendingHalt::Stop) => self.position = 0,
+                Some(PendingHalt::Stop) => self.rewind(),
                 Some(PendingHalt::Pause) => self.paused = true,
                 None => {}
             }
@@ -699,7 +760,7 @@ impl MixCore {
         // audio thread and the GUI never sees a half-updated track.
         let mut tracks = self.tracks.write();
         for track in tracks.values_mut() {
-            if track.local_only != local || !track.playing || track.audio.frames == 0 {
+            if track.local_only != local || !track.playing || !track.has_audio() {
                 continue;
             }
             any_playing = true;
@@ -783,6 +844,10 @@ pub struct AudioMixer {
     next_track_id: Arc<AtomicU64>,
     /// Handle to the headless mix loop thread (None when the device drives us)
     mix_handle: parking_lot::Mutex<Option<thread::JoinHandle<()>>>,
+    /// Events of streamed tracks. Bounded: the audio thread sends with
+    /// `try_send`, which allocates nothing on a bounded channel.
+    stream_events_tx: Sender<StreamEvent>,
+    stream_events_rx: Receiver<StreamEvent>,
 }
 
 impl AudioMixer {
@@ -794,6 +859,7 @@ impl AudioMixer {
     /// Create a new audio mixer with custom configuration
     pub fn with_config(config: MixerConfig) -> Self {
         let (broadcast_tx, broadcast_rx) = bounded(config.channel_capacity);
+        let (stream_events_tx, stream_events_rx) = bounded(STREAM_EVENT_CAPACITY);
         let master_volume = config.master_volume;
 
         Self {
@@ -806,6 +872,8 @@ impl AudioMixer {
             seq_no: Arc::new(AtomicU64::new(0)),
             next_track_id: Arc::new(AtomicU64::new(0)),
             mix_handle: parking_lot::Mutex::new(None),
+            stream_events_tx,
+            stream_events_rx,
         }
     }
 
@@ -815,11 +883,39 @@ impl AudioMixer {
     /// [`play_track`](Self::play_track) to begin playback. It starts centred
     /// (pan 0), on the [`Bus::Ambience`] bus and audible to everyone.
     pub fn add_track(&self, audio: Arc<DecodedAudio>, looped: bool) -> Uuid {
+        self.insert_track(TrackSource::Memory(audio), looped, |_, _| {})
+    }
+
+    /// Add a track that streams from a file (see [`StreamSource`]).
+    ///
+    /// Like [`add_track`](Self::add_track) it starts stopped. When the track
+    /// plays to its end a [`StreamEvent::TrackFinished`] with the returned id
+    /// arrives on [`stream_events`](Self::stream_events).
+    pub fn add_stream_track(&self, source: StreamSource, looped: bool) -> Uuid {
+        let events = self.stream_events_tx.clone();
+        self.insert_track(
+            TrackSource::Stream(Box::new(source)),
+            looped,
+            move |id, source| {
+                if let TrackSource::Stream(stream) = source {
+                    stream.set_event_sink(events, id);
+                }
+            },
+        )
+    }
+
+    fn insert_track(
+        &self,
+        mut source: TrackSource,
+        looped: bool,
+        attach: impl FnOnce(Uuid, &mut TrackSource),
+    ) -> Uuid {
         let id = Uuid::from_u64_pair(0, self.next_track_id.fetch_add(1, Ordering::Relaxed));
+        attach(id, &mut source);
 
         let track = TrackState {
             _id: id,
-            audio,
+            source,
             position: 0,
             volume: 1.0,
             gain: 1.0,
@@ -1148,7 +1244,7 @@ impl AudioMixer {
     pub fn play_track(&self, track_id: Uuid) -> Result<(), MixerError> {
         self.with_track(track_id, |track| {
             track.playing = true;
-            track.position = 0;
+            track.rewind();
             track.halt = None;
             track.paused = false;
             track.fade = None;
@@ -1170,7 +1266,7 @@ impl AudioMixer {
         self.with_track(track_id, |track| {
             let start = if track.playing { track.gain } else { 0.0 };
             track.playing = true;
-            track.position = 0;
+            track.rewind();
             track.halt = None;
             track.paused = false;
             track.gain = start;
@@ -1190,7 +1286,7 @@ impl AudioMixer {
             if !track.playing {
                 track.gain = 0.0;
             }
-            track.playing = track.position < track.audio.frames || track.looped;
+            track.playing = !track.at_end() || track.looped;
             track.halt = None;
             track.paused = false;
         })
@@ -1208,7 +1304,7 @@ impl AudioMixer {
             if !track.playing {
                 track.gain = 0.0;
             }
-            track.playing = track.position < track.audio.frames || track.looped;
+            track.playing = !track.at_end() || track.looped;
             track.halt = None;
             track.paused = false;
             track.fade = Fade::between(track.gain, track.volume, ms_to_frames(duration_ms), curve);
@@ -1294,7 +1390,7 @@ impl AudioMixer {
         self.with_track(track_id, |track| {
             if !track.playing {
                 if halt == PendingHalt::Stop {
-                    track.position = 0;
+                    track.rewind();
                     track.paused = false;
                 }
                 return;
@@ -1331,6 +1427,67 @@ impl AudioMixer {
                     }
                 }
             }
+        })
+    }
+
+    /// Receiver of [`StreamEvent`]s (a streamed track played to its end).
+    pub fn stream_events(&self) -> Receiver<StreamEvent> {
+        self.stream_events_rx.clone()
+    }
+
+    /// Playback position of a track in milliseconds. A track that is looping
+    /// reports the position within the current pass.
+    pub fn track_position_ms(&self, track_id: Uuid) -> Result<u64, MixerError> {
+        self.with_track(track_id, |t| match &t.source {
+            TrackSource::Memory(audio) => {
+                let frames = if t.looped && audio.frames > 0 {
+                    t.position % audio.frames
+                } else {
+                    t.position
+                };
+                frames as u64 * 1000 / u64::from(TARGET_SAMPLE_RATE)
+            }
+            TrackSource::Stream(stream) => stream.position_ms(),
+        })
+    }
+
+    /// Jump to `ms` in a track (clamped to its length). A streamed track
+    /// discards its buffered audio and refills from the new position.
+    pub fn seek_track_ms(&self, track_id: Uuid, ms: u64) -> Result<(), MixerError> {
+        self.with_track(track_id, |t| match &mut t.source {
+            TrackSource::Memory(audio) => {
+                let frame = ms * u64::from(TARGET_SAMPLE_RATE) / 1000;
+                t.position = (frame as usize).min(audio.frames);
+            }
+            TrackSource::Stream(stream) => stream.seek(ms),
+        })
+    }
+
+    /// Length of a track in milliseconds, `None` for a streamed file whose
+    /// header does not say (before the first full pass).
+    pub fn track_duration_ms(&self, track_id: Uuid) -> Result<Option<u64>, MixerError> {
+        self.with_track(track_id, |t| match &t.source {
+            TrackSource::Memory(audio) => {
+                Some(audio.frames as u64 * 1000 / u64::from(TARGET_SAMPLE_RATE))
+            }
+            TrackSource::Stream(stream) => stream.duration_ms(),
+        })
+    }
+
+    /// Tags of a streamed track (`None` for a sound held in memory, which
+    /// does not keep them).
+    pub fn track_meta(&self, track_id: Uuid) -> Result<Option<TrackMeta>, MixerError> {
+        self.with_track(track_id, |t| match &t.source {
+            TrackSource::Memory(_) => None,
+            TrackSource::Stream(stream) => Some(stream.meta().clone()),
+        })
+    }
+
+    /// Underruns of a streamed track (0 for memory sounds).
+    pub fn track_underruns(&self, track_id: Uuid) -> Result<u64, MixerError> {
+        self.with_track(track_id, |t| match &t.source {
+            TrackSource::Memory(_) => 0,
+            TrackSource::Stream(stream) => stream.underruns(),
         })
     }
 

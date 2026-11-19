@@ -85,6 +85,9 @@ socket2 = { workspace = true }
 roxmltree = { workspace = true }
 # EBU R128 loudness measurement (pure Rust) for track normalization
 ebur128 = "0.1.11"
+# Lock-free SPSC ring buffer (pure Rust) between the stream decoder thread and
+# the audio callback
+rtrb = "0.3.6"
 
 # getifaddrs for LAN address detection on Linux / macOS
 [target.'cfg(unix)'.dependencies]

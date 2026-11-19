@@ -5,9 +5,13 @@ pub mod decoder;
 pub mod engine;
 pub mod loudness;
 pub mod mixer;
+pub mod stream_source;
 pub mod youtube;
 
-pub use decoder::{AudioDecoder, DecodedAudio, DecoderError, TARGET_CHANNELS, TARGET_SAMPLE_RATE};
+pub use decoder::{
+    AudioDecoder, DecodedAudio, DecoderError, FileProbe, TrackMeta, TARGET_CHANNELS,
+    TARGET_SAMPLE_RATE,
+};
 pub use engine::{
     AudioEngine, EngineError, EngineStats, LocalOutputState, LocalOutputStatus, SoundId,
     TrackHandle,
@@ -15,4 +19,5 @@ pub use engine::{
 pub use mixer::{
     pan_gains, AudioMixer, Bus, DuckSettings, FadeCurve, MixedOutput, MixerConfig, MixerError,
 };
+pub use stream_source::{StreamEvent, StreamOptions, StreamSource, DEFAULT_STREAM_THRESHOLD_SECS};
 pub use youtube::{display_name as youtube_display_name, extract_video_id};

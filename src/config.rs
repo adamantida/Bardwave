@@ -118,6 +118,12 @@ pub struct AudioConfig {
     /// ambience; sound effects and stingers stay at full level).
     #[serde(default = "default_duck_buses")]
     pub duck_buses: Vec<Bus>,
+
+    /// Files longer than this many seconds are decoded on the fly (streamed)
+    /// instead of being held in memory; shorter ones stay in memory for an
+    /// instant start. `0` turns streaming off.
+    #[serde(default = "default_stream_threshold_secs")]
+    pub stream_threshold_secs: u32,
 }
 
 /// Logging configuration
@@ -797,6 +803,10 @@ fn default_duck_release_ms() -> u32 {
     800
 }
 
+fn default_stream_threshold_secs() -> u32 {
+    crate::audio::stream_source::DEFAULT_STREAM_THRESHOLD_SECS
+}
+
 fn default_duck_buses() -> Vec<Bus> {
     vec![Bus::Music, Bus::Ambience]
 }
@@ -840,6 +850,7 @@ impl Default for AudioConfig {
             duck_attack_ms: default_duck_attack_ms(),
             duck_release_ms: default_duck_release_ms(),
             duck_buses: default_duck_buses(),
+            stream_threshold_secs: default_stream_threshold_secs(),
         }
     }
 }

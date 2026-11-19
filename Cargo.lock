@@ -3443,6 +3443,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtrb"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "342e1478a6e1c839e7405033eabfdc954d4d5dabd39f34e83420a43a95acfb04"
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3892,6 +3898,7 @@ dependencies = [
  "parking_lot",
  "rfd",
  "roxmltree",
+ "rtrb",
  "rusty-opus",
  "serde",
  "serde_json",

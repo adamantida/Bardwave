@@ -558,6 +558,9 @@ fn main() -> Result<()> {
         &config.audio,
     ));
 
+    // Long files are streamed from disk instead of held in memory.
+    audio_engine.set_stream_threshold_secs(config.audio.stream_threshold_secs);
+
     // Get the broadcast output receiver for WebSocket streaming
     let broadcast_output_rx = audio_engine.broadcast_output_receiver();
 
