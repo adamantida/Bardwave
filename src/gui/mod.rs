@@ -14,6 +14,7 @@
 //! ```
 
 pub mod app;
+pub mod audio_settings;
 pub mod dialog;
 pub mod gm_bridge;
 pub mod groups;

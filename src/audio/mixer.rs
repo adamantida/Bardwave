@@ -21,6 +21,12 @@
 //! Tracks flagged `local_only` (previews on the master's machine) are rendered
 //! in a separate pass, [`AudioMixer::mix_local_into`], that the caller runs
 //! *after* [`AudioMixer::publish_broadcast`]: players never hear them.
+//!
+//! Previews have their own bus: fixed unity gain, so the Ambience (or any
+//! other) fader and ducking never touch them; only the master volume applies.
+//! When the previews go to a second device (headphones) the main callback
+//! skips that pass ([`AudioMixer::set_preview_external`]) and the second
+//! device's callback renders it with [`AudioMixer::mix_preview_into`].
 
 use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
@@ -705,6 +711,15 @@ impl Limiter {
         Self { gain: 1.0 }
     }
 
+    /// Let the gain recover towards 1.0 over `frames` frames without touching
+    /// any audio. Used while nothing goes through the limiter, so the reduction
+    /// built up by a loud preview fades out with the same release time instead
+    /// of snapping back (an audible step on the main mix).
+    fn relax(&mut self, frames: usize) {
+        let keep = (-(frames as f32) / (LIMIT_RELEASE_SECS * TARGET_SAMPLE_RATE as f32)).exp();
+        self.gain = 1.0 - (1.0 - self.gain) * keep;
+    }
+
     fn process(&mut self, out: &mut [f32]) {
         let release = 1.0 - (-1.0 / (LIMIT_RELEASE_SECS * TARGET_SAMPLE_RATE as f32)).exp();
         for frame in out.as_chunks_mut::<CHANNELS>().0 {
@@ -730,6 +745,9 @@ struct MixCore {
     limiter: parking_lot::Mutex<Limiter>,
     /// Limiter of the local pass (broadcast stays untouched by it).
     local_limiter: parking_lot::Mutex<Limiter>,
+    /// True while a second device renders the previews: the main callback then
+    /// skips the local pass.
+    preview_external: AtomicBool,
     buses: parking_lot::Mutex<BusBank>,
     /// Peak output level since the GUI last read it (f32 bits; non-negative
     /// floats order like their bit patterns, so `fetch_max` works).
@@ -743,6 +761,7 @@ impl MixCore {
             master_volume: parking_lot::Mutex::new(master_volume),
             limiter: parking_lot::Mutex::new(Limiter::new()),
             local_limiter: parking_lot::Mutex::new(Limiter::new()),
+            preview_external: AtomicBool::new(false),
             buses: parking_lot::Mutex::new(BusBank::new()),
             peak: AtomicU32::new(0),
         }
@@ -814,24 +833,49 @@ impl MixCore {
 
     /// The local pass: adds local-only tracks on top of an already published
     /// mix.
+    ///
+    /// Previews sit on their own bus with a fixed unity gain, so no bus fader
+    /// and no ducking applies to them. Does nothing while a second device
+    /// renders the previews.
     fn mix_local(&self, out: &mut [f32]) -> bool {
-        if out.len() < CHANNELS {
+        if out.len() < CHANNELS || self.preview_external.load(Ordering::Acquire) {
             return false;
         }
         let master = *self.master_volume.lock();
-        let gains = self.buses.lock().block;
-        let any_playing = self.render_tracks(true, master, &gains, out);
+        let any_playing = self.render_tracks(true, master, &PREVIEW_BUS, out);
         if any_playing {
             // The sum of the (already limited) mix and the previews may pass
             // full scale: keep it under the ceiling, for the device only.
             self.local_limiter.lock().process(out);
             self.note_peak(out);
         } else {
-            self.local_limiter.lock().gain = 1.0;
+            // No preview left: the limiter recovers at its normal release
+            // speed rather than jumping back to 1.0.
+            self.local_limiter.lock().relax(out.len() / CHANNELS);
+        }
+        any_playing
+    }
+
+    /// The previews alone, for the preview device's own callback: `out` is
+    /// overwritten (silence when nothing plays).
+    fn mix_preview(&self, out: &mut [f32]) -> bool {
+        out.fill(0.0);
+        if out.len() < CHANNELS {
+            return false;
+        }
+        let master = *self.master_volume.lock();
+        let any_playing = self.render_tracks(true, master, &PREVIEW_BUS, out);
+        if any_playing {
+            self.local_limiter.lock().process(out);
+        } else {
+            self.local_limiter.lock().relax(out.len() / CHANNELS);
         }
         any_playing
     }
 }
+
+/// Fixed gain of the preview bus: unity, never ducked, never faded.
+const PREVIEW_BUS: [BusGain; BUS_COUNT] = [BusGain::UNITY; BUS_COUNT];
 
 /// High-performance audio mixer.
 ///
@@ -1009,6 +1053,35 @@ impl AudioMixer {
     /// playing.
     pub fn mix_local_into(&self, out: &mut [f32]) -> bool {
         self.core.mix_local(out)
+    }
+
+    /// Render the previews alone into `out` (overwritten), for a second output
+    /// device. The preview limiter runs on it; nothing is published.
+    ///
+    /// Only meaningful after [`set_preview_external(true)`](Self::set_preview_external):
+    /// until then the main callback renders the previews itself.
+    /// Returns `true` when a preview was playing.
+    pub fn mix_preview_into(&self, out: &mut [f32]) -> bool {
+        self.core.mix_preview(out)
+    }
+
+    /// Route previews to a second device. While set, [`mix_local_into`](Self::mix_local_into)
+    /// and the headless loop leave the preview tracks alone: whoever calls
+    /// [`mix_preview_into`](Self::mix_preview_into) advances them.
+    pub fn set_preview_external(&self, external: bool) {
+        self.core
+            .preview_external
+            .store(external, Ordering::Release);
+    }
+
+    /// Whether previews are rendered by a second device.
+    pub fn is_preview_external(&self) -> bool {
+        self.core.preview_external.load(Ordering::Acquire)
+    }
+
+    /// Gain of the local (preview) limiter: 1.0 when it is not reducing.
+    pub fn local_limiter_gain(&self) -> f32 {
+        self.core.local_limiter.lock().gain
     }
 
     /// Peak output level (0.0..=1.0) since the previous call, for the meter.
@@ -2483,6 +2556,146 @@ mod fade_bus_tests {
         mixer.stop();
         assert!(!sounding(&mixer, preview), "the preview ran to its end");
         assert!(rx.try_recv().is_err(), "and was never published");
+    }
+
+    #[test]
+    fn preview_bypasses_bus_faders_and_ducking() {
+        let mixer = AudioMixer::new();
+        // A broadcast track on Ambience (the default bus) and a preview.
+        let ambience = constant(&mixer, 0.5, SR, true);
+        let preview = constant(&mixer, 0.25, SR, true);
+        mixer.set_track_local_only(preview, true).unwrap();
+        mixer.play_track(ambience).unwrap();
+        mixer.play_track(preview).unwrap();
+
+        // Fader down and a hard duck on every bus.
+        mixer.set_bus_volume(Bus::Ambience, 0.2).unwrap();
+        for bus in Bus::ALL {
+            mixer.duck_bus(
+                bus,
+                DuckSettings {
+                    target: 0.0,
+                    attack_ms: 1,
+                    release_ms: 1,
+                    hold_ms: None,
+                },
+            );
+        }
+
+        // Let the fader slew and the duck settle.
+        for _ in 0..20 {
+            let mut out = vec![0.0f32; 960];
+            mixer.mix_into(&mut out);
+            mixer.mix_local_into(&mut out);
+        }
+        let mut out = vec![0.0f32; 960];
+        mixer.mix_into(&mut out);
+        assert!(
+            out.iter().all(|s| s.abs() < 1e-3),
+            "the ambience track is ducked to silence"
+        );
+        mixer.mix_local_into(&mut out);
+        assert!(
+            out.iter().all(|s| (*s - 0.25).abs() < 1e-6),
+            "the preview keeps its full level: {:?}",
+            &out[..4]
+        );
+    }
+
+    #[test]
+    fn external_preview_is_rendered_alone_by_the_second_device() {
+        let mixer = AudioMixer::new();
+        let main = constant(&mixer, 0.25, SR, true);
+        let preview = constant(&mixer, 0.5, SR, true);
+        mixer.set_track_local_only(preview, true).unwrap();
+        mixer.play_track(main).unwrap();
+        mixer.play_track(preview).unwrap();
+        mixer.set_preview_external(true);
+        assert!(mixer.is_preview_external());
+
+        // The main device's callback: no previews in it.
+        let mut main_out = vec![0.0f32; 960];
+        assert!(mixer.mix_into(&mut main_out));
+        mixer.publish_broadcast(&main_out);
+        assert!(!mixer.mix_local_into(&mut main_out));
+        assert!(main_out.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+
+        // The preview device's callback: previews only, buffer overwritten.
+        let mut preview_out = vec![0.9f32; 960];
+        assert!(mixer.mix_preview_into(&mut preview_out));
+        assert!(preview_out.iter().all(|s| (*s - 0.5).abs() < 1e-6));
+
+        let published = mixer.broadcast_output_receiver().try_recv().unwrap();
+        assert!(published.buffer.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+
+        // Back to a shared output: the main callback plays them again.
+        mixer.set_preview_external(false);
+        let mut out = vec![0.0f32; 960];
+        mixer.mix_into(&mut out);
+        assert!(mixer.mix_local_into(&mut out));
+        assert!(out.iter().all(|s| (*s - 0.75).abs() < 1e-6));
+    }
+
+    #[test]
+    fn idle_preview_device_gets_silence() {
+        let mixer = AudioMixer::new();
+        mixer.set_preview_external(true);
+        let mut out = vec![0.7f32; 960];
+        assert!(!mixer.mix_preview_into(&mut out));
+        assert!(out.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn local_limiter_recovers_smoothly_when_the_last_preview_ends() {
+        let mixer = AudioMixer::new();
+        // A loud broadcast mix and a short loud preview on top of it.
+        let main = constant(&mixer, 0.9, SR * 10, true);
+        let preview = constant(&mixer, 0.9, 4800, false);
+        mixer.set_track_local_only(preview, true).unwrap();
+        mixer.play_track(main).unwrap();
+        mixer.play_track(preview).unwrap();
+
+        let block = |mixer: &AudioMixer| {
+            let mut out = vec![0.0f32; 480 * 2];
+            mixer.mix_into(&mut out);
+            mixer.mix_local_into(&mut out)
+        };
+        // Run until the preview has played out.
+        let mut blocks = 0;
+        while block(&mixer) {
+            blocks += 1;
+            assert!(blocks < 100, "the preview never ended");
+        }
+        let reduced = mixer.local_limiter_gain();
+        assert!(reduced < 0.7, "the limiter was working: {reduced}");
+
+        // The gain climbs back at the release speed, never as a jump to 1.0.
+        let mut previous = reduced;
+        for _ in 0..5 {
+            assert!(!block(&mixer));
+            let gain = mixer.local_limiter_gain();
+            assert!(gain > previous, "recovering: {previous} -> {gain}");
+            assert!(gain < 1.0, "not snapped to unity: {gain}");
+            assert!(
+                gain - previous < 0.05,
+                "a 10 ms step is small: {previous} -> {gain}"
+            );
+            previous = gain;
+        }
+        // And it does get there (a few release times later).
+        for _ in 0..200 {
+            block(&mixer);
+        }
+        assert!(mixer.local_limiter_gain() > 0.999);
+    }
+
+    #[test]
+    fn limiter_relax_matches_processing_silence() {
+        let mut a = Limiter { gain: 0.5 };
+        let mut b = Limiter { gain: 0.5 };
+        a.relax(480);
+        b.process(&mut [0.0f32; 960]);
+        assert!((a.gain - b.gain).abs() < 1e-3, "{} vs {}", a.gain, b.gain);
     }
 
     // --- the source seam -----------------------------------------------------------

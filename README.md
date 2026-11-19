@@ -266,6 +266,8 @@ duck_attack_ms = 200        # full level -> duck_amount
 duck_release_ms = 800       # duck_amount -> full level
 duck_buses = ["music", "ambience"]  # which buses duck; "sfx" stays untouched by default
 stream_threshold_secs = 60  # files longer than this are streamed from disk; 0 = never
+# output_device = "USB DAC"      # sound card for the mix; absent = system default (set it in AUDIO OUTPUT)
+# preview_device = "Headphones"  # separate card for sound previews; absent = the main output
 
 [logging]
 level = "info"     # trace | debug | info | warn | error

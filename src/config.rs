@@ -129,6 +129,18 @@ pub struct AudioConfig {
     /// instant start. `0` turns streaming off.
     #[serde(default = "default_stream_threshold_secs")]
     pub stream_threshold_secs: u32,
+
+    /// Name of the output device the desktop plays on. `None` (the default,
+    /// and what configs written before this existed mean) is the system
+    /// default device. A name that is not found falls back to the default and
+    /// the console says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
+
+    /// Name of a second device (headphones) for sound previews. `None` plays
+    /// previews on the main output. Previews never reach the players' stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_device: Option<String>,
 }
 
 /// Logging configuration
@@ -964,6 +976,8 @@ impl Default for AudioConfig {
             duck_release_ms: default_duck_release_ms(),
             duck_buses: default_duck_buses(),
             stream_threshold_secs: default_stream_threshold_secs(),
+            output_device: None,
+            preview_device: None,
         }
     }
 }

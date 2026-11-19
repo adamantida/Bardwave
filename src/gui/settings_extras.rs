@@ -48,6 +48,8 @@ pub struct ConsoleExtras {
     pub gm: GmLinkUi,
     /// Session timers: the timeline thread and the Timers dialog.
     pub timers: crate::gui::timeline::TimersUi,
+    /// Output / preview device dropdowns (see `audio_settings`).
+    pub audio: crate::gui::audio_settings::AudioSettingsUi,
 }
 
 impl ConsoleExtras {
@@ -62,6 +64,7 @@ impl ConsoleExtras {
                 ctx,
                 app_state.config.lock().unwrap().timers.clone(),
             ),
+            audio: Default::default(),
         }
     }
 }
