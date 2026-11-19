@@ -265,14 +265,53 @@ pub(crate) fn mirror_playing(sounds: &Mutex<HashMap<SoundId, SoundEntry>>, engin
     }
 }
 
-/// One file for the background decoder: the path and where to report.
-type DecodeJob = (String, Sender<anyhow::Result<SoundInfo>>);
-/// A finished decode: the job plus the decoded PCM (or the error text).
+/// One file for the background decoder: the path, where to report, and the
+/// engine's streaming threshold in seconds (0 disables streaming).
+type DecodeJob = (String, Sender<anyhow::Result<SoundInfo>>, u32);
+/// A finished decode: the job plus how the file is to be held (or the error).
 type DecodedJob = (
     String,
     Sender<anyhow::Result<SoundInfo>>,
-    Result<DecodedAudio, String>,
+    Result<LoadedFile, String>,
 );
+
+/// How the decoder worker prepared a file.
+enum LoadedFile {
+    /// A short file, fully decoded into memory.
+    Pcm(DecodedAudio),
+    /// A long file: only its header was read, playback decodes it on the fly.
+    Stream {
+        meta: crate::audio::decoder::TrackMeta,
+        duration_secs: Option<f64>,
+    },
+}
+
+/// Prepare a file for the engine, as [`AudioEngine::load_sound`] does: a file
+/// longer than `threshold_secs` is only probed (never decoded into RAM, which
+/// would cost hundreds of MB for a long music track and block the single
+/// decoder queue); a short one is fully decoded.
+fn prepare_file(path: &str, threshold_secs: u32) -> Result<LoadedFile, String> {
+    if threshold_secs > 0 {
+        // A file the probe cannot read falls through to the full decode,
+        // which reports the real error.
+        if let Ok(probe) = AudioDecoder::probe_file(path) {
+            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if crate::audio::stream_source::should_stream(
+                probe.duration_secs,
+                bytes,
+                threshold_secs,
+            ) {
+                return Ok(LoadedFile::Stream {
+                    meta: probe.meta,
+                    duration_secs: probe.duration_secs,
+                });
+            }
+        }
+    }
+    AudioDecoder::decode_file(path)
+        .map(LoadedFile::Pcm)
+        .map_err(|e| e.to_string())
+}
 
 /// One finished YouTube download: the file ready for the decoder, or the reason.
 type YouTubeJob = Result<PathBuf, String>;
@@ -288,8 +327,8 @@ fn spawn_decoder(ctx: egui::Context) -> (Sender<DecodeJob>, Receiver<DecodedJob>
     std::thread::Builder::new()
         .name("decoder".into())
         .spawn(move || {
-            for (path, response) in job_rx {
-                let result = AudioDecoder::decode_file(&path).map_err(|e| e.to_string());
+            for (path, response, threshold) in job_rx {
+                let result = prepare_file(&path, threshold);
                 if done_tx.send((path, response, result)).is_err() {
                     break;
                 }
@@ -1531,8 +1570,18 @@ impl SoundSharedApp {
                 continue;
             };
             match decoded {
-                Ok(audio) => {
-                    let sound_id = engine.load_sound_from_data(audio);
+                Ok(loaded) => {
+                    let sound_id = match loaded {
+                        LoadedFile::Pcm(audio) => engine.load_sound_from_data(audio),
+                        LoadedFile::Stream {
+                            meta,
+                            duration_secs,
+                        } => engine.register_stream_sound(
+                            std::path::Path::new(&path),
+                            meta,
+                            duration_secs,
+                        ),
+                    };
                     let (duration, sample_rate, _) =
                         engine.sound_info(sound_id).unwrap_or((0.0, 48000, 2));
                     // YouTube downloads arrive as `<title> [<id>]` on disk;
@@ -1635,8 +1684,11 @@ impl SoundSharedApp {
                 match cmd {
                     AudioCommand::LoadSound { path, response } => {
                         // Decoded off the GUI thread; finished in `finish_decoded`.
-                        if let Err(e) = self.decode_tx.send((path, response)) {
-                            let (_, response) = e.into_inner();
+                        if let Err(e) =
+                            self.decode_tx
+                                .send((path, response, engine.stream_threshold_secs()))
+                        {
+                            let (_, response, _) = e.into_inner();
                             let _ = response.send(Err(anyhow::anyhow!("decoder stopped")));
                         }
                     }
@@ -1928,5 +1980,93 @@ impl SoundSharedApp {
                 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_load_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::gui::hotkeys_ui::test_support::harness;
+
+    /// A silent 16-bit mono 8 kHz WAV of `secs` seconds in a fresh temp dir.
+    fn silent_wav(tag: &str, secs: u32) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bardwave-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("track.wav");
+        let data_len = secs * 8_000 * 2;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000u32.to_le_bytes());
+        bytes.extend_from_slice(&16_000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize(bytes.len() + data_len as usize, 0);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn prepare_file_streams_long_and_decodes_short() {
+        let path = silent_wav("prepare", 3);
+        let p = path.to_string_lossy();
+        assert!(matches!(prepare_file(&p, 1), Ok(LoadedFile::Stream { .. })));
+        assert!(matches!(prepare_file(&p, 10), Ok(LoadedFile::Pcm(_))));
+        // A zero threshold disables streaming.
+        assert!(matches!(prepare_file(&p, 0), Ok(LoadedFile::Pcm(_))));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The console's load path (decoder worker -> `finish_decoded`) must hand a
+    /// file above the threshold to the engine as a stream, not decode it.
+    #[test]
+    fn console_load_streams_a_long_file_and_decodes_a_short_one() {
+        let long = silent_wav("console-long", 3);
+        let short = silent_wav("console-short", 1);
+        let mut h = harness(Config::default(), true);
+        {
+            let guard = h.app.audio_engine.lock().unwrap();
+            guard.as_ref().unwrap().set_stream_threshold_secs(2);
+        }
+        let mut loaded = Vec::new();
+        for path in [&long, &short] {
+            let (tx, rx) = bounded(1);
+            h.app
+                .app_state
+                .audio_cmd_tx
+                .send(AudioCommand::LoadSound {
+                    path: path.to_string_lossy().to_string(),
+                    response: tx,
+                })
+                .unwrap();
+            h.app.process_audio_commands();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let info = loop {
+                h.app.finish_decoded();
+                if let Ok(result) = rx.try_recv() {
+                    break result.expect("load succeeds");
+                }
+                assert!(Instant::now() < deadline, "decoder never finished");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            loaded.push(info.id);
+        }
+        let guard = h.app.audio_engine.lock().unwrap();
+        let engine = guard.as_ref().unwrap();
+        assert!(engine.is_sound_streamed(loaded[0]), "long file must stream");
+        assert!(
+            !engine.is_sound_streamed(loaded[1]),
+            "short file is decoded"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(long.parent().unwrap());
+        let _ = std::fs::remove_dir_all(short.parent().unwrap());
     }
 }

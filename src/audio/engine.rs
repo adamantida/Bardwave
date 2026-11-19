@@ -982,7 +982,7 @@ impl AudioEngine {
         Ok(self.register_stream_sound(path.as_ref(), probe.meta, probe.duration_secs))
     }
 
-    fn register_stream_sound(
+    pub fn register_stream_sound(
         &self,
         path: &Path,
         meta: TrackMeta,
