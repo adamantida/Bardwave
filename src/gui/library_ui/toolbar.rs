@@ -11,6 +11,7 @@ use crate::gui::app::SoundSharedApp;
 use crate::gui::theme::{alpha, micro_label, Metrics, Palette};
 use crate::gui::widgets::{elide, glyph, glyph_font, paint_icon, ConsoleButton, IconButton};
 
+use super::layout::{search_layout, CLEAR_W};
 use super::logic::{
     elide_start, highlight_job, missing_count, missing_summary, tag_chips, MissingSound,
 };
@@ -27,23 +28,40 @@ pub fn library_toolbar(ui: &mut Ui, state: &mut SoundSharedApp) {
     toast_row(ui, state);
 }
 
+/// Start a new row of a wrapped layout when fewer than `needed` pixels are
+/// left on this one.
+///
+/// egui wraps plain widgets by itself, but the console buttons draw inside a
+/// nested scope, and a scope that does not fit is not wrapped: it spills over
+/// the right edge and widens the whole column. The row is therefore ended by
+/// hand before such a button.
+fn wrap_if_short(ui: &mut Ui, needed: f32) {
+    if ui.available_rect_before_wrap().width() < needed + 0.5 {
+        ui.end_row();
+    }
+}
+
+/// Search field, then `Folder…`, `Export…`, `Import…`.
+///
+/// A wrapped row: the field stretches (never below its minimum) and the
+/// buttons drop to a second row, with an explicit gap, when they would not
+/// fit beside it. See [`search_layout`].
 fn search_row(ui: &mut Ui, state: &mut SoundSharedApp) {
-    const BTN_W: [f32; 3] = [112.0, 84.0, 84.0];
-    let buttons_w: f32 = BTN_W.iter().sum::<f32>() + 3.0 * Metrics::SM;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = Metrics::SM;
-        let has_text = !state.lib_ui.filter.text.is_empty();
-        let clear_w = if has_text { 26.0 } else { 0.0 };
-        let field_w = (ui.available_width() - buttons_w - clear_w - Metrics::SM).max(120.0);
+    let has_text = !state.lib_ui.filter.text.is_empty();
+    let lay = search_layout(ui.available_width(), has_text);
+    ui.horizontal_wrapped(|ui| {
+        // The panels zero the vertical spacing, so the gap between the two
+        // rows is placed here.
+        ui.spacing_mut().item_spacing = vec2(Metrics::SM, Metrics::SM);
         let field = egui::TextEdit::singleline(&mut state.lib_ui.filter.text)
             .hint_text("Search name or tag…")
-            .desired_width(field_w)
+            .desired_width(lay.field_w)
             .font(glyph_font(12.0))
             .margin(egui::Margin::symmetric(10.0, 7.0));
         ui.add(field);
         if has_text
             && IconButton::new(glyph::CROSS)
-                .size(26.0)
+                .size(CLEAR_W)
                 .font_size(10.0)
                 .tooltip("Clear search")
                 .id_salt("library_search_clear")
@@ -52,10 +70,14 @@ fn search_row(ui: &mut Ui, state: &mut SoundSharedApp) {
         {
             state.lib_ui.filter.text.clear();
         }
+        if lay.stacked {
+            ui.end_row();
+        }
+        wrap_if_short(ui, lay.button_w[0]);
         if ConsoleButton::ghost("Folder…")
             .glyph(glyph::FOLDER)
             .small()
-            .width(BTN_W[0])
+            .width(lay.button_w[0])
             .tooltip("Add every sound in a folder (and its sub-folders)")
             .id_salt("library_add_folder")
             .show(ui)
@@ -63,9 +85,10 @@ fn search_row(ui: &mut Ui, state: &mut SoundSharedApp) {
         {
             state.open_add_folder();
         }
+        wrap_if_short(ui, lay.button_w[1]);
         if ConsoleButton::ghost("Export…")
             .small()
-            .width(BTN_W[1])
+            .width(lay.button_w[1])
             .tooltip("Save the library as a shareable .zip bundle")
             .id_salt("library_export")
             .show(ui)
@@ -73,9 +96,10 @@ fn search_row(ui: &mut Ui, state: &mut SoundSharedApp) {
         {
             state.open_export();
         }
+        wrap_if_short(ui, lay.button_w[2]);
         if ConsoleButton::ghost("Import…")
             .small()
-            .width(BTN_W[2])
+            .width(lay.button_w[2])
             .tooltip("Merge a .zip bundle into the library")
             .id_salt("library_import")
             .show(ui)
@@ -99,6 +123,7 @@ fn filter_row(ui: &mut Ui, state: &mut SoundSharedApp) {
 
     let mut toggled: Option<String> = None;
     let mut clear = false;
+    let row_w = ui.available_width();
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(Metrics::SM, Metrics::SM);
         for chip_data in &chips {
@@ -114,17 +139,19 @@ fn filter_row(ui: &mut Ui, state: &mut SoundSharedApp) {
         if hidden > 0 {
             ui.label(micro_label(format!("+{hidden} more tags")));
         }
-        if active
-            && ConsoleButton::ghost("Clear")
+        if active {
+            wrap_if_short(ui, 80.0);
+            if ConsoleButton::ghost("Clear")
                 .glyph(glyph::CROSS)
                 .small()
-                .width(80.0)
+                .width(80.0_f32.min(row_w))
                 .height(22.0)
                 .id_salt("library_filter_clear")
                 .show(ui)
                 .clicked()
-        {
-            clear = true;
+            {
+                clear = true;
+            }
         }
     });
     if let Some(tag) = toggled {
@@ -194,6 +221,7 @@ fn banner_row(ui: &mut Ui, state: &mut SoundSharedApp) {
         .rounding(Rounding::same(Metrics::R_SM))
         .inner_margin(egui::Margin::symmetric(Metrics::MD, Metrics::SM))
         .show(ui, |ui| {
+            let row_w = ui.available_width();
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(Metrics::SM, Metrics::SM);
                 let (icon_rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
@@ -204,10 +232,11 @@ fn banner_row(ui: &mut Ui, state: &mut SoundSharedApp) {
                         .color(Palette::AMBER_400)
                         .extra_letter_spacing(0.8),
                 );
+                wrap_if_short(ui, 168.0);
                 if ConsoleButton::ghost("Replace Path Prefix…")
                     .small()
                     .height(22.0)
-                    .width(168.0)
+                    .width(168.0_f32.min(row_w))
                     .tooltip(
                         "The whole sound folder moved: rewrite the start of every path at once",
                     )
@@ -217,11 +246,12 @@ fn banner_row(ui: &mut Ui, state: &mut SoundSharedApp) {
                 {
                     remap = true;
                 }
+                wrap_if_short(ui, 96.0);
                 if ConsoleButton::ghost("Recheck")
                     .glyph(glyph::REFRESH)
                     .small()
                     .height(22.0)
-                    .width(96.0)
+                    .width(96.0_f32.min(row_w))
                     .tooltip("Look for the files again")
                     .id_salt("library_recheck")
                     .show(ui)

@@ -14,6 +14,8 @@
 //!
 //! The group rail is the RPG-Sounds workflow: pick a category, add sounds to it.
 
+mod layout;
+
 use crate::audio::SoundId;
 use crate::gui::app::{SoundEntry, SoundSharedApp};
 use crate::gui::groups::GroupFilter;
@@ -30,6 +32,9 @@ use crate::gui::widgets::{
     ConsoleButton, IconButton,
 };
 use egui::{Align, CursorIcon, Layout, Rect, Rounding, Sense, Stroke, Ui, Vec2};
+use layout::{
+    header_layout, master_layout, meter_cells, rail_label_chars, rail_width, row_layout_for,
+};
 
 /// Renders the whole `01 / LIBRARY` panel at the given size.
 pub fn sound_library_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
@@ -53,11 +58,15 @@ pub fn sound_library_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) 
             Vec2::new(ui.available_width(), list_h),
             Layout::left_to_right(Align::Min),
             |ui| {
-                // The rail is the primary navigation; it only collapses when the
-                // sound rows themselves would become too narrow to read.
-                let rail_fits = size.x >= Metrics::RAIL_W + Metrics::MD + Metrics::MIN_ROW_W;
-                if rail_fits {
-                    group_rail(ui, state, list_h);
+                // Gaps are placed by hand, so the widths budgeted by
+                // `rail_width` are exact.
+                ui.spacing_mut().item_spacing.x = 0.0;
+                // The rail is the primary navigation: it narrows before the
+                // rows do and is dropped only when the rows would become too
+                // narrow to read. The decision uses the body width, not the
+                // outer panel size (which still contains the padding).
+                if let Some(rail_w) = rail_width(ui.available_width()) {
+                    group_rail(ui, state, list_h, rail_w);
                     ui.add_space(Metrics::MD);
                 }
                 ui.allocate_ui_with_layout(
@@ -98,27 +107,35 @@ fn header(ui: &mut Ui, state: &mut SoundSharedApp) {
             });
         });
 
+        // The buttons get what the title leaves; they narrow, and the YouTube
+        // one drops out, before anything can leave the panel.
+        let room = (ui.available_width() - 1.0).max(0.0);
+        let lay = header_layout(room);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // Gaps are placed by hand so the widths budgeted above are exact.
+            ui.spacing_mut().item_spacing.x = 0.0;
             if ConsoleButton::primary("Add Sound")
                 .glyph(glyph::PLUS)
                 .font_size(11.0)
-                .width(150.0)
+                .width(lay.add_w)
                 .id_salt("library_add")
                 .show(ui)
                 .clicked()
             {
                 state.open_file_dialog();
             }
-            ui.add_space(Metrics::SM);
-            if ConsoleButton::ghost("YouTube")
-                .glyph(glyph::WAVE)
-                .font_size(11.0)
-                .width(110.0)
-                .id_salt("library_add_youtube")
-                .show(ui)
-                .clicked()
-            {
-                state.open_add_youtube();
+            if let Some(youtube_w) = lay.youtube_w {
+                ui.add_space(Metrics::SM);
+                if ConsoleButton::ghost("YouTube")
+                    .glyph(glyph::WAVE)
+                    .font_size(11.0)
+                    .width(youtube_w)
+                    .id_salt("library_add_youtube")
+                    .show(ui)
+                    .clicked()
+                {
+                    state.open_add_youtube();
+                }
             }
         });
     });
@@ -128,12 +145,14 @@ fn header(ui: &mut Ui, state: &mut SoundSharedApp) {
 ///
 /// Selecting a chip filters the rows. Each chip carries its sound count and, on
 /// hover, reveals rename/delete actions for real groups.
-fn group_rail(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
+fn group_rail(ui: &mut Ui, state: &mut SoundSharedApp, height: f32, width: f32) {
     ui.allocate_ui_with_layout(
-        Vec2::new(Metrics::RAIL_W, height),
+        Vec2::new(width, height),
         Layout::top_down(Align::Min),
         |ui| {
-            ui.set_width(Metrics::RAIL_W);
+            // Exactly `width`: the rail never grows with its content.
+            ui.set_width(width);
+            ui.set_max_width(width);
 
             ui.horizontal(|ui| {
                 ui.label(micro_label("Groups"));
@@ -166,13 +185,20 @@ fn group_rail(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
                     let ungrouped = counts.for_filter(GroupFilter::Ungrouped);
                     let all = counts.for_filter(GroupFilter::All);
 
-                    if rail_chip(ui, "All Sounds", all, active == GroupFilter::All, None)
-                        == RailAction::Select
+                    if rail_chip(
+                        ui,
+                        width,
+                        "All Sounds",
+                        all,
+                        active == GroupFilter::All,
+                        None,
+                    ) == RailAction::Select
                     {
                         state.set_group_filter(GroupFilter::All);
                     }
                     if rail_chip(
                         ui,
+                        width,
                         "Ungrouped",
                         ungrouped,
                         active == GroupFilter::Ungrouped,
@@ -205,7 +231,7 @@ fn group_rail(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
 
                     for (id, name, count) in groups {
                         let selected = active == GroupFilter::Group(id);
-                        match rail_chip(ui, &name, count, selected, Some(id)) {
+                        match rail_chip(ui, width, &name, count, selected, Some(id)) {
                             RailAction::Select => state.set_group_filter(GroupFilter::Group(id)),
                             RailAction::Rename => state.open_rename_group(id),
                             RailAction::Delete => state.open_delete_group(id),
@@ -232,15 +258,14 @@ enum RailAction {
 /// replacing their count badge; non-group chips always show the count.
 fn rail_chip(
     ui: &mut Ui,
+    width: f32,
     label: &str,
     count: usize,
     selected: bool,
     group: Option<crate::gui::groups::GroupId>,
 ) -> RailAction {
-    let (rect, resp) = ui.allocate_exact_size(
-        Vec2::new(Metrics::RAIL_W, Metrics::RAIL_ITEM_H),
-        Sense::click(),
-    );
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(width, Metrics::RAIL_ITEM_H), Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     let hovered = resp.hovered();
     let painter = ui.painter();
@@ -269,7 +294,11 @@ fn rail_chip(
     };
 
     let text_x = rect.left() + 10.0;
-    let galley = painter.layout_no_wrap(elide(label, 17), ui_font(12.0), text_color);
+    let galley = painter.layout_no_wrap(
+        elide(label, rail_label_chars(width)),
+        ui_font(12.0),
+        text_color,
+    );
     painter.galley(
         egui::pos2(text_x, rect.center().y - galley.size().y / 2.0),
         galley,
@@ -491,6 +520,9 @@ struct RowView<'a> {
     terms: &'a [String],
 }
 
+/// Width reserved for the `FILE NOT FOUND` badge next to a name.
+const MISSING_BADGE_W: f32 = 96.0;
+
 /// A single 64px sound row.
 ///
 /// Playing rows get the rose tint, a flush left signal bar and a pulsing dot —
@@ -654,8 +686,8 @@ fn sound_row(
         action = RowAction::Preview;
     }
 
-    // The group chip is measured first: it decides how much room the name and
-    // the meta line have before the right-hand controls start.
+    // The group chip is measured first: its width goes into the layout, which
+    // decides what the row can show at this width (see `layout::row_layout_for`).
     let group_name = sound
         .group
         .and_then(|id| state.group_name(id))
@@ -667,16 +699,21 @@ fn sound_row(
         Palette::ZINC_500,
     );
     let tag_w = tag_galley.size().x + 14.0;
-    // Remove (10 + 24), readout (34), gaps (8 + 12), slider, chip.
-    let cluster_left = rect.right() - 168.0 - tag_w;
+    let lay = row_layout_for(width, tag_w);
+    let x_at = |x: f32| rect.left() + x;
+    let span_rect = |span: layout::Span, h: f32| {
+        Rect::from_min_max(
+            egui::pos2(x_at(span.left), rect.center().y - h / 2.0),
+            egui::pos2(x_at(span.right), rect.center().y + h / 2.0),
+        )
+    };
 
     // ---- Name + metadata ----
-    let text_x = preview_rect.right() + 12.0;
+    let text_x = x_at(layout::TEXT_X);
+    let name_right = x_at(lay.name.right);
+    let name_clip = Rect::from_min_max(rect.min, egui::pos2(name_right.max(text_x), rect.max.y));
+    let text_painter = painter.with_clip_rect(name_clip);
     let mut name_x = text_x;
-    let text_painter = painter.with_clip_rect(Rect::from_min_max(
-        rect.min,
-        egui::pos2((cluster_left - 8.0).max(text_x), rect.max.y),
-    ));
 
     if playing {
         // Pulsing dot in front of the name (the mockup's playing indicator).
@@ -701,23 +738,34 @@ fn sound_row(
     } else {
         Palette::WHITE
     };
-    let name = elide(&sound.name, 38);
-    // Search matches are lit inside the name.
-    let name_job = highlight_job(
-        &name,
+    // Search matches are lit inside the name. A name that does not fit is cut
+    // with an ellipsis (the full name is in the tooltip).
+    let full_name = elide(&sound.name, 200);
+    let mut name_job = highlight_job(
+        &full_name,
         view.terms,
         ui_font(14.0),
         name_color,
         Palette::WHITE,
         alpha(Palette::ROSE_600, 90),
     );
+    let name_room = (name_right - name_x).max(0.0);
+    let name_cut = painter.layout_job(name_job.clone()).size().x > name_room + 0.5;
+    if name_cut {
+        name_job.wrap = egui::text::TextWrapping {
+            max_width: name_room,
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('\u{2026}'),
+        };
+    }
     let name_galley = painter.layout_job(name_job);
     // Name sits right above the centre line, the meta line right below it;
     // the old fixed offset let the two overlap by a few pixels.
     let name_y = rect.center().y - name_galley.size().y;
     let name_size = name_galley.size();
     text_painter.galley(egui::pos2(name_x, name_y), name_galley, name_color);
-    if view.missing {
+    if view.missing && name_x + name_size.x + 10.0 + MISSING_BADGE_W <= name_right {
         paint_badge(
             &text_painter,
             name_x + name_size.x + 10.0,
@@ -727,29 +775,36 @@ fn sound_row(
         );
     }
 
-    // `48 kHz / 00:42 / WAV` — mono telemetry under the name.
-    let rate = if sound.sample_rate > 0 {
-        format_sample_rate(sound.sample_rate)
-    } else {
-        format_sample_rate(crate::audio::TARGET_SAMPLE_RATE)
-    };
-    let meta = format!(
-        "{} / {} / {}",
-        rate,
-        format_duration(sound.duration),
-        crate::gui::widgets::format_extension(&sound.path)
-    );
-    let meta_rect = text_painter.text(
-        egui::pos2(text_x, rect.center().y + 3.0),
-        egui::Align2::LEFT_TOP,
-        meta.to_uppercase(),
-        crate::gui::widgets::glyph_font(10.0),
-        Palette::ZINC_500,
-    );
+    // `48 kHz / 00:42 / WAV` — mono telemetry under the name; the first thing
+    // to go when the row narrows.
+    let mut extra_x = text_x;
+    if lay.show_meta {
+        let rate = if sound.sample_rate > 0 {
+            format_sample_rate(sound.sample_rate)
+        } else {
+            format_sample_rate(crate::audio::TARGET_SAMPLE_RATE)
+        };
+        let meta = format!(
+            "{} / {} / {}",
+            rate,
+            format_duration(sound.duration),
+            crate::gui::widgets::format_extension(&sound.path)
+        );
+        let meta_rect = text_painter.text(
+            egui::pos2(text_x, rect.center().y + 3.0),
+            egui::Align2::LEFT_TOP,
+            meta.to_uppercase(),
+            crate::gui::widgets::glyph_font(10.0),
+            Palette::ZINC_500,
+        );
+        // After the telemetry: how to fix a missing file, or the tags.
+        extra_x = meta_rect.right() + 14.0;
+    }
 
-    // After the telemetry: how to fix a missing file, or the tags (a click
-    // edits them; an untagged row offers "+ TAG" while hovered).
-    let extra_x = meta_rect.right() + 14.0;
+    // A click on the tags edits them; an untagged row offers "+ TAG" while
+    // hovered. A missing file offers "LOCATE…" instead. The hit area is cut to
+    // the name area so it can never cover the controls on the right.
+    let meta_top = rect.center().y + 3.0;
     if view.missing {
         let galley = painter.layout_no_wrap(
             "LOCATE…".to_string(),
@@ -757,21 +812,24 @@ fn sound_row(
             Palette::AMBER_400,
         );
         let locate_rect = Rect::from_min_size(
-            egui::pos2(extra_x - 4.0, meta_rect.top() - 2.0),
+            egui::pos2(extra_x - 4.0, meta_top - 2.0),
             galley.size() + Vec2::new(8.0, 4.0),
-        );
-        let locate_resp = ui
-            .interact(locate_rect, resp.id.with("locate"), Sense::click())
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("Pick the file's new location");
-        let color = if locate_resp.hovered() {
-            Palette::WHITE
-        } else {
-            Palette::AMBER_400
-        };
-        text_painter.galley(egui::pos2(extra_x, meta_rect.top()), galley, color);
-        if locate_resp.clicked() {
-            action = RowAction::Locate;
+        )
+        .intersect(name_clip);
+        if locate_rect.is_positive() {
+            let locate_resp = ui
+                .interact(locate_rect, resp.id.with("locate"), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Pick the file's new location");
+            let color = if locate_resp.hovered() {
+                Palette::WHITE
+            } else {
+                Palette::AMBER_400
+            };
+            text_painter.galley(egui::pos2(extra_x, meta_top), galley, color);
+            if locate_resp.clicked() {
+                action = RowAction::Locate;
+            }
         }
     } else if !view.tags.is_empty() || hovered {
         let (text, color) = if view.tags.is_empty() {
@@ -781,30 +839,34 @@ fn sound_row(
         };
         let galley = painter.layout_no_wrap(text, crate::gui::widgets::glyph_font(10.0), color);
         let tags_rect = Rect::from_min_size(
-            egui::pos2(extra_x - 4.0, meta_rect.top() - 2.0),
+            egui::pos2(extra_x - 4.0, meta_top - 2.0),
             galley.size() + Vec2::new(8.0, 4.0),
-        );
-        let tags_resp = ui
-            .interact(tags_rect, resp.id.with("tags"), Sense::click())
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("Edit tags");
-        let color = if tags_resp.hovered() {
-            Palette::WHITE
-        } else {
-            color
-        };
-        text_painter.galley(egui::pos2(extra_x, meta_rect.top()), galley, color);
-        if tags_resp.clicked() {
-            action = RowAction::EditTags;
+        )
+        .intersect(name_clip);
+        if tags_rect.is_positive() {
+            let tags_resp = ui
+                .interact(tags_rect, resp.id.with("tags"), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Edit tags");
+            let color = if tags_resp.hovered() {
+                Palette::WHITE
+            } else {
+                color
+            };
+            text_painter.galley(egui::pos2(extra_x, meta_top), galley, color);
+            if tags_resp.clicked() {
+                action = RowAction::EditTags;
+            }
         }
     }
 
-    // ---- Right side: group tag, volume, assign, remove ----
-    let mut cursor = rect.right() - 10.0;
+    // ---- Right side: group tag, volume, remove ----
 
     // Remove (✕)
-    let remove_rect =
-        Rect::from_center_size(egui::pos2(cursor - 9.0, rect.center().y), Vec2::splat(18.0));
+    let remove_rect = Rect::from_center_size(
+        span_rect(lay.remove, layout::REMOVE_W).center(),
+        Vec2::splat(layout::SMALL_BTN),
+    );
     let remove_resp = ui.interact(remove_rect, resp.id.with("remove"), Sense::click());
     crate::gui::widgets::paint_icon(
         painter,
@@ -820,115 +882,107 @@ fn sound_row(
     if remove_resp.clicked() {
         action = RowAction::Remove;
     }
-    cursor -= 24.0;
 
-    // Volume readout + slider
+    // Volume readout, right-aligned in its fixed box.
     let pct_galley = painter.layout_no_wrap(
         format!("{:.0}%", sound.volume * 100.0),
         crate::gui::widgets::glyph_font(10.0),
         Palette::ZINC_400,
     );
-    // Fixed-width, right-aligned readout: "100%" is wider than "70%", and a
-    // width that follows the text shifted the slider from row to row.
-    const PCT_W: f32 = 34.0;
-    cursor -= PCT_W;
     painter.galley(
         egui::pos2(
-            cursor + PCT_W - pct_galley.size().x,
+            x_at(lay.percent.right) - pct_galley.size().x,
             rect.center().y - pct_galley.size().y / 2.0,
         ),
         pct_galley,
         Palette::ZINC_400,
     );
 
-    cursor -= Metrics::SM;
-    let slider_rect = Rect::from_center_size(
-        egui::pos2(cursor - Metrics::ROW_SLIDER_W / 2.0, rect.center().y),
-        Vec2::new(Metrics::ROW_SLIDER_W, 18.0),
-    );
-    let slider_resp = ui.interact(slider_rect, resp.id.with("volume"), Sense::click_and_drag());
-    let slider_resp = slider_resp.on_hover_cursor(CursorIcon::ResizeHorizontal);
+    // Volume slider (it narrows, and goes only on a very narrow row).
+    if let Some(slider_span) = lay.slider {
+        let slider_rect = span_rect(slider_span, 18.0);
+        let slider_resp = ui.interact(slider_rect, resp.id.with("volume"), Sense::click_and_drag());
+        let slider_resp = slider_resp.on_hover_cursor(CursorIcon::ResizeHorizontal);
 
-    let mut value = sound.volume;
-    let mut changed = false;
-    if let Some(pointer) = slider_resp.interact_pointer_pos() {
-        if slider_resp.is_pointer_button_down_on() || slider_resp.dragged() {
-            let track_left = slider_rect.left();
-            let t = ((pointer.x - track_left) / slider_rect.width().max(1.0)).clamp(0.0, 1.0);
-            if (t - value).abs() > f32::EPSILON {
-                value = t;
-                changed = true;
+        let mut value = sound.volume;
+        let mut changed = false;
+        if let Some(pointer) = slider_resp.interact_pointer_pos() {
+            if slider_resp.is_pointer_button_down_on() || slider_resp.dragged() {
+                let track_left = slider_rect.left();
+                let t = ((pointer.x - track_left) / slider_rect.width().max(1.0)).clamp(0.0, 1.0);
+                if (t - value).abs() > f32::EPSILON {
+                    value = t;
+                    changed = true;
+                }
             }
         }
-    }
 
-    // 2px track with a square thumb, matching the mockup.
-    let track = Rect::from_min_size(
-        egui::pos2(slider_rect.left(), slider_rect.center().y - 1.0),
-        Vec2::new(slider_rect.width(), 2.0),
-    );
-    painter.rect_filled(track, Rounding::ZERO, Palette::BORDER_STRONG);
-    let shown = value.clamp(0.0, 1.0);
-    if shown > 0.0 {
+        // 2px track with a square thumb, matching the mockup.
+        let track = Rect::from_min_size(
+            egui::pos2(slider_rect.left(), slider_rect.center().y - 1.0),
+            Vec2::new(slider_rect.width(), 2.0),
+        );
+        painter.rect_filled(track, Rounding::ZERO, Palette::BORDER_STRONG);
+        let shown = value.clamp(0.0, 1.0);
+        if shown > 0.0 {
+            painter.rect_filled(
+                Rect::from_min_size(track.min, Vec2::new(track.width() * shown, 2.0)),
+                Rounding::ZERO,
+                if playing {
+                    Palette::ROSE_500
+                } else {
+                    Palette::ZINC_500
+                },
+            );
+        }
+        let thumb_size = if slider_resp.hovered() { 6.0 } else { 4.5 };
         painter.rect_filled(
-            Rect::from_min_size(track.min, Vec2::new(track.width() * shown, 2.0)),
+            Rect::from_center_size(
+                egui::pos2(track.left() + track.width() * shown, track.center().y),
+                Vec2::splat(thumb_size),
+            ),
             Rounding::ZERO,
             if playing {
                 Palette::ROSE_500
             } else {
-                Palette::ZINC_500
+                Palette::ZINC_400
             },
         );
-    }
-    let thumb_size = if slider_resp.hovered() { 6.0 } else { 4.5 };
-    painter.rect_filled(
-        Rect::from_center_size(
-            egui::pos2(track.left() + track.width() * shown, track.center().y),
-            Vec2::splat(thumb_size),
-        ),
-        Rounding::ZERO,
-        if playing {
-            Palette::ROSE_500
-        } else {
-            Palette::ZINC_400
-        },
-    );
 
-    if changed {
-        action = RowAction::Volume(value);
+        if changed {
+            action = RowAction::Volume(value);
+        }
     }
-    cursor -= Metrics::ROW_SLIDER_W;
 
-    // Group tag (click to reassign); measured above.
-    cursor -= Metrics::MD;
-    let tag_rect = Rect::from_center_size(
-        egui::pos2(cursor - tag_w / 2.0, rect.center().y),
-        Vec2::new(tag_w, 18.0),
-    );
-    let tag_resp = ui.interact(tag_rect, resp.id.with("tag"), Sense::click());
-    let tag_resp = tag_resp.on_hover_cursor(CursorIcon::PointingHand);
-    painter.rect(
-        tag_rect,
-        Rounding::same(Metrics::R_SM),
-        if tag_resp.hovered() {
-            Palette::BORDER
-        } else {
-            Palette::TRANSPARENT
-        },
-        Stroke::new(1.0_f32, Palette::BORDER),
-    );
-    painter.galley(
-        egui::pos2(
-            tag_rect.center().x - tag_galley.size().x / 2.0,
-            tag_rect.center().y - tag_galley.size().y / 2.0,
-        ),
-        tag_galley,
-        Palette::ZINC_500,
-    );
-    if tag_resp.clicked() {
-        action = RowAction::Assign;
-    } else if tag_resp.hovered() {
-        tag_resp.on_hover_text("Change group");
+    // Group tag (click to reassign); only when the row is wide enough.
+    if let Some(tag_span) = lay.tag {
+        let tag_rect = span_rect(tag_span, 18.0);
+        let tag_resp = ui.interact(tag_rect, resp.id.with("tag"), Sense::click());
+        let tag_resp = tag_resp.on_hover_cursor(CursorIcon::PointingHand);
+        painter.rect(
+            tag_rect,
+            Rounding::same(Metrics::R_SM),
+            if tag_resp.hovered() {
+                Palette::BORDER
+            } else {
+                Palette::TRANSPARENT
+            },
+            Stroke::new(1.0_f32, Palette::BORDER),
+        );
+        let text_w = tag_galley.size().x.min(tag_rect.width() - 4.0);
+        painter.with_clip_rect(tag_rect).galley(
+            egui::pos2(
+                tag_rect.center().x - text_w / 2.0,
+                tag_rect.center().y - tag_galley.size().y / 2.0,
+            ),
+            tag_galley,
+            Palette::ZINC_500,
+        );
+        if tag_resp.clicked() {
+            action = RowAction::Assign;
+        } else if tag_resp.hovered() {
+            tag_resp.on_hover_text("Change group");
+        }
     }
 
     // Right-click: add to a scene, flag as a stinger.
@@ -938,7 +992,13 @@ fn sound_row(
     });
 
     if action_is_none(&action) && resp.hovered() {
-        resp.on_hover_text(sound.path.to_string_lossy());
+        // A cut name, a hidden group and a missing slider are all in here.
+        resp.on_hover_text(format!(
+            "{}\n{}\nGroup: {}",
+            sound.name,
+            sound.path.to_string_lossy(),
+            group_name
+        ));
     }
 
     action
@@ -1081,10 +1141,20 @@ fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, hei
 }
 
 /// `MASTER OUTPUT ▮▮▮▮…  80%  [MUTE]` strip at the bottom of the panel.
+///
+/// The slider and the level meter narrow with the panel (the meter goes first
+/// when there is no room for it), so Mute never leaves the panel.
 fn master_output(ui: &mut Ui, state: &mut SoundSharedApp) {
     ui.horizontal(|ui| {
+        // Gaps are placed by hand so the widths budgeted by `master_layout`
+        // are exact.
+        ui.spacing_mut().item_spacing.x = 0.0;
         ui.label(micro_label("Master Output"));
         ui.add_space(Metrics::LABEL_GAP);
+        // What is left of the strip after the caption (1px of slack keeps a
+        // rounding error from wrapping the last control).
+        let room = (ui.available_width() - 1.0).max(0.0);
+        let lay = master_layout(room);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let muted = state.is_muted();
             let mute_label = if muted { "Unmute" } else { "Mute" };
@@ -1096,7 +1166,7 @@ fn master_output(ui: &mut Ui, state: &mut SoundSharedApp) {
                     crate::gui::widgets::BtnKind::Ghost
                 })
                 .small()
-                .width(92.0)
+                .width(lay.mute_w)
                 .id_salt("master_mute")
                 .show(ui);
             if resp.clicked() {
@@ -1112,13 +1182,16 @@ fn master_output(ui: &mut Ui, state: &mut SoundSharedApp) {
                     .color(Palette::WHITE),
             );
 
-            ui.add_space(Metrics::SM);
-            // Live output level (peak, dB scale), not the fader position.
-            segmented_meter(ui, state.output_meter(), 20, 160.0, 8.0);
-
-            ui.add_space(Metrics::MD);
+            if let Some(meter_w) = lay.meter_w {
+                ui.add_space(Metrics::SM);
+                // Live output level (peak, dB scale), not the fader position.
+                segmented_meter(ui, state.output_meter(), meter_cells(meter_w), meter_w, 8.0);
+                ui.add_space(Metrics::MD);
+            } else {
+                ui.add_space(Metrics::SM);
+            }
             let mut slider_value = value;
-            let slider = level_slider(ui, &mut slider_value, 120.0, "master_panel");
+            let slider = level_slider(ui, &mut slider_value, lay.slider_w, "master_panel");
             if slider.changed() {
                 state.set_master_volume(slider_value);
             }
@@ -1177,6 +1250,131 @@ mod tests {
                 }
             }
             height += 7.0;
+        }
+    }
+
+    // ---- headless frames of the whole panel ----
+
+    /// The panel's border box for a window `width` wide, as `gui::mod` sizes it.
+    fn left_panel_rect(width: f32, height: f32) -> Rect {
+        let content = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, height))
+            .shrink(Metrics::APP_PAD);
+        let inner = content.shrink(1.0);
+        let right_left = inner.right() - (Metrics::RIGHT_COL_W - 2.0);
+        Rect::from_min_max(
+            inner.min,
+            egui::pos2(right_left - Metrics::COL_GAP - 2.0, inner.bottom()),
+        )
+    }
+
+    /// Right edge of every painted box or line (text is clipped by its own
+    /// painter, so only filled / stroked shapes are measured).
+    fn box_rights(shape: &egui::Shape, out: &mut Vec<f32>) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| box_rights(s, out)),
+            egui::Shape::Rect(_) | egui::Shape::LineSegment { .. } => {
+                out.push(shape.visual_bounding_rect().right());
+            }
+            _ => {}
+        }
+    }
+
+    /// Run the panel for a few frames in a window `width` wide; returns the
+    /// right edges of everything it painted and the panel's right border.
+    fn run_panel(width: f32, search: &str, muted: bool) -> (Vec<f32>, f32) {
+        use crate::gui::hotkeys_ui::test_support::harness;
+
+        let mut h = harness(crate::config::Config::default(), false);
+        let rain =
+            std::path::PathBuf::from("/nonexistent/rain/Rain On A Very Long Tavern Roof.ogg");
+        let gone = std::path::PathBuf::from("/nonexistent/gone/Missing Thunder.ogg");
+        let group = h.app.library.add_group("A rather long group name");
+        for (n, name) in [
+            "Rain",
+            "A sound with a really quite long name indeed",
+            "Wolf",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = if n == 0 {
+                rain.clone()
+            } else {
+                std::path::PathBuf::from(format!("/nonexistent/{n}.ogg"))
+            };
+            let group = if n == 1 { group } else { None };
+            h.app.library.insert_sound(&path, name, 1.0, group);
+            let id = SoundId(uuid::Uuid::from_u128(n as u128 + 1));
+            h.app.sounds.lock().unwrap().insert(
+                id,
+                SoundEntry {
+                    id,
+                    name: name.to_string(),
+                    path,
+                    playing: n == 1,
+                    volume: 1.0,
+                    looped: false,
+                    group,
+                    duration: 190.0,
+                    sample_rate: 44_100,
+                },
+            );
+            h.app.sound_order.lock().unwrap().push(id);
+        }
+        h.app
+            .library
+            .insert_sound(&gone, "Missing Thunder", 0.7, None);
+        h.app.lib_ui.missing.insert(gone);
+        h.app.lib_ui.filter.text = search.to_string();
+        if muted {
+            h.app.toggle_mute();
+        }
+
+        let height = 700.0;
+        let panel = left_panel_rect(width, height);
+        let mut last = None;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, height),
+                )),
+                ..Default::default()
+            };
+            last = Some(h.ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(panel)
+                                .layout(Layout::top_down(Align::Min)),
+                            |ui| sound_library_panel(ui, &mut h.app, panel.size()),
+                        );
+                    });
+            }));
+        }
+        let mut rights = Vec::new();
+        for clipped in &last.unwrap().shapes {
+            box_rights(&clipped.shape, &mut rights);
+        }
+        // The panel is stroked one pixel outside its fill rect.
+        (rights, panel.right() + 1.0)
+    }
+
+    #[test]
+    fn panel_draws_at_900_and_960_without_leaving_its_border() {
+        for width in [900.0_f32, 960.0] {
+            for (search, muted) in [("", false), ("ra", true)] {
+                let (rights, limit) = run_panel(width, search, muted);
+                assert!(!rights.is_empty());
+                for right in rights {
+                    assert!(
+                        right <= limit + 1.0,
+                        "width {width} search {search:?}: a box reaches {right}, limit {limit}"
+                    );
+                }
+            }
         }
     }
 }

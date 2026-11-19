@@ -187,7 +187,7 @@ pub struct SoundSharedApp {
 
     // Local sound cache (synced from audio engine)
     pub(crate) sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
-    sound_order: Arc<Mutex<Vec<SoundId>>>,
+    pub(crate) sound_order: Arc<Mutex<Vec<SoundId>>>,
 
     // Master volume cache
     pub(crate) master_volume: Arc<Mutex<f32>>,
