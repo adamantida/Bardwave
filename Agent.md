@@ -17,7 +17,7 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 ┌─────────────────────────── Bardwave ───────────────────────────┐
 │  egui console ──AudioCommand──┐                                │
 │  hotkeys ─────────────────────┴▶ Director ──Playback──▶ AudioEngine
-│  /control (--server-only): ControlAction ─▶ Board ─▶ Director   │
+│  /control: ControlAction ─▶ Board (headless) or GmBridge (console) ─▶ Director │
 │                                   scenes, emitters,    ├─ decoder / stream_source
 │                                   playlists, ducking   ├─ mixer (tracks, buses, pan,
 │                                                        │   fades, duck, limiter)
@@ -35,7 +35,7 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
                               (Web Audio API → speakers)
 ```
 
-**Key dependencies:** egui/eframe 0.30, rfd, cpal, symphonia (WAV/FLAC/MP3/OGG/AAC), rusty-opus (pure Rust Opus), tokio, axum (WebSocket), tokio-tungstenite, ebur128 (loudness), rtrb (lock-free ring buffer), zip (bundles), qrcode (GM link QR), global-hotkey, optional `midir` (feature `midi`), socket2 + roxmltree (UPnP), ureq (yt-dlp download), serde/toml/serde_json, tracing, anyhow, thiserror, uuid, crossbeam-channel, parking_lot.
+**Key dependencies:** egui/eframe 0.30, rfd, cpal, symphonia (WAV/FLAC/MP3/OGG/AAC), rusty-opus (pure Rust Opus), tokio, axum (WebSocket), tokio-tungstenite, rustls / tokio-rustls / rcgen (HTTPS), ebur128 (loudness), rtrb (lock-free ring buffer), zip (bundles), qrcode (GM link QR), global-hotkey, optional `midir` (feature `midi`), socket2 + roxmltree (UPnP), ureq (yt-dlp download), serde/toml/serde_json, tracing, anyhow, thiserror, uuid, crossbeam-channel, parking_lot.
 
 **Build requirements:** Rust 1.85+. Windows 10/11, macOS 11+ and Linux are built in CI (ubuntu, windows, macOS). Linux needs GTK 3, ALSA, xkbcommon development packages. ffmpeg (YouTube import only) is auto-downloaded on Windows; on macOS/Linux it must be installed.
 
@@ -55,11 +55,15 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 | File | Responsibility |
 |------|----------------|
 | `engine.rs` | `AudioEngine`: sound catalog, cpal output (headless fallback when no device), master volume, previews (`play_preview`, local-only), `impl Playback` |
-| `devices.rs` | Output device list (`OutputDeviceInfo`, `list_output_devices` for a worker thread), pure picking by name with fallback (`pick_output_device`, `DevicePick`), preview routing (`plan_preview_route`), `OutputSelection` read from `[audio] output_device` / `preview_device` |
+| `devices.rs` | Output device list (`OutputDeviceInfo`, `list_output_devices` for a worker thread), pure picking by name with fallback (`pick_output_device`, `DevicePick`), preview routing (`plan_preview_route`), `OutputSelection` read from `[audio] output_device` / `preview_device`; the engine reopens streams live without stopping tracks |
 | `decoder.rs` | Symphonia decoding to 48 kHz / stereo f32 (`DecodedAudio`), file probe, tags (`TrackMeta`) |
 | `stream_source.rs` | Streaming decoder for long files: worker thread + `rtrb` ring buffer, seek by generation counter, loop, `StreamEvent::TrackFinished`. Threshold `[audio] stream_threshold_secs` (default 60 s) |
 | `mixer.rs` | `AudioMixer`: pull-based mixing driven by the device callback; per-track gain with parametrised fades (equal-power or linear), pan, buses (music / ambience / sfx) with volume and ducking, master volume, limiter, local-only tracks (rendered after the broadcast copy is published, on a fixed-gain preview bus that no fader or ducking touches; a second device can render them alone via `mix_preview_into`) |
 | `director.rs` | `Director`: scenes (`ActivationPlan`: start / retune / stop with the scene's fades), snapshots to scene, stingers, delayed starts, state `watch` channel (`DirectorState`), the `Playback` trait and an in-memory `MockPlayback` for tests |
+| `director_pan.rs` | `impl Director`: per-sound and per-scene-item pan (scene override), applied at start and live |
+| `director_timeline.rs` | `impl Director`: `run_timer_action` maps every `TimerAction` onto an existing Director command |
+| `timeline.rs` | Session timers: pure `Timeline` core (`after_ms` / `every_ms`, start / pause / reset, never armed from config), `TimelineRunner` thread, `TimerEvent`s drained by the GUI |
+| `recorder.rs` | Session recording: tap of the broadcast mix, WAV writer thread (16-bit PCM or 32-bit float), header refresh every second, split near 1.8 GB, disk-space check on Unix |
 | `director_audio.rs` | `impl Director`: bus volumes, ducking (latch / hold / toggle, `[audio] duck_*`), loudness normalization (`CatalogSound::gain_db`, background measurement, `GainUpdate`) |
 | `emitter.rs` | Random / periodic sounds of the active scene: pure `Scheduler` (seeded xorshift), `EmitterRunner`, `EmitterHost` embedded in the Director |
 | `playlist.rs` | `PlaylistPlayer` (shuffle without repeats, repeat off/all/one, crossfade, seek, pause), `MusicLayer`, `PlaylistCommand`, `PlaylistState` |
@@ -71,11 +75,12 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 | File | Responsibility |
 |------|----------------|
 | `server.rs` | axum router (`build_router`, `build_router_with_control`), `NetworkServer`, `ServerHandle`, `/api/status`, embedded static files and PWA assets, request log that keeps `?k=` / `?g=` out |
-| `broadcast.rs` | `AudioBroadcaster` / `BroadcasterHandle`: client registry, listener count, format announcement, 20 ms Opus frames with `seq_no` and `server_ms` |
+| `broadcast.rs` | `AudioBroadcaster` / `BroadcasterHandle`: client registry, listener count, format announcement, 20 ms Opus frames with `seq_no` and `server_ms`; `NowPlayingFeed` (watch channel) and the throttled `now_playing` text message sent on connect and on change |
 | `opus_wire.rs` | `WireEncoder`: re-blocks any device block size into whole 960-frame packets, 64 kbit/s VBR |
 | `websocket.rs` | `/ws/audio` session: welcome, format replay, heartbeat, key-revocation close (code 4001) |
 | `access.rs` | `AccessGuard` (player key `?k=`), `GmGuard` / `GmAuth` (GM token `?g=` / Bearer, loopback rule, proxy-header rule, rate limit: 10 failures per minute, close code 4003), `generate_key`, constant-time compare |
-| `control.rs` | Headless GM panel: `Board` (library loaded into a Director), `ControlAction` / `ControlCommand`, REST `/api/control/*`, `/ws/control` (snapshots with `rev`, commands with `req` acks), `ControlFeed`, `X-Bardwave-Control` and `Origin` checks |
+| `tls.rs` | Optional HTTPS (`server.tls`): rustls over the existing listener (`serve` replaces `axum::serve`), own PEM (`tls_cert` / `tls_key`) or a self-signed certificate kept in `<data dir>/tls/` (renewed on expiry or when the LAN addresses change), SHA-256 fingerprint (`TlsInfo`, logged, shown in the console) |
+| `control.rs` | GM panel (mounted in both modes): `Board` (library loaded into a Director), `ControlAction` / `ControlCommand`, REST `/api/control/*`, `/ws/control` (snapshots with `rev`, commands with `req` acks), `ControlFeed`, `X-Bardwave-Control` and `Origin` checks; playlist commands (`playlist_*`, `/api/control/playlist/*`), bus levels and ducking in the snapshot |
 | `local_ip.rs` | LAN address choice: adapter table (`GetAdaptersAddresses` / `getifaddrs`) scored, VPN/TUN/benchmark/link-local ranges never win |
 | `upnp.rs` | Own UPnP IGD client: SSDP from every LAN address, renewal, `UpnpStatus` (incl. double NAT) |
 | `static/` | `index.html`, `app.js`, `style.css`, `opus-decoder.min.js` (listener page, reconnect back-off, link quality, Wake Lock, Media Session, per-player volume in `localStorage`, `now_playing` handler), `manifest.webmanifest` + icons (PWA), `control.html/js/css` (phone GM page) |
@@ -91,8 +96,16 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 | `scenes.rs` | scene deck, editor, save-mix flow, stinger pads, transition control, Stop scene / Stop all |
 | `music.rs` | transport bar, playlist manager, "Emitters & music" dialog |
 | `hotkeys_ui.rs` | `poll_hotkeys` once per frame, Hotkeys dialog (capture, conflicts, global switch) |
-| `settings_extras.rs` | MIX section: bus faders, DUCK button, normalization, hotkey entry |
+| `settings_extras.rs` + `settings_extras/` | MIX section: bus faders, DUCK button, normalization, interface scale slider (`gui.ui_scale`), update-check block, hotkey and Timers entries |
 | `server_panel.rs` | SERVER panel: addresses, UPnP status, access key, GM link, QR |
+| `tls_section.rs` | HTTPS switch, certificate source and fingerprint, "New certificate" |
+| `audio_settings.rs` | AUDIO OUTPUT section: output and preview device choice with status |
+| `recorder_ui.rs` | REC button, time / size readout, recordings folder |
+| `profiles_ui.rs` | Profile menu: switch (restart), new, rename, delete with typed confirmation |
+| `timeline.rs` | `TimersUi`: Timers dialog and the glue running fired timers against the Director |
+| `pan_ui.rs` | pan slider (right-click menu, scene editor rows) |
+| `onboarding.rs` | first-run "Getting started" card (pure launch / step rules, Help menu entry) |
+| `gm_bridge.rs` | console side of the phone panel: runs `ControlCommand`s in the window's frame loop and feeds `/ws/control` with the window's state |
 | `library_ui.rs` + `library_ui/` | search / tag chips, folder import, missing-file repair, bundle dialogs, preview; `logic` (pure), `state`, `tasks` (background), `ops`, `toolbar`, `dialogs` |
 
 ### 2.5 Other modules
@@ -101,6 +114,8 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 |------|----------------|
 | `src/main.rs` | entry point; `--server-only`; config load, key generation (`access_token`, `gm_token`), engine and server threads, `AudioProcessor` (engine output → broadcaster), headless loop (`Board`, `tick`, gain updates) |
 | `src/lib.rs` | library root, `VERSION` |
+| `src/profiles.rs` | campaign profiles: name validation, `--profile` parsing, create / copy / rename / delete, `recent.toml`; `paths::set_active_profile` points `config_path` and `library_dir` at `profiles/<name>/` (the log, tools and `recent.toml` stay in the root) |
+| `src/updates.rs` | opt-in update check: pure version logic, bounded `fetch_latest` against the GitHub latest release, `UpdateChecker` thread; notification only |
 | `src/config.rs` | `config.toml` schema and persistence, `ensure_ids`, `ensure_gm_token`, hotkey string normalization |
 | `src/paths.rs` | data directory: `choose_data_dir` (pure, per-OS), `data_dir()`, `config_path`, `library_dir`, `tools_dir`, `log_path` |
 | `src/hotkeys.rs`, `src/hotkeys/` | `Binding` parser, `map` (conflicts), `dispatch` (`HotkeyDispatcher` → Director), `local` (egui keys), `service` (system-wide through `global-hotkey`), `midi` (only with `--features midi`; not connected to the GUI, MIDI bindings are reported as unavailable) |
@@ -119,12 +134,14 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 * **One control core.** Console `AudioCommand`s, hotkeys and the headless `/control` panel all end in the same `Director` operations, so scenes behave identically everywhere. `Playback` is the narrow interface to the engine (and to a mock in tests).
 * **Scene activation:** `Director::activate_scene` diffs "playing now" against "scene wants" and executes start / retune / stop with the scene's `fade_in_ms` / `fade_out_ms` / `curve`; re-activating mid-transition continues from current gains. Emitters of the scene start; its playlist (music layer) starts.
 * **Ids, not paths:** scenes, playlists and hotkeys reference sound ids (UUID strings); the engine id of a loaded sound is separate (`SoundId`) and mapped in `sync_director`.
-* **Console vs headless:** the console syncs scenes **and playlists** into the Director (`sync_from_library`). The headless `Board` syncs scenes and the sound catalog only and does not call `set_playlists`, and `/ws/control` has no playlist commands, so playlists and scene music layers do not work in `--server-only`; the GM page's Music block is disabled for that reason. The GM panel is served **only** with `--server-only` (`AppState::gm_panel_served`).
+* **Console vs headless:** both sync scenes **and playlists** into the Director (the console in `sync_from_library`, the headless `Board` through `set_playlists`), so music layers and the GM page's Music block work in both. The GM panel is mounted in both modes: with `--server-only` the commands run on the main thread, in the console `GmBridge` runs them in the window's frame loop (`AppState::gm_panel_served`). Hotkeys and session timers run in the console only.
+* **Stop all:** one routine silences sounds, the active scene (delayed starts, emitters), the music layer and the headphone preview; the button, hotkey, timer action and *Fade Out* all end there.
+* **Profiles:** chosen before any path is used (`--profile` in `main.rs`); switching restarts the process with the other profile.
 * **Stream:** the engine publishes the broadcast copy of the mix (before local-only previews), `AudioProcessor` forwards it to the broadcaster, which Opus-encodes and fans it out to `/ws/audio` sessions.
 
 ### 2.7 Configuration
 
-`config.toml` lives in the data directory (see `paths.rs`). The full schema with examples is in `README.md` ("Configuration"); the source of truth is `src/config.rs`. Sections: `[server]` (`host`, `port`, `upnp`, `access_token`, `gm_token`), `[audio]` (`buffer_size` 960, `sample_rate`, `channels`, `master_volume`, `normalize`, `normalize_target_lufs`, `duck_amount`, `duck_attack_ms`, `duck_release_ms`, `duck_buses`, `stream_threshold_secs`, `output_device`, `preview_device`), `[logging]`, `[gui]` (`reduce_motion`, `global_hotkeys`), `[library]` (`groups`, `sounds`, `scenes` with `items` and `emitters`, `playlists`), top-level `[[hotkeys]]`. Every new field has a serde default; `tests/config_compat.rs` keeps v1.4.0 configs loading. A config that fails to parse stops the app (it is never replaced by defaults).
+`config.toml` lives in the data directory (see `paths.rs`). The full schema with examples is in `README.md` ("Configuration"); the source of truth is `src/config.rs`. Sections: `[server]` (`host`, `port`, `upnp`, `access_token`, `gm_token`), `[audio]` (`buffer_size` 960, `sample_rate`, `channels`, `master_volume`, `normalize`, `normalize_target_lufs`, `duck_amount`, `duck_attack_ms`, `duck_release_ms`, `duck_buses`, `stream_threshold_secs`, `output_device`, `preview_device`), `[logging]`, `[server]` also has `tls`, `tls_cert`, `tls_key`; `[gui]` (`reduce_motion`, `global_hotkeys`, `recordings_dir`, `record_float32`, `check_updates`, `last_update_check`, `ui_scale` 0.8 to 1.6, `onboarding_done`), `[library]` (`groups`, `sounds`, `scenes` with `items` and `emitters`, `playlists`; `pan` on sounds and scene items), top-level `[[hotkeys]]` and `[[timers]]` (`trigger = { after_ms | every_ms }`, `action = { kind = … }`, `enabled`). Every new field has a serde default; `tests/config_compat.rs` keeps v1.4.0 configs loading. A config that fails to parse stops the app (it is never replaced by defaults).
 
 ### 2.8 Audio pipeline
 
@@ -142,15 +159,15 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 | 4 | 4 bytes | `server_ms` — u32 LE, stream time since broadcaster start |
 | 8 | variable | Opus packet (one 20 ms frame) |
 
-Text messages: `{"type":"welcome",…}`, `{"type":"format","data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":960}}` (first frame, replayed to late joiners), `ping` / `pong`. The listener page also handles `{"type":"now_playing","scene":…,"track":…}`; **the server does not send it yet**. Clients ignore unknown types.
+Text messages: `{"type":"welcome",…}`, `{"type":"format","data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":960}}` (first frame, replayed to late joiners), `ping` / `pong`. The server sends `{"type":"now_playing","scene":…|null,"track":…|null}` on connect and when the scene or track changes (throttled); the listener page shows it. With `server.tls` the same paths are served as `wss://`. Clients ignore unknown types.
 
 **`/ws/control?g=<token>`:** JSON text frames ≤ 4096 bytes. Server → client: `snapshot{rev,state}`, `ack{req}`, `error{req,message}`, `pong`. Client → server: `ping`, `state`, `play`, `stop`, `volume`, `loop`, `master`, `stop_all{fade_ms?}`, `scene`, `stop_scene`, `stinger`, `duck`, `bus`. At most 16 clients, 100 commands per second each. Details: the module docs of `control.rs`.
 
 ### 2.10 Inter-component commands
 
-* **`AudioCommand`** (GUI → engine/Director, each with a one-slot reply channel that is never awaited on the render thread): load / play / stop / volume / loop / master / remove sound, `StopAll`, `StopAllFade`, `ActivateScene`, `StopScene`, `SnapshotScene`, `PlayStinger`, `Playlist*` (next, prev, seek, pause, resume, shuffle, repeat…), `SetBusVolume`, `Duck`, `DuckRelease`, `DuckHold`, normalization switch.
+* **`AudioCommand`** (GUI → engine/Director, each with a one-slot reply channel that is never awaited on the render thread): load / play / stop / volume / loop / master / remove sound, `StopAll`, `StopAllFade`, `ActivateScene`, `StopScene`, `SnapshotScene`, `PlayStinger`, `Playlist*` (next, prev, seek, pause, resume, shuffle, repeat…), `SetBusVolume`, `Duck`, `DuckRelease`, `DuckHold`, normalization switch. Device choice and recording are driven directly by the console (`audio_settings.rs`, `recorder_ui.rs`) against the engine and the recorder tap, not through `AudioCommand`.
 * **`ServerCommand`** (GUI → server thread): `Start`, `Stop`, `SetBind { host, port }`, `GetStatus`.
-* **`ControlAction`** (HTTP → main thread, headless): `List`, `Play`, `Stop`, `StopAll`, `StopAllFade`, `SetVolume`, `SetLoop`, `SetMaster`, `ActivateScene`, `StopScene`, `PlayStinger`, `Duck`, `Mix`.
+* **`ControlAction`** (HTTP → main thread, headless; the console receives the same `ControlCommand`s through `GmBridge`): `List`, `Play`, `Stop`, `StopAll`, `StopAllFade`, `SetVolume`, `SetLoop`, `SetMaster`, `ActivateScene`, `StopScene`, `PlayStinger`, `Duck`, `Mix`.
 * **`ServerStatus`**: `running`, `address`, `listener_count`.
 
 ---
@@ -243,15 +260,16 @@ Bardwave/
 ├── .github/workflows/           # ci, release, release-extras, release-macos
 ├── tests/                       # integration tests (see 2.5)
 └── src/
-    ├── main.rs, lib.rs, config.rs, error.rs, paths.rs
+    ├── main.rs, lib.rs, config.rs, error.rs, paths.rs, profiles.rs, updates.rs
     ├── hotkeys.rs, hotkeys/{dispatch,local,map,midi,service,testing}.rs
     ├── library_scan.rs, library_query.rs, library_bundle.rs
-    ├── audio/{decoder,stream_source,engine,mixer,director,director_audio,emitter,playlist,loudness,youtube}.rs
-    ├── network/{server,broadcast,opus_wire,websocket,access,control,local_ip,upnp}.rs
+    ├── audio/{decoder,devices,stream_source,engine,mixer,director,director_audio,director_pan,director_timeline,emitter,playlist,timeline,recorder,loudness,youtube}.rs
+    ├── network/{server,broadcast,opus_wire,websocket,access,control,tls,local_ip,upnp}.rs
     │   └── static/              # index.html, app.js, style.css, opus-decoder.min.js, manifest.webmanifest,
     │                            # icons, control.html/js/css
-    └── gui/{app,types,groups,sound_list,top_bar,dialog,widgets,theme,motion,scenes,music,
-             hotkeys_ui,settings_extras,server_panel,library_ui}.rs, gui/library_ui/{logic,state,tasks,ops,toolbar,dialogs}.rs
+    └── gui/{app,types,groups,sound_list,top_bar,dialog,widgets,theme,motion,scenes,music,hotkeys_ui,
+             settings_extras,server_panel,library_ui,audio_settings,recorder_ui,profiles_ui,timeline,pan_ui,
+             onboarding,tls_section,gm_bridge}.rs, gui/library_ui/{logic,state,tasks,ops,toolbar,dialogs}.rs
 ```
 
 ---
@@ -266,7 +284,7 @@ Bardwave/
 | Test | `cargo test --all-targets --locked` | All tests must pass |
 | Build | `cargo build --release` | Must compile cleanly |
 
-CI runs these on ubuntu, windows and macOS. **Not verified on real hardware:** the Windows and Linux installers, the macOS app and global hotkeys on macOS, MIDI (details in `README.md`).
+CI runs these on ubuntu, windows and macOS. **Not verified on real hardware:** the Windows and Linux installers, the macOS app and global hotkeys on macOS, MIDI, audio-device switching on Windows and Linux, HTTPS with real phones (details in `README.md`). **Not done:** a light theme (the palette is constants in `gui/theme.rs`), per-bus volume for players (one shared stream), README screenshots (no screen-recording permission when the docs were written).
 
 ---
 
@@ -286,3 +304,4 @@ CI runs these on ubuntu, windows and macOS. **Not verified on real hardware:** t
 |---------|------|---------|
 | 1.0 | Initial | Agent team documentation for Bardwave |
 | 2.0 | 2026-11 | Rewritten from the code: scenes, Director, buses, playlists and streaming, hotkeys, GM panel, library tools, data directory, packaging; removed stale team roles and pre-existing-issues list that belonged to another project |
+| 3.0 | 2026-11 | Added from the code: Stop all, timers, pan, audio devices and headphone preview, WAV recording, profiles, HTTPS, update check, first-run wizard, interface scale, GM panel in the console and playlists / buses in it, `now_playing`; corrected the headless and `now_playing` statements |

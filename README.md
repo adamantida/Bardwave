@@ -17,7 +17,7 @@ No subscriptions, no accounts, no cloud. A self-hosted alternative to Syrinscape
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-3b3b3b.svg?style=flat-square&logo=windows&logoColor=white)](#requirements)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-a04a4a.svg?style=flat-square)](#contributing)
 
-[Why](#why) · [Features](#features) · [Getting started](#getting-started) · [Game-master panel](#game-master-panel-phone) · [Configuration](#configuration) · [Security](#security-and-tokens) · [How it works](#how-it-works) · [Not verified](#not-verified-on-real-hardware) · [Roadmap](#roadmap)
+[Why](#why) · [Features](#features) · [Getting started](#getting-started) · [Game-master panel](#game-master-panel-phone) · [Profiles](#profiles-several-campaigns) · [HTTPS](#https) · [Configuration](#configuration) · [Security](#security-and-tokens) · [How it works](#how-it-works) · [Not verified](#not-verified-on-real-hardware) · [Roadmap](#roadmap)
 
 </div>
 
@@ -47,8 +47,17 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 - **Crossfade between scenes**: the scene's `fade_in_ms` / `fade_out_ms` and an equal-power (sin/cos) or linear curve. Switching again in the middle of a transition continues from the current levels instead of jumping. A scene can leave other sounds playing (`stop_others = false`).
 - **Save current mix as scene**: play things by hand, press one button, get a scene.
 - A shared **transition control** over the scene deck (*Auto* = each scene's own fades), **Stop scene** and **Stop all** (with a fade).
+- **Stop all** (the top-bar button that used to be called *Panic*) silences everything at once: sounds, the active scene with its delayed starts and emitters, the music layer and the headphone preview. It is also a hotkey action, a timer action and the *Fade Out* button, and every route stops the preview too. The button is dimmed, but still clickable, while nothing is playing.
 - **Stingers**: sounds marked as stingers are one-shots layered over everything; they do not depend on the active scene and are spared by scene changes. Pads for them sit under the scene deck.
-- **Emitters** inside a scene: random or periodic sounds ("crows every 20–60 s"), with a random pick from a set, volume and stereo-position jitter and a maximum overlap. The deck shows when the next sound is due. Per-sound **pan** exists in the mixer.
+- **Emitters** inside a scene: random or periodic sounds ("crows every 20–60 s"), with a random pick from a set, volume and stereo-position jitter and a maximum overlap. The deck shows when the next sound is due. Per-sound **pan** exists in the mixer and is set in the UI (see below).
+
+### Pan
+
+A centred slider (a notch at zero, double click resets, a tooltip such as `L 40%`) sits in the right-click menu of a sound and in every row of the scene editor. The value (`pan`, `-1.0..=1.0`, default `0`) is stored per library sound and per scene item; a non-zero item value overrides the sound's own pan inside that scene. It is applied when the sound starts and live while it plays.
+
+### Timers
+
+Session timers (`[[timers]]`) fire an action by themselves: "activate the Alarm scene in ten minutes", "play the bell stinger every half hour". A timer has a trigger (`after_ms` once, or `every_ms` repeatedly, at least 100 ms) and an action: activate a scene, stop the scene, play a stinger, stop all with a fade, start or stop a playlist, next track, pause or resume the music. The **Timers** dialog (button under the mix controls) starts, pauses and resets them, shows countdowns with the nearest one highlighted, and keeps a log of what fired, including timers that point at a deleted scene, sound or playlist (a warning, never an error). Only the definitions are saved: **timers always start stopped**. Timers run in the console window only, not with `--server-only`.
 
 ### Music
 
@@ -68,13 +77,21 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 - Work while the console window is focused. **System-wide** shortcuts (window in the background) are an opt-in setting, `gui.global_hotkeys`.
 - A dialog captures a key ("press a combination") and shows conflicts and broken bindings. See [Hotkeys](#hotkeys-1) below.
 
+### Audio output and headphones
+
+The **AUDIO OUTPUT** section of the console chooses the sound card that plays the mix (`[audio] output_device`) and, separately, a card for previews (`[audio] preview_device`, for example your headphones while the room hears the mix). Switching needs no restart: the streams reopen, tracks keep playing, and a device that has disappeared falls back to the system default with a message. Without a preview device, previews go to the main output. The stream sent to the players is never affected. See [Not verified](#not-verified-on-real-hardware) for the platforms this was run on.
+
+### Session recording (WAV)
+
+The **REC** button in the top bar records the mix the players hear to a WAV file (48 kHz stereo, 16-bit PCM, or 32-bit float with `gui.record_float32 = true`) and shows time and size. Files are named `bardwave-YYYYMMDD-HHMMSS.wav` (UTC) and go to `recordings/` in the data directory, or to the folder chosen with the folder button (`gui.recordings_dir`). The header is refreshed every second, so a file left by a crash still plays; a long session continues in `_part2.wav`, ... close to 1.8 GB (a warning appears at 1.5 GB), starting is refused when the disk is known to be nearly full (Unix check only), and frames dropped by a slow disk are counted and reported.
+
 ### Library
 
 - **Tags and search**: free-text search over name, file name and tags (case-insensitive, all of Unicode), tag chips, combined with the group filter.
 - **Import a folder**: recursive scan, one group per first-level sub-folder on request, duplicates skipped by path and by content.
 - **Missing files** are marked instead of silently dropped, with a relink button and a bulk "replace path prefix".
 - **Bundles**: export the library (groups, sounds with volumes and tags, scenes, playlists — optionally the audio files) to one `.zip` with `bundle.toml`; import with an explicit policy for name/id/path conflicts (skip, keep both, replace) and a dry-run report. Ids are preserved so scenes keep pointing at the right sounds. Hotkeys are a console setting and are not part of a bundle.
-- **Preview** (headphones button): plays a sound on this computer only; it never reaches the players' stream.
+- **Preview** (headphones button): plays a sound on this computer only; it never reaches the players' stream. It has its own fixed-gain bus, so the faders and ducking do not change it.
 - WAV, FLAC, MP3, OGG-Vorbis and AAC/MP4 via [Symphonia](https://github.com/pdeljanov/Symphonia).
 - **YouTube links**: paste a video/music URL — yt-dlp (and, on Windows, ffmpeg) download themselves on first use, the audio is saved once into the data directory and plays like any local file. See [Sounds from YouTube](#sounds-from-youtube).
 - Sounds have stable ids; scenes, playlists and hotkeys refer to ids, not paths, so moving a file does not break them. A `config.toml` from v1.4.0 loads without changes and gets ids on first load.
@@ -84,13 +101,22 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 - WebSocket broadcast of the **final mix** — players hear what the GM hears — as 20 ms **Opus** frames (~64 kbit/s VBR).
 - The listener page is **embedded in the binary**. It reconnects on its own (exponential back-off with jitter), shows a **link-quality** readout (latency, buffer, lost packets) with a hint when the network is weak, keeps the phone awake (**Wake Lock**), integrates with the lock-screen controls (**Media Session**), remembers the player's own volume, and is an installable **PWA** (manifest and icons; no service worker, the stream needs none).
 - **Access key** in the shared link, **live listener counter** in the console, automatic LAN address detection that ignores VPN/TUN adapters, optional UPnP port forwarding for remote players.
-- The page also understands a `now_playing` text message (scene / track name). The server sends it on connect and whenever the scene or track changes.
+- **Now playing** on the player page: the server sends a `now_playing` text message (active scene and current track name) on connect and whenever either changes, throttled, and the page shows both lines. Clients that do not know the message ignore it.
+- Optional **HTTPS** on the same port, see [HTTPS](#https).
 
 ### Phone control panel
 
-- A mobile page, `/control`, with scene buttons, stinger pads, per-sound faders, master volume, bus faders, *Duck*, *Stop scene* and *Stop all*, live through a WebSocket (several devices see the same state).
+- A mobile page, `/control`, with scene buttons, stinger pads, per-sound faders, master volume, **bus faders with the real bus levels and ducking state**, *Duck*, *Stop scene* and *Stop all*, and a **Music block** (the playlists: start, pause, next/previous, seek, shuffle, repeat), live through a WebSocket (several devices see the same state).
 - Has its **own token** (`gm_token`) that is never the player key. The console shows the link with a **QR code**.
-- Served both by the console window (while the server is started) and by `--server-only`; the Music block drives the playlists in both. See [Game-master panel](#game-master-panel-phone).
+- Served both by the console window (while the server is started; the **master panel now works in the windowed mode**, not only headless) and by `--server-only`; the playlists work in both. See [Game-master panel](#game-master-panel-phone).
+
+### Console conveniences
+
+- **Getting started** wizard: on the first run with an empty library a small card (it does not block the window) walks through three steps: add sounds, save a mix as a scene, start the server and share the link. Each step is ticked by the real state of the app. It can be reopened from the **Help** menu; `gui.onboarding_done` records that it is finished (set automatically when the config already has a library).
+- **Interface scale**: the *Interface* slider in the MIX section, or `gui.ui_scale` (0.8 to 1.6, default 1.0), is applied live. Dialogs are sized to fit the minimum window.
+- **Update check** (off by default): the **Check for updates** button asks GitHub for the latest release and shows a link; nothing is downloaded or installed. With `gui.check_updates = true` the check also runs once a day at start. A stock install makes no network request on its own.
+- **Profiles**: one campaign per profile, see [Profiles](#profiles-several-campaigns).
+- Only the dark theme exists. There is no light theme: the palette is a set of constants, and a light theme needs a separate rework.
 
 ### Engineering
 
@@ -181,6 +207,18 @@ Each campaign can have its own `config.toml` and library. The **default profile*
 - Start a profile from the command line: `soundshared --profile "Curse of Strahd"` (`--profile default` is the default profile). Names are letters, digits, spaces, `-` and `_`, up to 32 characters.
 - In the console, the **Profile** menu in the top bar lists the recent profiles, switches (Bardwave saves, closes and starts again with the other profile), creates a profile (optionally copying the current library), renames and deletes other profiles, and opens the data folder. Deleting a profile that is not empty asks you to type its name; there is no trash.
 - Only one profile runs at a time, so two profiles may use the same server port.
+- `--profile` works together with `--server-only`.
+
+### HTTPS
+
+By default the link is plain HTTP and WebSocket: fine on a LAN. For players or a phone panel across the internet set `server.tls = true` (or tick **HTTPS (ENCRYPTED LINK)** in the console while the server is stopped; it is applied on the next Start). The same port then speaks HTTPS and `wss://`, there is no redirect, and the links the console copies start with `https://`.
+
+- **Self-signed (default):** with no files given, Bardwave generates a certificate once and keeps it in `tls/` of the data directory (`cert.pem`, `key.pem`, `meta.json`; the key is mode 0600 on Unix). It covers this machine's LAN addresses, is valid 397 days, and is renewed when it is about to expire or when the machine moves to a network it does not cover. **New certificate** in the console replaces it; phones will ask to trust it again.
+- **Your own certificate:** set `tls_cert` and `tls_key` to PEM files (for example from Let's Encrypt or Caddy) and they are used as they are.
+- **Fingerprint:** the console shows the SHA-256 fingerprint of the certificate in use (click to copy) and it is written to the log. A browser or phone shows a warning for a self-signed certificate: compare the fingerprint with the one the warning shows, then continue.
+- The listener page and the phone panel keep working over `https://`; keys stay in the URL, so the HTTPS link is still a secret.
+
+Not covered by real-device tests: see [Not verified](#not-verified-on-real-hardware).
 
 ### Connect your players
 
@@ -204,7 +242,7 @@ On **Start** the console asks your router to forward the port to this PC (UPnP I
 - **Windows firewall:** Windows marks many networks as *Public*, and the "allow access" prompt only opens *Private* ones by default. If the panel says *Firewall: port not opened*, allow Bardwave for public networks too (or run it once as administrator so it can add the rule itself). The installer can add the rule for you.
 - Opening the internet URL from inside your own network may fail on routers without NAT loopback. Test it from a phone on mobile data.
 - Set `upnp = false` in `config.toml` to turn this off.
-- The stream travels over plain HTTP/WebSocket (no TLS). See [Security and tokens](#security-and-tokens).
+- The stream travels over plain HTTP/WebSocket unless you turn on [HTTPS](#https). See [Security and tokens](#security-and-tokens).
 
 ### Game-master panel (phone)
 
@@ -214,7 +252,7 @@ On **Start** the console asks your router to forward the port to this PC (UPnP I
 Bardwave.exe --server-only        # soundshared --server-only from a source build
 ```
 
-Runs without the console window, for a spare PC next to the router or a session you drive from a phone-sized screen. The saved library (`[library]` in `config.toml`, i.e. whatever you set up in the console) is loaded at start, the listener server starts at once, and the log shows both links:
+Runs without the console window, for a spare PC next to the router or a session you drive from a phone-sized screen. `--profile <name>` and `server.tls` apply here too. The saved library (`[library]` in `config.toml`, i.e. whatever you set up in the console) is loaded at start, the listener server starts at once, and the log shows both links:
 
 - the **player link** (with the access key) to share, as in the console;
 - a **control page**, `http://127.0.0.1:<port>/control`, on this PC.
@@ -259,6 +297,9 @@ Every link the console copies ends with `/?k=<key>`: the stream (and `/api/statu
 host = "0.0.0.0"   # bind address; "0.0.0.0" = all IPv4 interfaces
 port = 8080
 upnp = true        # ask the router to forward the port for players outside the LAN
+tls = false        # true: HTTPS/wss on the same port (applied on the next Start)
+# tls_cert = "/etc/ssl/bardwave/fullchain.pem"  # your own PEM chain; both set = used as is
+# tls_key = "/etc/ssl/bardwave/privkey.pem"     # unset = a self-signed certificate in <data dir>/tls/
 access_token = "…" # key players need in the link (/?k=…); generated on first start, "" = open
 gm_token = "…"     # key for the control page from another device (/control?g=…); generated on first start, "" = this PC only
 
@@ -285,6 +326,10 @@ file_logging = false # true: also write bardwave.log into the data directory
 reduce_motion = false    # stop the pulsing dot and backdrop animation
 global_hotkeys = false   # let [[hotkeys]] fire while the window is not focused
 check_updates = false    # once a day at start, ask GitHub for a newer release (off = no network use)
+ui_scale = 1.0           # interface scale, 0.8 to 1.6, applied live
+onboarding_done = false  # the first-run "Getting started" card; set by the app
+# recordings_dir = "/home/me/bardwave-recordings"  # REC folder; default <data dir>/recordings
+record_float32 = false   # true: 32-bit float WAV instead of 16-bit PCM
 
 [library]              # managed by the app — your sounds, groups, scenes, playlists
 ```
@@ -307,6 +352,7 @@ tags = ["tavern", "warm"]
 gain_db = 0.0            # fixed correction written by normalization
 bus = "ambience"         # music | ambience | sfx
 oneshot_stinger = false  # true: one-shot over everything, independent of scenes
+pan = 0.0                # -1.0 (left) .. 1.0 (right); not written when centred
 
 [[library.scenes]]
 id = "…"
@@ -324,6 +370,7 @@ volume = 0.4             # level inside this scene
 looped = true
 start = "on_enter"       # on_enter | manual
 delay_ms = 0
+pan = 0.0                # non-zero overrides the sound's pan inside this scene
 
 [[library.scenes.emitters]]
 sounds = ["…", "…"]      # one is picked at random each time
@@ -342,6 +389,15 @@ shuffle = false
 repeat = "all"           # off | all | one
 crossfade_ms = 2000
 bus = "music"
+
+[[timers]]               # top-level; definitions only, timers always start stopped
+id = "…"
+name = "Alarm in ten minutes"
+trigger = { after_ms = 600000 }       # or { every_ms = 1800000 }
+action = { kind = "activate_scene", scene = "…" }
+# other actions: stop_scene | play_stinger (sound) | stop_all (fade_ms) | start_playlist (playlist) |
+#                stop_playlist | next_track | pause_music | resume_music
+enabled = true
 
 [[hotkeys]]              # top-level, not part of a bundle
 key = "Ctrl+1"
@@ -373,7 +429,7 @@ Bardwave has two separate secrets in `config.toml`. Both are random 16-character
 - The player key never opens the GM panel, and the GM key is not a player key.
 - Token comparison is constant-time. After 10 failed GM attempts within a minute an address gets `429` and is locked out (even a right token is refused meanwhile); a wrong, missing or disabled token all look the same (`401`).
 - A request from this PC needs no token — but "this PC" is decided from the socket address, never from `X-Forwarded-For`; a request carrying reverse-proxy headers or a non-loopback `Host` is treated as remote and needs the token. Local actions also need an `X-Bardwave-Control` header, and a local WebSocket handshake with a foreign `Origin` is refused, so a web page open in your browser cannot press your buttons.
-- **No HTTPS.** Everything, tokens included, is plain HTTP/WebSocket. That is fine on your LAN. Over the internet a `?k=` or `?g=` link can be sniffed on the way: do not hand the GM link to anything outside your network, and prefer a VPN or a trusted tunnel for remote GM access. A plain TCP tunnel (`ssh -R`, bore, frp…) or a proxy that rewrites `Host` to `127.0.0.1` cannot be told from your own browser, so with such a tunnel keep a `gm_token` set and point it at the listener port only.
+- **HTTPS is optional and off by default** (`server.tls`, see [HTTPS](#https)). Without it everything, tokens included, is plain HTTP/WebSocket. That is fine on your LAN. Over the internet a `?k=` or `?g=` link can be sniffed on the way: turn HTTPS on, or use a VPN or a trusted tunnel, and do not hand the GM link to anything outside your network. A plain TCP tunnel (`ssh -R`, bore, frp…) or a proxy that rewrites `Host` to `127.0.0.1` cannot be told from your own browser, so with such a tunnel keep a `gm_token` set and point it at the listener port only.
 - Both keys are kept out of the request log (only the method and path are logged), and the headless log prints `…?g=<gm_token from config.toml>` instead of the key.
 - `config.toml` holds the keys in plain text. It is yours to protect.
 
@@ -402,11 +458,11 @@ Bardwave has two separate secrets in `config.toml`. Both are random 16-character
                                     (Web Audio API ring buffer → speakers)
 ```
 
-- `src/audio` — decoding (in memory or streamed), mixing, resampling, device output, the `Director` (scenes, crossfade, stingers), emitters, playlists, ducking, loudness, YouTube import.
+- `src/audio` — decoding (in memory or streamed), mixing, resampling, device output and selection, the `Director` (scenes, crossfade, stingers, pan), emitters, playlists, timers (`timeline.rs`), the WAV recorder, ducking, loudness, YouTube import.
 - `src/network` — axum server, WebSocket sessions, broadcaster and Opus encoder, embedded listener page and PWA assets, local-IP detection, UPnP, access keys, the GM panel (`control.rs` and its page).
-- `src/gui` — the console: theme, sound list, groups, scenes, music, hotkeys dialog, library UI, server panel, MIX section.
+- `src/gui` — the console: theme, sound list, groups, scenes, music, timers dialog, hotkeys dialog, library UI, server panel, MIX section, audio output, REC, profiles menu, HTTPS block, first-run wizard.
 - `src/hotkeys*` — key parsing, conflicts, dispatch, window and system-wide shortcuts, optional MIDI.
-- `src/library_*` — folder scan, composite search, bundles. `src/config.rs` — `config.toml` schema. `src/paths.rs` — data directory.
+- `src/library_*` — folder scan, composite search, bundles. `src/config.rs` — `config.toml` schema. `src/paths.rs` — data directory. `src/profiles.rs` — campaign profiles. `src/updates.rs` — the opt-in update check. `src/network/tls.rs` — HTTPS.
 
 [Agent.md](Agent.md) describes the modules and the control flow in more detail.
 
@@ -474,6 +530,18 @@ This is an honest list of what the code and the CI cover on paper, but nobody ha
 - **macOS**: the `.app`/`.dmg` scripts, the universal build and the local-network prompt have not been checked on a Mac; signing and notarization have never been run (they need a paid Apple Developer account). **Global (system-wide) hotkeys on macOS** are unverified: the registration is main-thread-bound and the permission the OS may ask for is only described, not tested.
 - **MIDI**: the module decodes MIDI bytes and is covered by unit tests, and CI only checks that it compiles. It is off by default, not connected to the console, and has never seen a real controller.
 - Global hotkeys on Windows and Linux/X11, the data-directory choice on each OS, UPnP against different routers, and the listener page on iOS Safari and Android Chrome (Wake Lock, Media Session, home-screen install) are likewise only covered by unit tests and code review, not by hands-on sessions.
+- **Audio devices:** choosing the output and the headphone device and the second output stream were run on macOS only; device names and enumeration on Windows (WASAPI) and Linux (ALSA/JACK) are unchecked.
+- **HTTPS:** covered by automated tests (handshake, certificate renewal), but a self-signed certificate has not been trusted on a real iPhone or Android phone, and a custom certificate has not been tried with a real Let's Encrypt chain.
+- **Session recording:** the free-disk-space check is Unix only; long-file splitting and the 1.8 GB limits are tested with small stand-ins, not with a real multi-hour session.
+- **Profiles, update check, first-run wizard, interface scale:** unit-tested and run on macOS during development; not exercised on Windows or Linux. The update check has not been run against a published release (the repository has none yet).
+
+### Not done
+
+- **No screenshots in this README yet.** The window could not be captured in the environment where the documentation was written (no screen-recording permission), so no image is included instead of one that shows the wrong thing.
+- **No light theme.** The palette is defined as constants in `src/gui/theme.rs`; a light theme needs a separate rework, not a switch.
+- **No separate bus volume for players.** The listeners get one mixed stream, so a player cannot turn only the music down; only the GM's own faders (which change the mix for everyone) exist. Per-bus player faders would need separate streams.
+- **Headless mode** (`--server-only`) has no hotkeys and no timers.
+- **Loudness normalization** skips streamed (long) files, and a positive `gain_db` is audible only while the sound's own volume is below 1.0.
 
 If you try any of these, a bug report with the OS version is very welcome.
 
@@ -489,8 +557,11 @@ Honest list of what is **not** done yet:
 - [x] Packaging scripts and workflows: Windows installer, AppImage and `.deb`, macOS `.app`/`.dmg`
 - [ ] Verify the installers, the macOS app, global hotkeys on macOS and MIDI on real hardware (above)
 - [ ] Wire the MIDI module into the console (devices, learn mode)
-- [ ] HTTPS or another encrypted path for remote GM access
-- [ ] Update check through the GitHub API, screenshots and a short demo GIF in this README, a FAQ (firewall, VPN, UPnP)
+- [x] HTTPS on the same port (self-signed or your own certificate), opt-in update check, session recording, profiles, timers, pan, audio device selection, first-run wizard, interface scale
+- [ ] Verify HTTPS with real phones and the audio-device switching on Windows and Linux
+- [ ] Screenshots and a short demo GIF in this README (not captured yet), a FAQ (firewall, VPN, UPnP)
+- [ ] A light theme
+- [ ] Separate bus volume for players (needs separate streams)
 - [ ] Code-signed Windows build and a signed/notarized macOS build (needs certificates)
 
 Ideas, bug reports and pull requests are welcome.

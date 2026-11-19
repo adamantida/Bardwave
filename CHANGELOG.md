@@ -13,12 +13,22 @@ Read this before relying on the items below. They are implemented and covered by
 - **Windows installer** (Inno Setup) and **Linux packages** (AppImage, `.deb`): CI smoke tests only; the release workflows have not been confirmed by a real release run, and nobody has installed and used the results on a real Windows or Linux desktop.
 - **macOS**: the `.app` / `.dmg` scripts, the universal binary and the local-network prompt are unchecked on a Mac; signing and notarization have never been run. **Global (system-wide) hotkeys on macOS** are unverified.
 - **MIDI**: the module is unit-tested on raw bytes and only compiled in CI (`--features midi`); it is off by default, **not connected to the console**, and has never been used with a controller.
+- **Audio devices:** choosing the output and the headphone device was run on macOS only; names and enumeration on Windows (WASAPI) and Linux (ALSA/JACK) are unchecked.
+- **HTTPS:** tested by automated handshake and renewal tests only; a self-signed certificate has not been trusted on a real iPhone or Android phone, and a custom certificate has not been tried with a real Let's Encrypt chain.
+- **Update check:** never run against a published release (none is published from this branch). **Profiles, the first-run wizard, the interface scale and the WAV recorder** were run on macOS during development, not on Windows or Linux; the recorder's free-disk check is Unix only.
 - Also only tested by code and unit tests, not in live sessions: global hotkeys on Windows and Linux/X11, the data-directory choice on every OS, UPnP against real routers, the listener page on iOS Safari and Android Chrome (Wake Lock, Media Session, home-screen install).
+
+### Not done
+
+- **No screenshots in the README.** They could not be captured in the environment where the documentation was written (no screen-recording permission), so none was added rather than one showing the wrong thing.
+- **No light theme.** The palette is constants in `src/gui/theme.rs`; a light theme needs a separate rework.
+- **No separate bus volume for players.** The listeners get a single mixed stream, so per-bus faders for players are impossible without separate streams; only the GM's faders exist.
+- MIDI is still not wired into the console (see above).
 
 ### Known limitations
 
 - In `--server-only` mode hotkeys and session timers (`[[timers]]`) do not run.
-- No HTTPS: the player key (`?k=`) and the GM key (`?g=`) travel in plain HTTP. Use a LAN, a VPN or a trusted tunnel for anything beyond that.
+- HTTPS is **off by default** (`server.tls`): until it is turned on, the player key (`?k=`) and the GM key (`?g=`) travel in plain HTTP. Use a LAN, HTTPS, a VPN or a trusted tunnel for anything beyond that.
 - Loudness normalization skips streamed (long) files; a positive `gain_db` is audible only while the sound's own volume is below 1.0.
 
 ### Added
@@ -54,6 +64,24 @@ Read this before relying on the items below. They are implemented and covered by
 - Streaming decoder for long files (`[audio] stream_threshold_secs`, default 60 s): ring buffer fed by a worker thread, so an hour-long track no longer takes ~1.4 GB of RAM. Seeking and looping supported.
 - Buses (`music`, `ambience`, `sfx`) with faders, and ducking (`[audio] duck_amount`, `duck_attack_ms`, `duck_release_ms`, `duck_buses`) from a DUCK button (click to latch, hold to duck while pressed), hotkeys and the phone panel.
 - Loudness normalization (EBU R128, `[audio] normalize`, `normalize_target_lufs`, per-sound `gain_db`): off by default, measured in the background.
+
+**HTTPS**
+- `[server] tls = true` serves HTTPS and `wss://` on the same port (rustls); links the console copies start with `https://`. Without `tls_cert` / `tls_key` a self-signed certificate is generated into `tls/` of the data directory (397 days, covers the LAN addresses, renewed on expiry or on a network change, key mode 0600 on Unix); `tls_cert` and `tls_key` point at your own PEM files. The SHA-256 fingerprint is shown in the console (click to copy) and logged, with a "New certificate" button. A switch in the console is applied on the next Start. Off by default.
+
+**Update check**
+- *Check for updates* button asks the GitHub latest-release document and shows a link; nothing is downloaded or installed. `[gui] check_updates = true` repeats the check once a day at start. **Off by default**: a stock install makes no network request on its own.
+
+**Console**
+- First-run *Getting started* wizard (3 steps ticked by the real state of the app, a non-blocking card, reopened from the Help menu, `gui.onboarding_done`).
+- Interface scale: the *Interface* slider in the MIX section and `[gui] ui_scale` (0.8 to 1.6, applied live).
+- **Stop all** is the new name of the *Panic* button. It stops sounds, the active scene (delayed starts, emitters), the music layer and the headphone preview, whether it is pressed, bound to a hotkey, fired by a timer or reached through *Fade Out*.
+- Spacing scale, empty states, a scene warning badge, and dialogs that fit the minimum window.
+
+**Listener page**
+- `now_playing`: the server sends the active scene and track name on connect and on every change (throttled) and the page shows them.
+
+**Game-master panel in the console**
+- The console window serves `/control` while the server is started (previously only `--server-only` did), through `gui::gm_bridge`; the phone panel also got the music playlist block and the real bus levels and ducking state, in both modes. Hotkeys and timers still run in the console only.
 
 **Hotkeys**
 - `[[hotkeys]]` bindings for sounds, scenes, playlists, stop, master volume, mute, duck (toggle/hold), next/previous track, pause music; a dialog with key capture and conflict detection.
@@ -98,6 +126,7 @@ Read this before relying on the items below. They are implemented and covered by
 
 ### Documentation
 
+- README and `Agent.md` brought up to date with Stop all, timers, pan, audio devices and the headphone output, session recording, profiles (`--profile`), HTTPS and the fingerprint, the opt-in update check, the first-run wizard, `gui.ui_scale`, the master panel in the windowed mode with playlists and buses, `now_playing`, and a `config.toml` reference with examples; the lists of what is not done and not verified are in this file and in the README.
 - README rewritten from the code: features, configuration with the new sections, data directory per OS, macOS notes, packaging, token security, roadmap, and the list of what is not verified on real hardware. `Agent.md` describes the modules and the control flow; this changelog is new.
 - Corrected two stale numbers: the stream uses **20 ms** Opus frames (960 samples per channel) and the default `buffer_size` is **960**, not 10 ms / 480 (the code already had it at v1.4.0).
 
