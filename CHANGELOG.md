@@ -33,6 +33,10 @@ Read this before relying on the items below. They are implemented and covered by
 - The `Director`: one control core used by the console, the headless server, hotkeys and the phone panel.
 - Stable sound ids (UUIDs); scenes, playlists and hotkeys refer to ids, not paths. Configs from v1.4.0 load unchanged and get ids on first load.
 
+**Timers**
+- Session timers (`[[timers]]`: `id`, `name`, `trigger = { after_ms | every_ms }`, `action`, `enabled`): "in ten minutes activate the Alarm scene", "every half hour play the bell stinger". Actions: activate scene, stop scene, play stinger, stop all with a fade, start/stop playlist, next track, pause/resume music. Only the definitions are saved; timers always start stopped.
+- Timers dialog (button under the mix controls): countdowns, Start / Pause timers / Reset, the nearest timer highlighted, a log of what fired and of timers that pointed at a deleted scene, sound or playlist (a warning, never an error).
+
 **Emitters, music, mix**
 - Emitters inside scenes: random or periodic sounds with a random pick from a set, volume and pan jitter, maximum overlap, seeded random generator; the deck shows when the next sound is due. Per-sound stereo pan in the mixer.
 - Playlists (`[[library.playlists]]`): shuffle without repeats, repeat off/all/one, crossfade between tracks, seek, pause; a scene can use a playlist as its music layer. Transport bar and playlist manager in the console. Track names from file tags.

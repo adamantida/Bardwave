@@ -40,6 +40,8 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
 
         Dialog::Hotkeys => crate::gui::hotkeys_ui::show_hotkeys_dialog(ctx, state),
 
+        Dialog::Timers => crate::gui::timeline::show_timers_dialog(ctx, state),
+
         Dialog::NewGroup { name, error } => {
             let mut field = name;
             let mut submit = false;

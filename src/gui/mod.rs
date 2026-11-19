@@ -26,6 +26,7 @@ pub mod server_panel;
 pub mod settings_extras;
 pub mod sound_list;
 pub mod theme;
+pub mod timeline;
 pub mod top_bar;
 pub mod types;
 pub mod widgets;

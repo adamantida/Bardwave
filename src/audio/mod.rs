@@ -4,12 +4,14 @@
 pub mod decoder;
 pub mod director;
 pub mod director_audio;
+pub mod director_timeline;
 pub mod emitter;
 pub mod engine;
 pub mod loudness;
 pub mod mixer;
 pub mod playlist;
 pub mod stream_source;
+pub mod timeline;
 pub mod youtube;
 
 pub use decoder::{
@@ -21,6 +23,7 @@ pub use director::{
     DirectorState, FadeSpec, Playback, SceneReport,
 };
 pub use director_audio::{DuckMode, DuckTarget, GainUpdate, MixControl, NormalizeSettings};
+pub use director_timeline::TimerRun;
 pub use emitter::{
     EmitterEvent, EmitterHost, EmitterRunner, EmitterSnapshot, EmitterSound, EmitterSpec, Scheduler,
 };
@@ -36,4 +39,8 @@ pub use playlist::{
     PlaylistStatus,
 };
 pub use stream_source::{StreamEvent, StreamOptions, StreamSource, DEFAULT_STREAM_THRESHOLD_SECS};
+pub use timeline::{
+    Timeline, TimelineControl, TimelineRunner, TimelineSnapshot, TimelineStatus, TimerEvent,
+    TimerPhase, TimerView,
+};
 pub use youtube::{display_name as youtube_display_name, extract_video_id};
