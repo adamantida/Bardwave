@@ -159,8 +159,10 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         // The URL above carries the LAN address, which is what the players
         // open. This machine always has loopback, and showing it means a wrong
         // or blocked address detection can never hide the way in.
-        let advertised_is_loopback =
-            url.starts_with("http://127.0.0.1") || url.starts_with("http://[::1]");
+        let advertised_is_loopback = url.starts_with("http://127.0.0.1")
+            || url.starts_with("http://[::1]")
+            || url.starts_with("https://127.0.0.1")
+            || url.starts_with("https://[::1]");
         if running && !advertised_is_loopback {
             if let Some(local) = server.local_url.as_deref() {
                 ui.add_space(Metrics::XS);
@@ -457,6 +459,8 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
             );
         }
 
+        ui.add_space(Metrics::XS);
+        crate::gui::tls_section::tls_section(ui, state, config_enabled);
         ui.add_space(Metrics::XS);
         ui.horizontal(|ui| {
             ui.label(micro_label(if config_enabled {
@@ -759,6 +763,7 @@ fn gm_link_block(ui: &mut Ui, state: &mut SoundSharedApp, base_url: Option<&str>
         // Without the scheme the whole masked key fits the well.
         Some(link) => masked_gm_link(link, &token)
             .trim_start_matches("http://")
+            .trim_start_matches("https://")
             .to_string(),
         None => "Start the server to get the link".to_string(),
     };

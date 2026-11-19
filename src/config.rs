@@ -74,6 +74,24 @@ pub struct ServerConfig {
     /// stays reachable from this computer only.
     #[serde(default)]
     pub gm_token: Option<String>,
+
+    /// Serve HTTPS (and `wss://`) on the same port instead of plain HTTP, so
+    /// the game-master token and the listener key do not travel in clear text
+    /// over the internet. Off by default: the LAN keeps working over HTTP.
+    /// Takes effect on the next Start.
+    #[serde(default)]
+    pub tls: bool,
+
+    /// Path to your own PEM certificate chain (e.g. from Let's Encrypt or a
+    /// reverse-proxy tool). Needs [`ServerConfig::tls_key`] as well. When both
+    /// are unset a self-signed certificate is generated and stored in the
+    /// data directory (`tls/`).
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+
+    /// Path to the PEM private key that belongs to [`ServerConfig::tls_cert`].
+    #[serde(default)]
+    pub tls_key: Option<String>,
 }
 
 /// Audio engine configuration
@@ -953,6 +971,9 @@ impl Default for ServerConfig {
             upnp: default_upnp(),
             access_token: None,
             gm_token: None,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }

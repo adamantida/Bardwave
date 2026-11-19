@@ -95,6 +95,17 @@ zip = { version = "=2.6.1", default-features = false, features = ["deflate-flate
 # (pure Rust; no image/svg backends needed)
 qrcode = { version = "0.14.1", default-features = false }
 
+# Optional HTTPS (`server.tls`): self-signed certificate generation (rcgen),
+# a rustls acceptor over the existing tokio listener (the `ring` provider is
+# already in the tree through ureq) and the SHA-256 certificate fingerprint.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower = { version = "0.5", default-features = false }
+ring = "0.17"
+
 # System-wide hotkeys (console not focused); see src/hotkeys.rs
 global-hotkey = "0.7.0"
 # MIDI input for hotkey bindings, only with `--features midi` (off by default)
