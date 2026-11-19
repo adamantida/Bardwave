@@ -180,7 +180,7 @@ pub struct LoggingConfig {
 /// signal, so the operator states it here. Missing section in an older
 /// `config.toml` means "animated" (the default), so nothing changes for configs
 /// written before this existed.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GuiConfig {
     /// Disable the live-dot pulse and the backdrop scanline.
     ///
@@ -211,6 +211,57 @@ pub struct GuiConfig {
     /// Unix time (seconds) of the last update check; 0 = never.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub last_update_check: u64,
+
+    /// Interface scale factor, `UI_SCALE_MIN..=UI_SCALE_MAX` (1.0 = native
+    /// size). Applied live through egui's pixels-per-point; read it with
+    /// [`GuiConfig::scale`], which also repairs hand-edited nonsense.
+    #[serde(default = "default_ui_scale", skip_serializing_if = "is_default_scale")]
+    pub ui_scale: f32,
+}
+
+/// Smallest interface scale the console offers.
+pub const UI_SCALE_MIN: f32 = 0.8;
+/// Largest interface scale the console offers.
+pub const UI_SCALE_MAX: f32 = 1.6;
+
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
+fn is_default_scale(value: &f32) -> bool {
+    (*value - 1.0).abs() < f32::EPSILON
+}
+
+/// `scale` limited to the supported range; a non-finite value (a hand-edited
+/// `ui_scale = nan`) falls back to 1.0.
+pub fn clamp_ui_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX)
+    } else {
+        1.0
+    }
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            reduce_motion: false,
+            global_hotkeys: false,
+            recordings_dir: None,
+            record_float32: false,
+            check_updates: false,
+            last_update_check: 0,
+            ui_scale: default_ui_scale(),
+        }
+    }
+}
+
+impl GuiConfig {
+    /// The interface scale to use: [`GuiConfig::ui_scale`] clamped to the
+    /// supported range.
+    pub fn scale(&self) -> f32 {
+        clamp_ui_scale(self.ui_scale)
+    }
 }
 
 fn is_zero_u64(value: &u64) -> bool {

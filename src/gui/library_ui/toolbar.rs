@@ -100,7 +100,7 @@ fn filter_row(ui: &mut Ui, state: &mut SoundSharedApp) {
     let mut toggled: Option<String> = None;
     let mut clear = false;
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+        ui.spacing_mut().item_spacing = vec2(Metrics::SM, Metrics::SM);
         for chip_data in &chips {
             let label = if chip_data.count > 0 {
                 format!("{}  {}", chip_data.tag, chip_data.count)
@@ -136,7 +136,7 @@ fn filter_row(ui: &mut Ui, state: &mut SoundSharedApp) {
 
     if active {
         let shown = state.library().count_matching(&query);
-        ui.add_space(2.0);
+        ui.add_space(Metrics::XS);
         ui.label(micro_label(format!(
             "Showing {shown} of {} sounds",
             state.library().len()
@@ -192,10 +192,10 @@ fn banner_row(ui: &mut Ui, state: &mut SoundSharedApp) {
         .fill(alpha(Palette::AMBER_400, 14))
         .stroke(Stroke::new(1.0_f32, alpha(Palette::AMBER_400, 70)))
         .rounding(Rounding::same(Metrics::R_SM))
-        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+        .inner_margin(egui::Margin::symmetric(Metrics::MD, Metrics::SM))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+                ui.spacing_mut().item_spacing = vec2(Metrics::SM, Metrics::SM);
                 let (icon_rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                 paint_warning(ui.painter(), icon_rect.center(), 15.0, Palette::AMBER_400);
                 ui.label(

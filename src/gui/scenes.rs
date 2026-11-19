@@ -22,6 +22,8 @@
 //!   render thread never blocks (the audio commands are executed by the GUI
 //!   thread itself, one frame later, so waiting here would deadlock anyway).
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
@@ -33,10 +35,12 @@ use egui::{
 use crate::audio::SoundId as EngineSoundId;
 use crate::config::{FadeCurve, SceneConfig, SceneStart};
 use crate::gui::app::{Dialog, SoundEntry, SoundSharedApp};
-use crate::gui::dialog::{error_line, header, modal_sized};
+use crate::gui::dialog::{header, modal_sized};
 use crate::gui::groups::{
     Library, LibrarySound, Scene, SceneId, SceneItem, SoundId as LibSoundId, MAX_NAME_LEN,
 };
+use crate::gui::settings_extras::kit as settings_kit;
+use crate::gui::settings_extras::kit::error_line;
 use crate::gui::theme::{
     alpha, hairline, micro_label, micro_label_accent, micro_label_dim, ui_font, Metrics, Palette,
 };
@@ -644,6 +648,10 @@ pub struct SceneCard {
     pub sounds: usize,
     pub fade_in_ms: u32,
     pub active: bool,
+    /// What would silently go wrong when this scene is activated (missing
+    /// sound files, an empty scene, ...), one short line each. Filled from
+    /// the [`WarningCache`]; empty when all is well.
+    pub warnings: Vec<String>,
 }
 
 /// One card per scene, in library order. `active` is the Director's active
@@ -659,8 +667,143 @@ pub fn scene_cards(library: &Library, active: Option<&str>) -> Vec<SceneCard> {
             sounds: scene.items.len(),
             fade_in_ms: scene.fade_in_ms,
             active: active == Some(scene.id.to_string().as_str()),
+            warnings: Vec::new(),
         })
         .collect()
+}
+
+// ============================================================================
+// Pure logic: scene warnings
+// ============================================================================
+
+/// How often the scene warnings are looked up again (it touches the disk).
+pub const WARNING_REFRESH: Duration = Duration::from_secs(3);
+/// Lines a warning tooltip lists before it says "and N more".
+const WARNING_TOOLTIP_LINES: usize = 6;
+
+/// `scene "Tavern" sound X is missing its file ...` -> `Sound X is missing its
+/// file ...`: the card already names the scene.
+pub fn short_warning(line: &str, scene_name: &str) -> String {
+    let owner = format!("scene \u{201c}{scene_name}\u{201d} ");
+    let rest = line.strip_prefix(&owner).unwrap_or(line);
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The tooltip of a card's "!" badge: one bullet per problem.
+pub fn warning_tooltip(lines: &[String]) -> String {
+    let mut out = String::new();
+    for line in lines.iter().take(WARNING_TOOLTIP_LINES) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("\u{2022} ");
+        out.push_str(line);
+    }
+    if lines.len() > WARNING_TOOLTIP_LINES {
+        out.push_str(&format!(
+            "\nand {} more",
+            lines.len() - WARNING_TOOLTIP_LINES
+        ));
+    }
+    out
+}
+
+/// Short warning lines of every scene that has any, keyed by scene id.
+/// `exists` answers "is this file on disk"; it is the slow part, so callers
+/// run this off the render thread (see [`WarningCache`]).
+pub fn scene_warning_lines(
+    library: &Library,
+    exists: impl Fn(&Path) -> bool,
+) -> HashMap<SceneId, Vec<String>> {
+    let mut by_scene = HashMap::new();
+    for scene in library.scenes() {
+        let lines: Vec<String> = library
+            .scene_warnings_with(scene.id, &exists)
+            .iter()
+            .map(|warning| short_warning(&library.describe_warning(warning), &scene.name))
+            .collect();
+        if !lines.is_empty() {
+            by_scene.insert(scene.id, lines);
+        }
+    }
+    by_scene
+}
+
+/// Scene warnings kept for drawing. The lookup stats every referenced file,
+/// so it runs on a short-lived worker thread every [`WARNING_REFRESH`] (or
+/// right after a library change) and the render thread only reads the result.
+#[derive(Default)]
+pub struct WarningCache {
+    lines: HashMap<SceneId, Vec<String>>,
+    refreshed: Option<Instant>,
+    dirty: bool,
+    job: Option<Receiver<HashMap<SceneId, Vec<String>>>>,
+}
+
+impl WarningCache {
+    /// The library changed: look again at the next frame.
+    pub fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Warning lines of a scene (empty when it has none).
+    pub fn lines(&self, scene: SceneId) -> &[String] {
+        self.lines.get(&scene).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether a new lookup should start now.
+    pub fn due(&self, now: Instant) -> bool {
+        self.job.is_none()
+            && (self.dirty
+                || self
+                    .refreshed
+                    .is_none_or(|at| now.saturating_duration_since(at) >= WARNING_REFRESH))
+    }
+
+    /// Take a finished lookup, and start the next one when it is due. Never
+    /// blocks. `repaint` is called from the worker once its result is ready.
+    pub fn pump(
+        &mut self,
+        library: &Library,
+        now: Instant,
+        repaint: impl FnOnce() + Send + 'static,
+    ) {
+        if let Some(rx) = &self.job {
+            match rx.try_recv() {
+                Ok(lines) => {
+                    self.lines = lines;
+                    self.job = None;
+                    self.refreshed = Some(now);
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.job = None;
+                    self.refreshed = Some(now);
+                }
+            }
+        }
+        if !self.due(now) {
+            return;
+        }
+        self.dirty = false;
+        let library = library.clone();
+        let (tx, rx) = bounded(1);
+        let spawned = std::thread::Builder::new()
+            .name("scene-warnings".into())
+            .spawn(move || {
+                let _ = tx.send(scene_warning_lines(&library, |path| path.exists()));
+                repaint();
+            });
+        if spawned.is_ok() {
+            self.job = Some(rx);
+        } else {
+            self.refreshed = Some(now);
+        }
+    }
 }
 
 /// Second line of a scene button. State is spelled out in words, never only
@@ -848,6 +991,8 @@ pub struct SceneUi {
     pending: Vec<Pending>,
     transition: Option<Transition>,
     last_active: Option<String>,
+    /// Problems of each scene, shown as a badge on its card.
+    pub warnings: WarningCache,
 }
 
 impl Default for SceneUi {
@@ -860,6 +1005,7 @@ impl Default for SceneUi {
             pending: Vec::new(),
             transition: None,
             last_active: None,
+            warnings: WarningCache::default(),
         }
     }
 }
@@ -999,6 +1145,20 @@ impl SoundSharedApp {
         if let Some(wait) = self.scenes.wakeup(now, self.reduced_motion()) {
             ctx.request_repaint_after(wait);
         }
+        let repaint_ctx = ctx.clone();
+        self.scenes
+            .warnings
+            .pump(&self.library, now, move || repaint_ctx.request_repaint());
+        // The interface scale lives here because this runs once per frame,
+        // right after the settings were last edited.
+        let scale = self
+            .app_state
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .gui
+            .scale();
+        crate::gui::settings_extras::apply_ui_scale(ctx, scale);
     }
 
     /// Queue a command whose reply is only an acknowledgement.
@@ -1099,6 +1259,7 @@ impl SoundSharedApp {
     /// see it).
     fn library_changed(&mut self) {
         self.library_dirty = true;
+        self.scenes.warnings.invalidate();
         crate::gui::app::sync_director(&mut self.director, &self.library, &self.sounds);
     }
 
@@ -1316,7 +1477,10 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
     let now = Instant::now();
     let reduced = state.reduced_motion();
     let sounds = state.sounds();
-    let cards = scene_cards(state.library(), state.director.active_scene());
+    let mut cards = scene_cards(state.library(), state.director.active_scene());
+    for card in &mut cards {
+        card.warnings = state.scenes.warnings.lines(card.id).to_vec();
+    }
     let pads = stinger_pads(state.library(), &sounds);
     let progress = state
         .scenes
@@ -1388,21 +1552,17 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
     });
 
     if let Some(notice) = &notice {
-        ui.add_space(Metrics::XS);
+        ui.add_space(Metrics::SM);
         let color = if notice.error {
             Palette::ROSE_400
         } else {
             Palette::ZINC_300
         };
-        ui.label(
-            RichText::new(&notice.text)
-                .font(glyph_font(10.0))
-                .color(color),
-        );
+        settings_kit::note_colored(ui, notice.text.as_str(), color);
     }
 
     if open {
-        ui.add_space(Metrics::SM);
+        ui.add_space(Metrics::MD);
 
         // ---- Transport + shared transition time ----
         ui.horizontal_wrapped(|ui| {
@@ -1429,7 +1589,7 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
                 actions.push(DeckAction::StopAll);
             }
 
-            ui.add_space(Metrics::SM);
+            ui.add_space(Metrics::MD);
             ui.label(micro_label("Transition"));
             if toggle_button(ui, "Auto", auto, 56.0, "scenes_auto_fade") {
                 actions.push(DeckAction::SetAuto(!auto));
@@ -1465,13 +1625,20 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
             );
         });
 
-        ui.add_space(Metrics::SM);
+        ui.add_space(Metrics::MD);
 
         // ---- Scene grid ----
         if cards.is_empty() {
-            ui.label(micro_label(
-                "No scenes yet. Start a few sounds and press Save Mix As Scene.",
-            ));
+            if settings_kit::empty_state_action(
+                ui,
+                "No scenes yet",
+                "Create your first scene \u{2014} set up a mix, then press Save Mix As Scene. \
+                 A scene remembers which sounds play and how loud.",
+                "New scene",
+                "scenes_empty_new",
+            ) {
+                actions.push(DeckAction::New);
+            }
         } else {
             let grid_h =
                 (ui.available_height() * 0.34).clamp(CARD_H + 6.0, CARD_H * 2.0 + GRID_GAP + 6.0);
@@ -1497,19 +1664,23 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
         }
 
         // ---- Stinger pads ----
-        ui.add_space(Metrics::SM);
+        ui.add_space(Metrics::LG);
         if pads.is_empty() {
             if any_sounds {
-                ui.label(micro_label_dim(
-                    "Stingers: right-click a sound and choose Use As Stinger",
-                ));
+                ui.label(micro_label("Stingers"));
+                settings_kit::note_under(
+                    ui,
+                    "One-shot sounds that play over the scene. Right-click a sound and choose \
+                     Use As Stinger.",
+                    Palette::ZINC_600,
+                );
             }
         } else {
             ui.horizontal(|ui| {
                 ui.label(micro_label("Stingers"));
                 ui.label(micro_label_dim("one-shots over the scene"));
             });
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::SM);
             egui::ScrollArea::vertical()
                 .id_salt("stinger_scroll")
                 .auto_shrink([false, true])
@@ -1592,6 +1763,17 @@ fn scene_button(
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_text("Edit scene");
 
+    let has_warnings = !card.warnings.is_empty();
+    let badge_rect = Rect::from_center_size(
+        egui::pos2(edit_rect.left() - 12.0, edit_rect.center().y),
+        Vec2::splat(18.0),
+    );
+    let badge = has_warnings.then(|| {
+        ui.interact(badge_rect, resp.id.with("warn"), Sense::hover())
+            .on_hover_cursor(CursorIcon::Help)
+            .on_hover_text(warning_tooltip(&card.warnings))
+    });
+
     let accent = to_color32(card.accent);
     let hovered = resp.hovered() || edit.hovered();
     let focused = resp.has_focus();
@@ -1638,7 +1820,12 @@ fn scene_button(
     );
 
     let text_x = rect.left() + 14.0;
-    let max_chars = (((width - 14.0 - 34.0) / 7.2) as usize).max(6);
+    let reserved = if has_warnings {
+        14.0 + 56.0
+    } else {
+        14.0 + 34.0
+    };
+    let max_chars = (((width - reserved) / 7.2) as usize).max(6);
     let name = painter.layout_no_wrap(elide(&card.name, max_chars), ui_font(13.0), Palette::WHITE);
     painter.galley(egui::pos2(text_x, rect.top() + 9.0), name, Palette::WHITE);
 
@@ -1670,6 +1857,17 @@ fn scene_button(
         );
     }
 
+    if has_warnings {
+        painter.circle_filled(badge_rect.center(), 8.0, Palette::AMBER_400);
+        painter.text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "!",
+            glyph_font(12.0),
+            Palette::BLACK,
+        );
+    }
+
     paint_icon(
         painter,
         glyph::EDIT,
@@ -1698,6 +1896,20 @@ fn scene_button(
             format!("Edit scene {}", card.name),
         )
     });
+    if let Some(badge) = &badge {
+        badge.widget_info(|| {
+            WidgetInfo::labeled(
+                WidgetType::Label,
+                true,
+                format!(
+                    "Scene {} has {} warning{}",
+                    card.name,
+                    card.warnings.len(),
+                    if card.warnings.len() == 1 { "" } else { "s" }
+                ),
+            )
+        });
+    }
 
     if edit.clicked() || edit.fake_primary_click {
         actions.push(DeckAction::Edit(card.id));
@@ -1705,10 +1917,15 @@ fn scene_button(
         actions.push(DeckAction::Activate(card.id));
     }
 
-    let resp = resp.on_hover_text(format!(
-        "Activate “{}”. Right-click for more, or use the pencil to edit",
-        card.name
-    ));
+    // Two tooltips would overlap: the badge's own wins while it is hovered.
+    let resp = if badge.as_ref().is_some_and(Response::hovered) {
+        resp
+    } else {
+        resp.on_hover_text(format!(
+            "Activate “{}”. Right-click for more, or use the pencil to edit",
+            card.name
+        ))
+    };
     resp.context_menu(|ui| {
         ui.set_min_width(180.0);
         if menu_item(ui, "Activate", glyph::PLAY, BtnKind::Ghost) {
@@ -1967,13 +2184,16 @@ fn delete_scene_dialog(ctx: &Context, state: &mut SoundSharedApp, id: SceneId) {
     modal_sized(ctx, "scene_delete_modal", SMALL_W, |ui| {
         header(ui, "Delete Scene", "This cannot be undone");
         ui.add_space(Metrics::MD);
-        ui.label(
-            RichText::new(format!(
-                "Delete “{name}”? Its {count} sound{} stay in the library; hotkeys that start this scene are removed.",
-                if count == 1 { "" } else { "s" }
+        ui.add(
+            egui::Label::new(settings_kit::note_text(
+                format!(
+                    "Delete “{name}”? Its {count} sound{} stay in the library; hotkeys that start this scene are removed.",
+                    if count == 1 { "" } else { "s" }
+                ),
+                11.0,
+                Palette::ZINC_300,
             ))
-            .font(glyph_font(11.0))
-            .color(Palette::ZINC_300),
+            .wrap(),
         );
         ui.add_space(Metrics::LG);
         hairline(ui);
@@ -2022,188 +2242,199 @@ fn edit_scene_dialog(ctx: &Context, state: &mut SoundSharedApp, mut form: SceneF
     let mut add: Option<LibSoundId> = None;
     let mut remove: Option<usize> = None;
 
+    // The form scrolls inside the modal (the footer stays put), so the editor
+    // fits the 960x620 minimum window even at a large interface scale.
+    let body_max = (settings_kit::modal_max_height(ctx.screen_rect().height())
+        - 2.0 * Metrics::PANEL_PAD
+        - 90.0)
+        .max(160.0);
+
     modal_sized(ctx, "scene_editor_modal", EDITOR_W, |ui| {
-        header(
-            ui,
-            if is_new { "New Scene" } else { "Edit Scene" },
-            "Which sounds start, how loud, and how the scene fades",
-        );
-        ui.add_space(Metrics::MD);
+        settings_kit::fit_scroll(ui, egui::Id::new("scene_editor_body"), body_max, |ui| {
+            header(
+                ui,
+                if is_new { "New Scene" } else { "Edit Scene" },
+                "Which sounds start, how loud, and how the scene fades",
+            );
+            ui.add_space(Metrics::MD);
 
-        // ---- Name ----
-        let name = field(
-            ui,
-            "Scene name",
-            &mut form.name,
-            "e.g. Tavern",
-            f32::INFINITY,
-            errors.name.is_some(),
-        );
-        focus_when_opened(ui, &name);
-        if enter_pressed(ui, &name) {
-            submit = true;
-        }
-        match &errors.name {
-            Some(message) => error_line(ui, message),
-            None => {
-                ui.label(micro_label(format!("Up to {MAX_NAME_LEN} characters")));
+            // ---- Name ----
+            let name = field(
+                ui,
+                "Scene name",
+                &mut form.name,
+                "e.g. Tavern",
+                f32::INFINITY,
+                errors.name.is_some(),
+            );
+            focus_when_opened(ui, &name);
+            if enter_pressed(ui, &name) {
+                submit = true;
             }
-        }
-        ui.add_space(Metrics::MD);
+            match &errors.name {
+                Some(message) => error_line(ui, message),
+                None => {
+                    ui.label(micro_label(format!("Up to {MAX_NAME_LEN} characters")));
+                }
+            }
+            ui.add_space(Metrics::MD);
 
-        // ---- Colour ----
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(micro_label("Button colour"));
-                ui.add_space(Metrics::XS);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = Metrics::XS + 2.0;
-                    let current = normalize_color_input(&form.color).ok().flatten();
-                    for (name, hex) in COLOR_PRESETS {
-                        if swatch(ui, name, hex, current.as_deref() == Some(hex)) {
-                            form.color = hex.to_string();
+            // ---- Colour ----
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(micro_label("Button colour"));
+                    ui.add_space(Metrics::XS);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = Metrics::XS + 2.0;
+                        let current = normalize_color_input(&form.color).ok().flatten();
+                        for (name, hex) in COLOR_PRESETS {
+                            if swatch(ui, name, hex, current.as_deref() == Some(hex)) {
+                                form.color = hex.to_string();
+                            }
                         }
-                    }
-                    let none = ConsoleButton::ghost("None")
-                        .small()
-                        .width(56.0)
-                        .id_salt("scene_color_none")
-                        .show(ui);
-                    if labelled(none, "No colour").clicked() {
-                        form.color.clear();
-                    }
+                        let none = ConsoleButton::ghost("None")
+                            .small()
+                            .width(56.0)
+                            .id_salt("scene_color_none")
+                            .show(ui);
+                        if labelled(none, "No colour").clicked() {
+                            form.color.clear();
+                        }
+                    });
+                });
+                ui.add_space(Metrics::LG);
+                ui.vertical(|ui| {
+                    field(
+                        ui,
+                        "Hex",
+                        &mut form.color,
+                        "#a04a4a",
+                        96.0,
+                        errors.color.is_some(),
+                    );
                 });
             });
-            ui.add_space(Metrics::LG);
-            ui.vertical(|ui| {
-                field(
-                    ui,
-                    "Hex",
-                    &mut form.color,
-                    "#a04a4a",
-                    96.0,
-                    errors.color.is_some(),
-                );
-            });
-        });
-        if let Some(message) = &errors.color {
-            error_line(ui, message);
-        }
-        ui.add_space(Metrics::MD);
+            if let Some(message) = &errors.color {
+                error_line(ui, message);
+            }
+            ui.add_space(Metrics::MD);
 
-        // ---- Fades, curve, stop others ----
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                field(
-                    ui,
-                    "Fade in (ms)",
-                    &mut form.fade_in,
-                    "2000",
-                    96.0,
-                    errors.fade_in.is_some(),
-                );
-            });
-            ui.vertical(|ui| {
-                field(
-                    ui,
-                    "Fade out (ms)",
-                    &mut form.fade_out,
-                    "2000",
-                    96.0,
-                    errors.fade_out.is_some(),
-                );
-            });
-            ui.vertical(|ui| {
-                ui.label(micro_label("Curve"));
-                ui.add_space(Metrics::XS);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = Metrics::XS;
-                    let equal = form.curve == FadeCurve::EqualPower;
-                    if toggle_button(ui, "Equal power", equal, 108.0, "scene_curve_eq") {
-                        form.curve = FadeCurve::EqualPower;
-                    }
-                    let linear = form.curve == FadeCurve::Linear;
-                    if toggle_button(ui, "Linear", linear, 70.0, "scene_curve_lin") {
-                        form.curve = FadeCurve::Linear;
-                    }
+            // ---- Fades, curve, stop others ----
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    field(
+                        ui,
+                        "Fade in (ms)",
+                        &mut form.fade_in,
+                        "2000",
+                        96.0,
+                        errors.fade_in.is_some(),
+                    );
+                });
+                ui.vertical(|ui| {
+                    field(
+                        ui,
+                        "Fade out (ms)",
+                        &mut form.fade_out,
+                        "2000",
+                        96.0,
+                        errors.fade_out.is_some(),
+                    );
+                });
+                ui.vertical(|ui| {
+                    ui.label(micro_label("Curve"));
+                    ui.add_space(Metrics::XS);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = Metrics::XS;
+                        let equal = form.curve == FadeCurve::EqualPower;
+                        if toggle_button(ui, "Equal power", equal, 108.0, "scene_curve_eq") {
+                            form.curve = FadeCurve::EqualPower;
+                        }
+                        let linear = form.curve == FadeCurve::Linear;
+                        if toggle_button(ui, "Linear", linear, 70.0, "scene_curve_lin") {
+                            form.curve = FadeCurve::Linear;
+                        }
+                    });
                 });
             });
-        });
-        for message in [&errors.fade_in, &errors.fade_out].into_iter().flatten() {
-            error_line(ui, message);
-        }
-        ui.add_space(Metrics::SM);
-        let stop_label = if form.stop_others {
-            "Stop other sounds: on"
-        } else {
-            "Stop other sounds: off"
-        };
-        if toggle_button(ui, stop_label, form.stop_others, 190.0, "scene_stop_others") {
-            form.stop_others = !form.stop_others;
-        }
-        ui.add_space(Metrics::MD);
-        hairline(ui);
-        ui.add_space(Metrics::MD);
+            for message in [&errors.fade_in, &errors.fade_out].into_iter().flatten() {
+                error_line(ui, message);
+            }
+            ui.add_space(Metrics::SM);
+            let stop_label = if form.stop_others {
+                "Stop other sounds: on"
+            } else {
+                "Stop other sounds: off"
+            };
+            if toggle_button(ui, stop_label, form.stop_others, 190.0, "scene_stop_others") {
+                form.stop_others = !form.stop_others;
+            }
+            ui.add_space(Metrics::MD);
+            hairline(ui);
+            ui.add_space(Metrics::MD);
 
-        // ---- Sounds ----
-        ui.horizontal(|ui| {
-            ui.label(micro_label(match form.items.len() {
-                1 => "1 sound".to_string(),
-                n => format!("{n} sounds"),
-            }));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                egui::ComboBox::from_id_salt("scene_add_sound")
-                    .selected_text("Add sound…")
-                    .width(200.0)
-                    .show_ui(ui, |ui| {
-                        if library_sounds.is_empty() {
-                            ui.label(micro_label("Every library sound is here"));
-                        }
-                        for (id, label) in &library_sounds {
-                            if ui.selectable_label(false, elide(label, 34)).clicked() {
-                                add = Some(*id);
+            // ---- Sounds ----
+            ui.horizontal(|ui| {
+                ui.label(micro_label(match form.items.len() {
+                    1 => "1 sound".to_string(),
+                    n => format!("{n} sounds"),
+                }));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("scene_add_sound")
+                        .selected_text("Add sound…")
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            if library_sounds.is_empty() {
+                                ui.label(micro_label("Every library sound is here"));
+                            }
+                            for (id, label) in &library_sounds {
+                                if ui.selectable_label(false, elide(label, 34)).clicked() {
+                                    add = Some(*id);
+                                }
+                            }
+                        });
+                });
+            });
+            ui.add_space(Metrics::SM);
+
+            if form.items.is_empty() {
+                settings_kit::empty_state(
+                    ui,
+                    "No sounds in this scene yet",
+                    "Use Add sound above to choose what starts when the scene is activated.",
+                );
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("scene_items_scroll")
+                    .max_height(list_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(Metrics::SM, Metrics::XS + 2.0);
+                        for (index, item) in form.items.iter_mut().enumerate() {
+                            let delay_bad = errors.delays.get(index).is_some_and(Option::is_some);
+                            if item_row(ui, index, item, delay_bad) {
+                                remove = Some(index);
                             }
                         }
                     });
-            });
-        });
-        ui.add_space(Metrics::SM);
-
-        if form.items.is_empty() {
-            ui.label(micro_label_dim(
-                "No sounds yet. Use Add sound to build the scene.",
-            ));
-        } else {
-            egui::ScrollArea::vertical()
-                .id_salt("scene_items_scroll")
-                .max_height(list_h)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(Metrics::SM, Metrics::XS + 2.0);
-                    for (index, item) in form.items.iter_mut().enumerate() {
-                        let delay_bad = errors.delays.get(index).is_some_and(Option::is_some);
-                        if item_row(ui, index, item, delay_bad) {
-                            remove = Some(index);
-                        }
-                    }
-                });
-        }
-        for (index, message) in errors.delays.iter().enumerate() {
-            if let (Some(message), Some(item)) = (message, form.items.get(index)) {
-                error_line(
-                    ui,
-                    &format!("Delay of {}: {message}", elide(&item.name, 24)),
-                );
             }
-        }
-        if let Some(message) = &errors.sounds {
-            error_line(ui, message);
-        }
+            for (index, message) in errors.delays.iter().enumerate() {
+                if let (Some(message), Some(item)) = (message, form.items.get(index)) {
+                    error_line(
+                        ui,
+                        &format!("Delay of {}: {message}", elide(&item.name, 24)),
+                    );
+                }
+            }
+            if let Some(message) = &errors.sounds {
+                error_line(ui, message);
+            }
 
-        // EXTENSION: the emitter and playlist editors of a scene plug in here
-        // (a separate dialog opened from a button in this spot). Emitters and
-        // the playlist are not part of `SceneForm`; `apply_scene` leaves them
-        // untouched, so nothing above has to change to add them.
+            // EXTENSION: the emitter and playlist editors of a scene plug in here
+            // (a separate dialog opened from a button in this spot). Emitters and
+            // the playlist are not part of `SceneForm`; `apply_scene` leaves them
+            // untouched, so nothing above has to change to add them.
+        });
 
         ui.add_space(Metrics::LG);
         hairline(ui);
@@ -2869,6 +3100,7 @@ mod tests {
             sounds: 1,
             fade_in_ms: 2000,
             active: false,
+            warnings: Vec::new(),
         };
         assert_eq!(card_subline(&card, None, false), "1 SOUND · FADE 2.0 S");
         card.sounds = 4;
@@ -3076,6 +3308,11 @@ mod tests {
                 sounds: n as usize,
                 fade_in_ms: 2000,
                 active: n == 1,
+                warnings: if n == 2 {
+                    vec!["Sound X is missing its file".into()]
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         let mut item = ItemForm {

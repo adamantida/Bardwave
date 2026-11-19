@@ -13,7 +13,7 @@
 //! settings; they are shown here (read-only) next to the active device.
 
 use crossbeam_channel::{bounded, Receiver, TryRecvError};
-use egui::{RichText, Ui};
+use egui::Ui;
 
 use crate::audio::devices::{
     list_output_devices, pick_output_device, DevicePick, OutputDeviceInfo, OutputSelection,
@@ -21,8 +21,9 @@ use crate::audio::devices::{
 use crate::audio::engine::{LocalOutputState, LocalOutputStatus};
 use crate::config::AudioConfig;
 use crate::gui::app::SoundSharedApp;
+use crate::gui::settings_extras::kit;
 use crate::gui::theme::{micro_label, Metrics, Palette};
-use crate::gui::widgets::{elide, glyph, glyph_font, ConsoleButton};
+use crate::gui::widgets::{elide, glyph, ConsoleButton};
 
 /// What a device dropdown can select.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,14 +367,7 @@ fn status_label(ui: &mut Ui, text: &str, error: bool) {
     } else {
         Palette::ZINC_500
     };
-    ui.add(
-        egui::Label::new(
-            RichText::new(text)
-                .font(glyph_font(Metrics::MICRO))
-                .color(color),
-        )
-        .wrap(),
-    );
+    kit::note_under(ui, text, color);
 }
 
 /// The AUDIO OUTPUT section. `ui` is the network column.
@@ -417,7 +411,7 @@ pub fn audio_section(ui: &mut Ui, state: &mut SoundSharedApp) {
     }
     let (text, error) = output_status_line(&output_status);
     status_label(ui, &text, error);
-    ui.add_space(Metrics::SM);
+    ui.add_space(Metrics::MD);
 
     if let Some(value) = device_dropdown(
         ui,
@@ -430,14 +424,14 @@ pub fn audio_section(ui: &mut Ui, state: &mut SoundSharedApp) {
     }
     let (text, error) = preview_status_line(&preview_status);
     status_label(ui, &text, error);
-    ui.add_space(Metrics::SM);
+    ui.add_space(Metrics::MD);
 
     let info = format_buffer_info(&state.app_state.config.lock().unwrap().audio);
     status_label(ui, &info, false);
     if let Some(message) = section.scan_error.clone().or(section.apply_error.clone()) {
         status_label(ui, &format!("Error: {message}"), true);
     }
-    ui.add_space(Metrics::SM);
+    ui.add_space(Metrics::MD);
 
     let scanning = section.is_scanning();
     if ConsoleButton::ghost(if scanning {

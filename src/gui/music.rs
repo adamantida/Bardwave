@@ -38,9 +38,10 @@ use crate::audio::{Director, EmitterSnapshot, PlaylistCommand, PlaylistState, Pl
 use crate::config::RepeatMode;
 use crate::gui::app::{mirror_playing, sync_director, Dialog, SoundSharedApp};
 use crate::gui::groups::{Emitter, Library, LibrarySound, Playlist, PlaylistId, SceneId, SoundId};
+use crate::gui::settings_extras::kit::{self as panel_kit, modal_window};
 use crate::gui::theme::{
-    alpha, hairline, micro_label, micro_label_accent, mono_font, panel_frame, panel_title,
-    row_subline, telemetry, ui_font, Metrics, Palette,
+    alpha, hairline, micro_label, micro_label_accent, mono_font, panel_title, row_subline,
+    telemetry, ui_font, Metrics, Palette,
 };
 use crate::gui::widgets::{elide, glyph, level_slider, paint_icon, BtnKind, ConsoleButton, Glyph};
 
@@ -902,18 +903,7 @@ fn error_text(ui: &mut Ui, message: &str) {
 
 /// Centred modal window of a given width (the console frame).
 fn window(ctx: &Context, id: &'static str, width: f32, add: impl FnOnce(&mut Ui)) {
-    egui::Window::new(id)
-        .id(egui::Id::new(id))
-        .order(egui::Order::Foreground)
-        .title_bar(false)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .frame(panel_frame())
-        .show(ctx, |ui| {
-            ui.set_width(width);
-            add(ui);
-        });
+    modal_window(ctx, id, width, add);
 }
 
 fn dialog_header(ui: &mut Ui, code: &str, title: &str, subtitle: &str) {
@@ -1248,7 +1238,7 @@ fn draw_playlists_tab(
 ) {
     let library = env.library;
     let (tracks_h, picker_h) = list_heights(screen_h);
-    let body_h = tracks_h + picker_h + 118.0;
+    let body_h = tracks_h + picker_h + 134.0;
     ui.horizontal_top(|ui| {
         // Left: the playlists.
         ui.allocate_ui_with_layout(vec2(210.0, body_h), Layout::top_down(Align::Min), |ui| {
@@ -1284,7 +1274,11 @@ fn draw_playlists_tab(
                         }
                     }
                     if library.playlists().is_empty() {
-                        ui.label(micro_label("No playlists yet"));
+                        panel_kit::empty_state(
+                            ui,
+                            "No playlists yet",
+                            "A playlist is background music: an ordered list of your sounds.",
+                        );
                     }
                 });
             ui.add_space(Metrics::SM);
@@ -1310,10 +1304,16 @@ fn draw_playlists_tab(
                     draw_playlist_editor(ui, env, st, playlist, tracks_h, picker_h, actions)
                 }
                 None => {
-                    ui.add_space(Metrics::XL);
-                    ui.label(micro_label(
-                        "Create a playlist, then add sounds from your library",
-                    ));
+                    if panel_kit::empty_state_action(
+                        ui,
+                        "Nothing selected",
+                        "Create a playlist, then add sounds from your library. A scene can start \
+                         it automatically.",
+                        "Create a playlist",
+                        "music_empty_create",
+                    ) {
+                        actions.push(MusicAction::CreatePlaylist);
+                    }
                 }
             },
         );
@@ -1443,8 +1443,9 @@ fn draw_playlist_editor(
             if unknown > 0 { "+" } else { "" }
         ));
     }
+    ui.add_space(Metrics::XS);
     ui.label(micro_label(sub));
-    ui.add_space(Metrics::SM);
+    ui.add_space(Metrics::MD);
 
     // Playback + mode.
     ui.horizontal(|ui| {
@@ -1513,7 +1514,7 @@ fn draw_playlist_editor(
             });
         }
     });
-    ui.add_space(Metrics::XS);
+    ui.add_space(Metrics::SM);
     ui.horizontal(|ui| {
         ui.label(micro_label("Crossfade"));
         let mut secs = playlist.crossfade_ms as f32 / 1000.0;
@@ -1532,15 +1533,15 @@ fn draw_playlist_editor(
             crossfade_label(playlist.crossfade_ms)
         )));
     });
-    ui.add_space(Metrics::SM);
+    ui.add_space(Metrics::MD);
     hairline(ui);
-    ui.add_space(Metrics::SM);
+    ui.add_space(Metrics::MD);
 
     // The tracks.
     ui.label(micro_label("Tracks · drag the handle or use the arrows"));
-    ui.add_space(Metrics::XS);
-    draw_tracks(ui, env, st, playlist, tracks_h, actions);
     ui.add_space(Metrics::SM);
+    draw_tracks(ui, env, st, playlist, tracks_h, actions);
+    ui.add_space(Metrics::LG);
 
     // The picker.
     ui.horizontal(|ui| {
@@ -1553,7 +1554,7 @@ fn draw_playlist_editor(
                 .margin(egui::Margin::symmetric(8.0, 4.0)),
         );
     });
-    ui.add_space(Metrics::XS);
+    ui.add_space(Metrics::SM);
     egui::ScrollArea::vertical()
         .id_salt("music_picker")
         .max_height(picker_h)
@@ -1593,7 +1594,19 @@ fn draw_playlist_editor(
                 });
             }
             if matches.is_empty() {
-                ui.label(micro_label("No sound matches"));
+                if st.filter.trim().is_empty() {
+                    panel_kit::empty_state(
+                        ui,
+                        "No sounds in the library",
+                        "Add sound files to the library first, then pick them for the playlist here.",
+                    );
+                } else {
+                    panel_kit::empty_state(
+                        ui,
+                        "No sound matches",
+                        "Try a shorter name, or clear the filter to see every sound.",
+                    );
+                }
             }
         });
 }
@@ -1623,7 +1636,11 @@ fn draw_tracks(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             if playlist.items.is_empty() {
-                ui.label(micro_label("Empty - add sounds below"));
+                panel_kit::empty_state(
+                    ui,
+                    "This playlist is empty",
+                    "Add sounds from the list below with the + buttons.",
+                );
             }
             for (index, item) in playlist.items.iter().enumerate() {
                 let current = playing_index == Some(index);
@@ -1790,10 +1807,11 @@ fn draw_scenes_tab(
     actions: &mut Vec<MusicAction>,
 ) {
     let (tracks_h, picker_h) = list_heights(screen_h);
-    ui.label(micro_label(
-        "Each scene can play one playlist and run random emitters",
-    ));
-    ui.add_space(Metrics::SM);
+    panel_kit::note(
+        ui,
+        "Each scene can play one playlist and run random emitters.",
+    );
+    ui.add_space(Metrics::MD);
     egui::ScrollArea::vertical()
         .id_salt("music_scenes")
         .max_height(tracks_h + picker_h + 80.0)
@@ -1801,7 +1819,12 @@ fn draw_scenes_tab(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = Metrics::XS;
             if env.library.scenes().is_empty() {
-                ui.label(micro_label("No scenes yet"));
+                panel_kit::empty_state(
+                    ui,
+                    "No scenes yet",
+                    "Create a scene in the Scenes deck first (set up a mix, then Save Mix As \
+                     Scene). Then attach music and emitters to it here.",
+                );
             }
             for scene in env.library.scenes() {
                 egui::Frame::none()
@@ -1894,9 +1917,9 @@ pub fn draw_emitters(
             });
         ui.label(micro_label("Starts and stops with the scene"));
     });
-    ui.add_space(Metrics::MD);
+    ui.add_space(Metrics::LG);
     hairline(ui);
-    ui.add_space(Metrics::MD);
+    ui.add_space(Metrics::LG);
 
     // Emitters.
     ui.horizontal(|ui| {
@@ -1925,10 +1948,17 @@ pub fn draw_emitters(
         .auto_shrink([false, true])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = Metrics::SM;
-            if draft.emitters.is_empty() {
-                ui.label(micro_label(
-                    "No emitters yet - add one for crows, drips or distant thunder",
-                ));
+            if draft.emitters.is_empty()
+                && panel_kit::empty_state_action(
+                    ui,
+                    "No emitters yet",
+                    "An emitter plays a random sound from its list every so often while the \
+                     scene runs: crows, drips, distant thunder.",
+                    "Add emitter",
+                    "em_empty_add",
+                )
+            {
+                draft.emitters.push(Emitter::new(Vec::new()));
             }
             for (index, emitter) in draft.emitters.iter_mut().enumerate() {
                 let snapshot = if scene_running {
@@ -2030,11 +2060,11 @@ fn draw_emitter_card(
                         }
                     });
                 });
-                ui.add_space(Metrics::XS);
+                ui.add_space(Metrics::SM);
 
                 // Sounds: removable chips and an "add" menu.
                 ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+                    ui.spacing_mut().item_spacing = vec2(Metrics::SM, Metrics::SM);
                     let mut drop_sound: Option<usize> = None;
                     for (i, sound) in emitter.sounds.iter().enumerate() {
                         let missing = library.sound_by_id(*sound).is_none();
@@ -2090,12 +2120,12 @@ fn draw_emitter_card(
                             }
                         });
                 });
-                ui.add_space(Metrics::SM);
+                ui.add_space(Metrics::MD);
 
                 // Numbers.
                 egui::Grid::new("em_grid")
                     .num_columns(3)
-                    .spacing([Metrics::MD, 6.0])
+                    .spacing([Metrics::MD, Metrics::SM])
                     .show(ui, |ui| {
                         ui.label(micro_label("Every"));
                         ui.horizontal(|ui| {

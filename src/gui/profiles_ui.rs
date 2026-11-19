@@ -8,6 +8,7 @@
 
 use crate::gui::app::SoundSharedApp;
 use crate::gui::dialog::{error_line, header, modal_sized};
+use crate::gui::settings_extras::kit;
 use crate::gui::theme::{alpha, hairline, micro_label, Metrics, Palette};
 use crate::gui::widgets::{glyph, ConsoleButton};
 use crate::profiles::{self, ProfileError, RecentProfiles};
@@ -329,6 +330,7 @@ pub fn profile_menu(ui: &mut Ui, state: &mut SoundSharedApp) {
         state.profiles_ui.refresh(&env);
     }
     let active = env.active.clone();
+    ui.add_space(Metrics::LG);
     ui.label(micro_label("Profile"));
     let menu = ui.menu_button(
         RichText::new(short(display_name(&active)))
@@ -337,7 +339,7 @@ pub fn profile_menu(ui: &mut Ui, state: &mut SoundSharedApp) {
         |ui| {
             ui.set_min_width(220.0);
             ui.label(micro_label("Switch to (restarts Bardwave)"));
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::SM);
             for entry in state.profiles_ui.menu_entries() {
                 let current = same_profile(&entry, &active);
                 let text = if current {
@@ -350,8 +352,9 @@ pub fn profile_menu(ui: &mut Ui, state: &mut SoundSharedApp) {
                     ui.close_menu();
                 }
             }
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::SM);
             hairline(ui);
+            ui.add_space(Metrics::SM);
             if ui.button("New profile…").clicked() {
                 state.profiles_ui.open_new();
                 ui.close_menu();
@@ -476,10 +479,13 @@ pub fn show_profile_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                 },
             );
             ui.add_space(Metrics::MD);
-            ui.label(micro_label(format!(
-                "Switch to \"{}\"? The server and all sounds stop, the current profile is saved.",
-                display_name(target)
-            )));
+            ui.label(
+                micro_label(format!(
+                    "Switch to \"{}\"? The server and all sounds stop, the current profile is saved.",
+                    display_name(target)
+                ))
+                .line_height(Some(16.0)),
+            );
             ui.add_space(Metrics::LG);
             hairline(ui);
             ui.add_space(Metrics::MD);
@@ -500,10 +506,10 @@ pub fn show_profile_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     act = Some(Act::Primary);
                 }
-                ui.add_space(Metrics::XS);
+                ui.add_space(Metrics::SM);
                 ui.checkbox(copy, "Copy the current library");
             });
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::SM);
             match (&*error, *busy) {
                 (_, true) => {
                     ui.label(micro_label("Copying the library…"));
@@ -527,6 +533,7 @@ pub fn show_profile_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
             egui::ScrollArea::vertical()
                 .max_height(240.0)
                 .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = Metrics::SM;
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Default").color(Palette::WHITE));
                         if active.is_none() {
@@ -546,6 +553,7 @@ pub fn show_profile_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if ConsoleButton::danger("Delete")
+                                            .width(90.0)
                                             .small()
                                             .id_salt(&format!("prof_del_{name}"))
                                             .show(ui)
@@ -554,6 +562,7 @@ pub fn show_profile_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                                             act = Some(Act::Delete(name.clone()));
                                         }
                                         if ConsoleButton::ghost("Rename")
+                                            .width(90.0)
                                             .small()
                                             .id_salt(&format!("prof_ren_{name}"))
                                             .show(ui)
@@ -568,12 +577,21 @@ pub fn show_profile_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                     }
                     if names.is_empty() {
                         ui.add_space(Metrics::XS);
-                        ui.label(micro_label("No other profiles yet"));
+                        if kit::empty_state_action(
+                            ui,
+                            "No other profiles yet",
+                            "A profile is a separate config and library: keep one per campaign \
+                             and switch between them without mixing sounds or scenes.",
+                            "New profile…",
+                            "prof_empty_new",
+                        ) {
+                            act = Some(Act::NewProfile);
+                        }
                     }
                 });
             if let Some(message) = message {
-                ui.add_space(Metrics::SM);
-                ui.label(micro_label(message.as_str()));
+                ui.add_space(Metrics::MD);
+                ui.label(micro_label(message.as_str()).line_height(Some(16.0)));
             }
             ui.add_space(Metrics::LG);
             hairline(ui);
