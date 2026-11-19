@@ -1422,6 +1422,189 @@ const GRID_GAP: f32 = 8.0;
 /// Stinger pad width.
 const PAD_W: f32 = 132.0;
 
+// ---- Deck layout (pure, tested over the whole range of panel widths) ----
+
+/// `SCENES` caption plus the `N scenes` count (10px mono, tracked), with room
+/// for a three-digit count.
+const HEAD_LEFT_W: f32 = 136.0;
+/// `· ACTIVE: <name>` with the name cut at 24 characters.
+const HEAD_ACTIVE_W: f32 = 250.0;
+/// `Save Mix As Scene` / `Save Mix` buttons.
+const SAVE_FULL_W: f32 = 170.0;
+const SAVE_SHORT_W: f32 = 108.0;
+/// A glyph-only button.
+const ICON_BTN_W: f32 = 30.0;
+/// `New` button with its text.
+const NEW_W: f32 = 70.0;
+/// `Show` / `Hide` toggle.
+const TOGGLE_W: f32 = 64.0;
+
+/// How the save-mix button is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveStyle {
+    /// `Save Mix As Scene`.
+    Full,
+    /// `Save Mix`.
+    Short,
+    /// The wave glyph alone (`New` turns into its glyph too).
+    Icon,
+}
+
+/// How the deck header spends its width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeckHeaderLayout {
+    pub save: SaveStyle,
+    /// `· Active: <scene>` on the header line (else on a line of its own).
+    pub active_inline: bool,
+    /// The buttons sit on a line under the caption: not even the icon form
+    /// fits next to it.
+    pub stacked: bool,
+}
+
+impl DeckHeaderLayout {
+    /// Width of the three buttons with `Metrics::SM` between them.
+    pub fn buttons_w(&self) -> f32 {
+        let (save, new) = match self.save {
+            SaveStyle::Full => (SAVE_FULL_W, NEW_W),
+            SaveStyle::Short => (SAVE_SHORT_W, NEW_W),
+            SaveStyle::Icon => (ICON_BTN_W, ICON_BTN_W),
+        };
+        save + new + TOGGLE_W + 2.0 * Metrics::SM
+    }
+
+    /// Width of the header line's items.
+    pub fn width(&self) -> f32 {
+        if self.stacked {
+            return HEAD_LEFT_W.max(self.buttons_w());
+        }
+        let active = if self.active_inline {
+            Metrics::SM + HEAD_ACTIVE_W
+        } else {
+            0.0
+        };
+        HEAD_LEFT_W + active + Metrics::SM + self.buttons_w()
+    }
+}
+
+/// Header layout for a deck `avail` points wide: the roomiest button set that
+/// fits next to the caption; the active scene's name moves to its own line
+/// when it does not fit on the header line.
+pub fn deck_header_layout(avail: f32) -> DeckHeaderLayout {
+    for save in [SaveStyle::Full, SaveStyle::Short, SaveStyle::Icon] {
+        let below = DeckHeaderLayout {
+            save,
+            active_inline: false,
+            stacked: false,
+        };
+        if below.width() <= avail {
+            let inline = DeckHeaderLayout {
+                active_inline: true,
+                ..below
+            };
+            return if inline.width() <= avail {
+                inline
+            } else {
+                below
+            };
+        }
+    }
+    DeckHeaderLayout {
+        save: SaveStyle::Icon,
+        active_inline: false,
+        stacked: true,
+    }
+}
+
+const STOP_SCENE_W: f32 = 118.0;
+const FADE_OUT_W: f32 = 104.0;
+/// `TRANSITION` micro label.
+const TRANSITION_LABEL_W: f32 = 76.0;
+const AUTO_W: f32 = 56.0;
+/// Transition slider range.
+const TRANSITION_SLIDER_MAX_W: f32 = 120.0;
+const TRANSITION_SLIDER_MIN_W: f32 = 48.0;
+/// Value text after the slider: `2.5 s` or `Per scene`.
+const TRANSITION_VALUE_W: f32 = 66.0;
+
+/// How the transport row of the deck is arranged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransportLayout {
+    /// Stop buttons and the transition group share one line.
+    pub one_row: bool,
+    /// The transition group is cut in two lines: `TRANSITION` + `Auto`, then
+    /// the slider and its value.
+    pub split_group: bool,
+    /// The two stop buttons are one above the other (they do not fit side by
+    /// side). egui cannot wrap these painted buttons by itself.
+    pub buttons_stacked: bool,
+    pub slider_w: f32,
+}
+
+impl TransportLayout {
+    fn group_w(slider_w: f32) -> f32 {
+        TRANSITION_LABEL_W
+            + Metrics::SM
+            + AUTO_W
+            + Metrics::SM
+            + slider_w
+            + Metrics::SM
+            + TRANSITION_VALUE_W
+    }
+
+    /// Width of the widest line of the arrangement.
+    pub fn widest_line(&self) -> f32 {
+        let buttons = if self.buttons_stacked {
+            STOP_SCENE_W.max(FADE_OUT_W)
+        } else {
+            STOP_SCENE_W + Metrics::SM + FADE_OUT_W
+        };
+        if self.split_group {
+            let top = TRANSITION_LABEL_W + Metrics::SM + AUTO_W;
+            let bottom = self.slider_w + Metrics::SM + TRANSITION_VALUE_W;
+            return buttons.max(top).max(bottom);
+        }
+        let group = Self::group_w(self.slider_w);
+        if self.one_row {
+            buttons + Metrics::MD + group
+        } else {
+            buttons.max(group)
+        }
+    }
+}
+
+/// Arrangement of the transport row for `avail` points. The transition group is
+/// never torn apart mid-way, so its value text cannot end up alone on a line;
+/// the stop buttons stack when they do not fit side by side.
+pub fn transport_layout(avail: f32) -> TransportLayout {
+    let buttons = STOP_SCENE_W + Metrics::SM + FADE_OUT_W;
+    let buttons_stacked = avail < buttons;
+    let roomy = buttons + Metrics::MD + TransportLayout::group_w(TRANSITION_SLIDER_MAX_W);
+    if avail >= roomy {
+        return TransportLayout {
+            one_row: true,
+            split_group: false,
+            buttons_stacked: false,
+            slider_w: TRANSITION_SLIDER_MAX_W,
+        };
+    }
+    let least = TransportLayout::group_w(TRANSITION_SLIDER_MIN_W);
+    if avail >= least {
+        let fixed = TransportLayout::group_w(0.0);
+        return TransportLayout {
+            one_row: false,
+            split_group: false,
+            buttons_stacked,
+            slider_w: (avail - fixed).clamp(TRANSITION_SLIDER_MIN_W, TRANSITION_SLIDER_MAX_W),
+        };
+    }
+    TransportLayout {
+        one_row: false,
+        split_group: true,
+        buttons_stacked,
+        slider_w: (avail - Metrics::SM - TRANSITION_VALUE_W).clamp(24.0, TRANSITION_SLIDER_MAX_W),
+    }
+}
+
 /// What a click in the deck asks for; applied after the frame's borrows end.
 #[derive(Debug, Clone, PartialEq)]
 enum DeckAction {
@@ -1500,19 +1683,44 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
     let mut actions: Vec<DeckAction> = Vec::new();
 
     // ---- Header ----
-    ui.horizontal(|ui| {
+    //
+    // The buttons are placed first with their exact width and the caption gets
+    // what is left, clipped to it: the two can never overlap.
+    let avail = ui.available_width();
+    let head = deck_header_layout(avail);
+    let active_label = active_name
+        .as_ref()
+        .map(|name| format!("· Active: {}", elide(name, 24)));
+    let caption = |ui: &mut Ui| {
         ui.label(micro_label_accent("Scenes"));
         ui.label(micro_label(match cards.len() {
             1 => "1 scene".to_string(),
             n => format!("{n} scenes"),
         }));
-        if let Some(name) = &active_name {
-            ui.label(micro_label(format!("· Active: {}", elide(name, 24))));
+        if let (true, Some(text)) = (head.active_inline, &active_label) {
+            ui.add(egui::Label::new(micro_label(text.as_str())).truncate());
+        }
+    };
+    if head.stacked {
+        ui.horizontal(|ui| caption(ui));
+        ui.add_space(Metrics::XS);
+    }
+    ui.horizontal(|ui| {
+        if !head.stacked {
+            let left_w = (avail - head.buttons_w() - Metrics::SM).max(0.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(left_w, Metrics::BTN_H_SM),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                    caption(ui);
+                },
+            );
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let toggle = ConsoleButton::ghost(if open { "Hide" } else { "Show" })
                 .small()
-                .width(64.0)
+                .width(TOGGLE_W)
                 .id_salt("scenes_toggle")
                 .tooltip(if open {
                     "Collapse the scene deck"
@@ -1523,33 +1731,46 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
             if labelled(toggle, if open { "Hide scenes" } else { "Show scenes" }).clicked() {
                 actions.push(DeckAction::ToggleDeck);
             }
-            let new = ConsoleButton::ghost("New")
+            let icon_only = head.save == SaveStyle::Icon;
+            let new = ConsoleButton::ghost(if icon_only { "" } else { "New" })
                 .glyph(glyph::PLUS)
                 .small()
-                .width(70.0)
+                .width(if icon_only { ICON_BTN_W } else { NEW_W })
                 .id_salt("scenes_new")
                 .tooltip("Create an empty scene and choose its sounds")
                 .show(ui);
             if labelled(new, "New scene").clicked() {
                 actions.push(DeckAction::New);
             }
-            let save = ConsoleButton::primary("Save Mix As Scene")
-                .glyph(glyph::WAVE)
-                .small()
-                .width(170.0)
-                .enabled(playing_any)
-                .id_salt("scenes_save_mix")
-                .tooltip(if playing_any {
-                    "Save the sounds that play now, with their levels, as a scene"
-                } else {
-                    "Start some sounds first: the scene is built from what is playing"
-                })
-                .show(ui);
+            let save = ConsoleButton::primary(match head.save {
+                SaveStyle::Full => "Save Mix As Scene",
+                SaveStyle::Short => "Save Mix",
+                SaveStyle::Icon => "",
+            })
+            .glyph(glyph::WAVE)
+            .small()
+            .width(match head.save {
+                SaveStyle::Full => SAVE_FULL_W,
+                SaveStyle::Short => SAVE_SHORT_W,
+                SaveStyle::Icon => ICON_BTN_W,
+            })
+            .enabled(playing_any)
+            .id_salt("scenes_save_mix")
+            .tooltip(if playing_any {
+                "Save the sounds that play now, with their levels, as a scene"
+            } else {
+                "Start some sounds first: the scene is built from what is playing"
+            })
+            .show(ui);
             if labelled(save, "Save current mix as a scene").clicked() {
                 actions.push(DeckAction::SaveMix);
             }
         });
     });
+    if let (false, Some(text)) = (head.active_inline, &active_label) {
+        ui.add_space(Metrics::XS);
+        ui.add(egui::Label::new(micro_label(text.as_str())).truncate());
+    }
 
     if let Some(notice) = &notice {
         ui.add_space(Metrics::SM);
@@ -1565,12 +1786,17 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
         ui.add_space(Metrics::MD);
 
         // ---- Transport + shared transition time ----
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(Metrics::SM, Metrics::XS);
+        //
+        // Explicit rows from `transport_layout`: egui cannot wrap these painted
+        // buttons, so a row that does not fit is built by hand. The transition
+        // group goes under the buttons as a unit instead of breaking apart, so
+        // no piece of it ends up alone.
+        let transport = transport_layout(ui.available_width());
+        ui.horizontal(|ui| {
             let stop_scene = ConsoleButton::ghost("Stop Scene")
                 .glyph(glyph::STOP)
                 .small()
-                .width(118.0)
+                .width(STOP_SCENE_W)
                 .enabled(active_name.is_some())
                 .id_salt("scenes_stop_scene")
                 .tooltip("Fade out the active scene's sounds")
@@ -1578,52 +1804,22 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
             if labelled(stop_scene, "Stop the active scene").clicked() {
                 actions.push(DeckAction::StopScene);
             }
-            let stop_all = ConsoleButton::danger("Fade Out")
-                .glyph(glyph::STOP)
-                .small()
-                .width(104.0)
-                .id_salt("scenes_stop_all")
-                .tooltip("Fade out everything that plays, over the transition time")
-                .show(ui);
-            if labelled(stop_all, "Stop all sounds with a fade-out").clicked() {
-                actions.push(DeckAction::StopAll);
+            if !transport.buttons_stacked {
+                fade_out_button(ui, &mut actions);
             }
-
-            ui.add_space(Metrics::MD);
-            ui.label(micro_label("Transition"));
-            if toggle_button(ui, "Auto", auto, 56.0, "scenes_auto_fade") {
-                actions.push(DeckAction::SetAuto(!auto));
+            if transport.one_row {
+                ui.add_space(Metrics::XS);
+                transition_group(ui, &mut actions, &transport, auto, transition_ms);
             }
-            let mut position = ms_to_slider(transition_ms);
-            let slider = level_slider(ui, &mut position, 120.0, "scenes_transition");
-            slider.widget_info(|| {
-                WidgetInfo::slider(
-                    true,
-                    f64::from(transition_ms) / 1000.0,
-                    if auto {
-                        "Transition time: each scene's own fade".to_string()
-                    } else {
-                        format!("Transition time: {}", format_seconds(transition_ms))
-                    },
-                )
-            });
-            if slider.changed() {
-                actions.push(DeckAction::SetTransition(slider_to_ms(position)));
-            }
-            ui.label(
-                RichText::new(if auto {
-                    "Scene".to_string()
-                } else {
-                    format_seconds(transition_ms)
-                })
-                .font(glyph_font(11.0))
-                .color(if auto {
-                    Palette::ZINC_400
-                } else {
-                    Palette::WHITE
-                }),
-            );
         });
+        if transport.buttons_stacked {
+            ui.add_space(Metrics::XS);
+            ui.horizontal(|ui| fade_out_button(ui, &mut actions));
+        }
+        if !transport.one_row {
+            ui.add_space(Metrics::SM);
+            transition_group(ui, &mut actions, &transport, auto, transition_ms);
+        }
 
         ui.add_space(Metrics::MD);
 
@@ -1668,6 +1864,7 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
         if pads.is_empty() {
             if any_sounds {
                 ui.label(micro_label("Stingers"));
+                ui.add_space(Metrics::XS);
                 settings_kit::note_under(
                     ui,
                     "One-shot sounds that play over the scene. Right-click a sound and choose \
@@ -1686,27 +1883,110 @@ pub fn scenes_deck(ui: &mut Ui, state: &mut SoundSharedApp) {
                 .auto_shrink([false, true])
                 .max_height(CARD_H)
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = Vec2::splat(Metrics::SM);
-                    ui.horizontal_wrapped(|ui| {
-                        for (index, pad) in pads.iter().enumerate() {
-                            let salt = format!("stinger_{}", pad.id.0);
-                            let resp = ConsoleButton::ghost(elide(&pad.name, 13))
-                                .glyph(glyph::PLAY)
-                                .small()
-                                .width(PAD_W)
-                                .id_salt(&salt)
-                                .tooltip(format!("Play “{}” once, over everything", pad.name))
-                                .show(ui);
-                            if labelled(resp, &format!("Stinger {}", pad.name)).clicked() {
-                                actions.push(DeckAction::Stinger(index));
-                            }
+                    // Rows built by hand: egui cannot wrap painted buttons.
+                    let per_row = grid_columns(ui.available_width(), PAD_W, Metrics::SM);
+                    for (row, chunk) in pads.chunks(per_row).enumerate() {
+                        if row > 0 {
+                            ui.add_space(Metrics::SM);
                         }
-                    });
+                        ui.horizontal(|ui| {
+                            for (offset, pad) in chunk.iter().enumerate() {
+                                let index = row * per_row + offset;
+                                let salt = format!("stinger_{}", pad.id.0);
+                                let resp = ConsoleButton::ghost(elide(&pad.name, 13))
+                                    .glyph(glyph::PLAY)
+                                    .small()
+                                    .width(PAD_W)
+                                    .id_salt(&salt)
+                                    .tooltip(format!("Play “{}” once, over everything", pad.name))
+                                    .show(ui);
+                                if labelled(resp, &format!("Stinger {}", pad.name)).clicked() {
+                                    actions.push(DeckAction::Stinger(index));
+                                }
+                            }
+                        });
+                    }
                 });
         }
     }
 
     apply_deck_actions(state, &ctx, actions, &pads);
+}
+
+/// `Fade Out`: fade everything that plays over the transition time.
+fn fade_out_button(ui: &mut Ui, actions: &mut Vec<DeckAction>) {
+    let stop_all = ConsoleButton::danger("Fade Out")
+        .glyph(glyph::STOP)
+        .small()
+        .width(FADE_OUT_W)
+        .id_salt("scenes_stop_all")
+        .tooltip("Fade out everything that plays, over the transition time")
+        .show(ui);
+    if labelled(stop_all, "Stop all sounds with a fade-out").clicked() {
+        actions.push(DeckAction::StopAll);
+    }
+}
+
+/// `TRANSITION`, the `Auto` toggle, the slider and its value, as one unit.
+/// With `layout.split_group` it is drawn as two lines, still as a unit.
+fn transition_group(
+    ui: &mut Ui,
+    actions: &mut Vec<DeckAction>,
+    layout: &TransportLayout,
+    auto: bool,
+    transition_ms: u32,
+) {
+    let head = |ui: &mut Ui, actions: &mut Vec<DeckAction>| {
+        ui.add_sized(
+            [TRANSITION_LABEL_W, Metrics::BTN_H_SM],
+            egui::Label::new(micro_label("Transition")),
+        );
+        if toggle_button(ui, "Auto", auto, AUTO_W, "scenes_auto_fade") {
+            actions.push(DeckAction::SetAuto(!auto));
+        }
+    };
+    let tail = |ui: &mut Ui, actions: &mut Vec<DeckAction>| {
+        let mut position = ms_to_slider(transition_ms);
+        let slider = level_slider(ui, &mut position, layout.slider_w, "scenes_transition");
+        slider.widget_info(|| {
+            WidgetInfo::slider(
+                true,
+                f64::from(transition_ms) / 1000.0,
+                if auto {
+                    "Transition time: each scene's own fade".to_string()
+                } else {
+                    format!("Transition time: {}", format_seconds(transition_ms))
+                },
+            )
+        });
+        if slider.changed() {
+            actions.push(DeckAction::SetTransition(slider_to_ms(position)));
+        }
+        // Fixed width: the value changing between `Per scene` and `2.5 s` never
+        // moves anything else.
+        let (text, color) = if auto {
+            ("Per scene".to_string(), Palette::ZINC_400)
+        } else {
+            (format_seconds(transition_ms), Palette::WHITE)
+        };
+        let value = ui.add_sized(
+            [TRANSITION_VALUE_W, Metrics::BTN_H_SM],
+            egui::Label::new(RichText::new(text).font(glyph_font(11.0)).color(color)),
+        );
+        if auto {
+            value.on_hover_text("Auto: every scene fades with its own fade-in time");
+        }
+    };
+    if layout.split_group {
+        ui.horizontal(|ui| head(ui, actions));
+        ui.add_space(Metrics::XS);
+        ui.horizontal(|ui| tail(ui, actions));
+    } else {
+        ui.horizontal(|ui| {
+            head(ui, actions);
+            tail(ui, actions);
+        });
+    }
 }
 
 /// Run what the frame collected.
@@ -3443,5 +3723,162 @@ mod tests {
         assert!(ui.notice().is_some(), "errors stay longer");
         ui.poll(t0 + NOTICE_ERROR_HOLD);
         assert!(ui.notice().is_none());
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::gui::hotkeys_ui::test_support::harness;
+    use crate::gui::layout_probe::{assert_clean, run_frames, text_boxes};
+
+    /// Panel inner widths the deck sees between a 640 and a 1600 window: the
+    /// library column is `window - 48 - 340 - 24` wide minus 48 of padding.
+    fn deck_widths() -> impl Iterator<Item = f32> {
+        (640..=1600).map(|w| w as f32 - 48.0 - 340.0 - 24.0 - 48.0)
+    }
+
+    #[test]
+    fn header_fits_next_to_its_caption_at_any_width() {
+        for width in deck_widths() {
+            let head = deck_header_layout(width);
+            assert!(
+                head.width() <= width + 0.001,
+                "{width}: {head:?} needs {}",
+                head.width()
+            );
+        }
+    }
+
+    #[test]
+    fn header_gives_up_text_before_it_gives_up_the_buttons() {
+        let roomy = deck_header_layout(1000.0);
+        assert_eq!(roomy.save, SaveStyle::Full);
+        assert!(roomy.active_inline);
+        let mut previous = roomy;
+        for width in (130..=1000).rev() {
+            let head = deck_header_layout(width as f32);
+            // Never goes back to a richer form while narrowing.
+            assert!(head.save as u8 >= previous.save as u8, "{width}");
+            if head.save == previous.save {
+                assert!(head.active_inline <= previous.active_inline, "{width}");
+            }
+            previous = head;
+        }
+    }
+
+    #[test]
+    fn transport_lines_fit_at_any_width() {
+        for width in deck_widths() {
+            let layout = transport_layout(width);
+            assert!(
+                layout.widest_line() <= width + 0.001,
+                "{width}: {layout:?} needs {}",
+                layout.widest_line()
+            );
+            assert!(layout.slider_w >= 24.0 && layout.slider_w <= TRANSITION_SLIDER_MAX_W);
+        }
+        // The two stop buttons wrap by themselves, so each must fit alone.
+        assert!(deck_widths().all(|w| w >= STOP_SCENE_W.max(FADE_OUT_W)));
+    }
+
+    #[test]
+    fn transition_group_is_never_torn_apart_before_it_has_to() {
+        let roomy = transport_layout(900.0);
+        assert!(roomy.one_row && !roomy.split_group);
+        // The group stays whole in every width where it fits at all.
+        let least = TransportLayout::group_w(TRANSITION_SLIDER_MIN_W);
+        for width in deck_widths().filter(|w| *w >= least) {
+            assert!(!transport_layout(width).split_group, "{width}");
+        }
+    }
+
+    fn deck_boxes(width: f32, auto: bool, open: bool) -> Vec<crate::gui::layout_probe::TextBox> {
+        let mut config = Config::default();
+        for name in ["Tavern", "A scene with a rather long name", "Road"] {
+            config.library.scenes.push(crate::config::SceneConfig {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            });
+        }
+        let mut h = harness(config, false);
+        h.app.scenes.auto_fade = auto;
+        h.app.scenes.deck_open = open;
+        let ctx = h.ctx.clone();
+        let out = run_frames(&ctx, egui::vec2(width + 200.0, 700.0), 2, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(width, 600.0),
+                    Layout::top_down(Align::Min),
+                    |ui| scenes_deck(ui, &mut h.app),
+                );
+            });
+        });
+        text_boxes(&out)
+    }
+
+    #[test]
+    fn painted_deck_stays_inside_its_panel_at_any_width() {
+        for width in deck_widths().step_by(7) {
+            for auto in [true, false] {
+                let boxes = deck_boxes(width, auto, true);
+                assert!(boxes.iter().any(|b| b.text == "TRANSITION"), "{width}");
+                // The deck's left edge is its leftmost text; it is `width` wide.
+                let left = boxes.iter().map(|b| b.rect.left()).fold(f32::MAX, f32::min);
+                let bounds = Rect::from_min_max(
+                    egui::pos2(left - 0.5, 0.0),
+                    egui::pos2(left + width + 0.5, 700.0),
+                );
+                // Scene cards paint their own clipped labels; only the header
+                // and the transport above them are held to the panel edge.
+                let cards_top = boxes
+                    .iter()
+                    .filter(|b| b.text.contains("TAVERN"))
+                    .map(|b| b.rect.top())
+                    .fold(f32::MAX, f32::min);
+                let head: Vec<_> = boxes
+                    .iter()
+                    .filter(|b| b.rect.bottom() < cards_top)
+                    .cloned()
+                    .collect();
+                assert!(head.len() >= 4, "{width}: {boxes:?}");
+                assert_clean(&head, bounds, &format!("deck at {width} (auto {auto})"));
+            }
+        }
+    }
+
+    #[test]
+    fn no_lone_scene_label_hangs_under_the_buttons() {
+        for width in [228.0 - 48.0, 440.0, 548.0 - 48.0, 820.0] {
+            for auto in [true, false] {
+                let boxes = deck_boxes(width, auto, true);
+                assert!(
+                    !boxes.iter().any(|b| b.text == "SCENE"),
+                    "{width}: a bare Scene label is back: {boxes:?}"
+                );
+                if auto {
+                    let value = boxes
+                        .iter()
+                        .find(|b| b.text == "PER SCENE")
+                        .unwrap_or_else(|| panic!("{width}: no value text in {boxes:?}"));
+                    // It sits on the slider's line, not on its own.
+                    let transition = boxes.iter().find(|b| b.text == "TRANSITION").unwrap();
+                    assert!(
+                        (value.rect.center().y - transition.rect.center().y).abs() < 40.0,
+                        "{width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_deck_draws_only_its_header() {
+        let boxes = deck_boxes(440.0, true, false);
+        assert!(boxes.iter().any(|b| b.text == "SCENES"));
+        assert!(!boxes.iter().any(|b| b.text == "TRANSITION"));
     }
 }

@@ -45,8 +45,6 @@ use crate::gui::theme::{
 };
 use crate::gui::widgets::{elide, glyph, level_slider, paint_icon, BtnKind, ConsoleButton, Glyph};
 
-/// Height of the transport bar above the status strip.
-pub const MUSIC_BAR_H: f32 = 56.0;
 /// Longest crossfade the manager offers.
 pub const MAX_CROSSFADE_MS: u32 = 30_000;
 /// Shortest interval of an emitter (the scheduler floors lower ones anyway).
@@ -58,7 +56,25 @@ pub const MAX_EMITTER_OVERLAP: u32 = 16;
 /// Seeking never lands closer than this to the end (it would end the track).
 pub const SEEK_END_GUARD_MS: u64 = 500;
 
+/// Widest the now-playing block gets (title + subline).
 const NOW_PLAYING_W: f32 = 232.0;
+/// Narrowest it gets before the title is useless.
+const NOW_PLAYING_MIN_W: f32 = 140.0;
+/// One transport button (previous, play, stop, next).
+const TRANSPORT_BTN: f32 = 32.0;
+/// The four transport buttons with `Metrics::SM` between them.
+const TRANSPORT_W: f32 = 4.0 * TRANSPORT_BTN + 3.0 * Metrics::SM;
+/// Elapsed / total clock column.
+const CLOCK_W: f32 = 44.0;
+/// The seek bar never gets thinner than this while it is shown.
+const SEEK_MIN_W: f32 = 60.0;
+/// Labelled mode buttons.
+const SHUFFLE_W: f32 = 86.0;
+const REPEAT_W: f32 = 104.0;
+/// The `Music…` button.
+const MUSIC_W: f32 = 88.0;
+/// Square mode button (the icon form of Shuffle / Repeat).
+const MODE_ICON_W: f32 = 28.0;
 const MANAGER_W: f32 = 780.0;
 const EMITTERS_W: f32 = 600.0;
 
@@ -661,6 +677,7 @@ enum Ico {
     Up,
     Down,
     Grip,
+    Shuffle,
 }
 
 fn paint_ico(painter: &egui::Painter, ico: Ico, center: egui::Pos2, size: f32, color: Color32) {
@@ -698,6 +715,29 @@ fn paint_ico(painter: &egui::Painter, ico: Ico, center: egui::Pos2, size: f32, c
                 vec![p(-0.3, -0.14), p(0.0, 0.16), p(0.3, -0.14)],
                 stroke,
             ));
+        }
+        Ico::Shuffle => {
+            // Two arrows that cross: the classic shuffle mark.
+            let head = |tip: egui::Pos2| {
+                Shape::line(
+                    vec![
+                        pos2(tip.x - size * 0.14, tip.y + size * 0.12),
+                        tip,
+                        pos2(tip.x - size * 0.14, tip.y - size * 0.12),
+                    ],
+                    stroke,
+                )
+            };
+            painter.add(Shape::line(
+                vec![p(-0.36, -0.2), p(-0.1, -0.2), p(0.1, 0.2), p(0.28, 0.2)],
+                stroke,
+            ));
+            painter.add(head(p(0.36, 0.2)));
+            painter.add(Shape::line(
+                vec![p(-0.36, 0.2), p(-0.1, 0.2), p(0.1, -0.2), p(0.28, -0.2)],
+                stroke,
+            ));
+            painter.add(head(p(0.36, -0.2)));
         }
         Ico::Grip => {
             for x in [-0.14, 0.14] {
@@ -918,25 +958,141 @@ fn dialog_header(ui: &mut Ui, code: &str, title: &str, subtitle: &str) {
 // Transport bar
 // =====================================================================
 
+// ---- Transport bar layout -------------------------------------------------
+
+/// How the transport bar spends its width. Items are separated by
+/// `Metrics::SM` (the bar sets `item_spacing.x` and adds no extra gaps).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerLayout {
+    /// Width of the now-playing block.
+    pub now_playing_w: f32,
+    /// Width of the seek bar.
+    pub seek_w: f32,
+    /// Elapsed / total clocks on both sides of the seek bar.
+    pub clocks: bool,
+    /// `Shuffle` / `Repeat All` text buttons (else square icon buttons).
+    pub mode_labels: bool,
+}
+
+impl PlayerLayout {
+    fn width_of(now_playing_w: f32, seek_w: f32, clocks: bool, mode_labels: bool) -> f32 {
+        let gap = Metrics::SM;
+        let seek = if clocks {
+            CLOCK_W + gap + seek_w + gap + CLOCK_W + gap
+        } else {
+            seek_w + gap
+        };
+        let (shuffle, repeat) = if mode_labels {
+            (SHUFFLE_W, REPEAT_W)
+        } else {
+            (MODE_ICON_W, MODE_ICON_W)
+        };
+        TRANSPORT_W + gap + now_playing_w + gap + seek + shuffle + gap + repeat + gap + MUSIC_W
+    }
+
+    /// Width the items add up to, gaps included.
+    pub fn width(&self) -> f32 {
+        Self::width_of(
+            self.now_playing_w,
+            self.seek_w,
+            self.clocks,
+            self.mode_labels,
+        )
+    }
+
+    /// Width of the Shuffle button.
+    pub fn shuffle_w(&self) -> f32 {
+        if self.mode_labels {
+            SHUFFLE_W
+        } else {
+            MODE_ICON_W
+        }
+    }
+
+    /// Width of the Repeat button.
+    pub fn repeat_w(&self) -> f32 {
+        if self.mode_labels {
+            REPEAT_W
+        } else {
+            MODE_ICON_W
+        }
+    }
+}
+
+/// Layout for a card whose inside is `inner` points wide.
+///
+/// Order of give-ups as the window narrows: the seek bar shrinks to
+/// `SEEK_MIN_W` first, then the now-playing block, then Shuffle / Repeat turn
+/// into icons (and the block grows back), and last the clocks go. Nothing
+/// overlaps down to the 640px window the layout is tested for.
+pub fn player_layout(inner: f32) -> PlayerLayout {
+    let attempts = [(true, true), (false, true), (false, false)];
+    for (mode_labels, clocks) in attempts {
+        let seek = inner - PlayerLayout::width_of(NOW_PLAYING_W, 0.0, clocks, mode_labels);
+        if seek >= SEEK_MIN_W {
+            return PlayerLayout {
+                now_playing_w: NOW_PLAYING_W,
+                seek_w: seek,
+                clocks,
+                mode_labels,
+            };
+        }
+        let now_playing_w = NOW_PLAYING_W - (SEEK_MIN_W - seek);
+        if now_playing_w >= NOW_PLAYING_MIN_W {
+            return PlayerLayout {
+                now_playing_w,
+                seek_w: SEEK_MIN_W,
+                clocks,
+                mode_labels,
+            };
+        }
+    }
+    // Narrower than anything the window allows: the smallest form.
+    PlayerLayout {
+        now_playing_w: NOW_PLAYING_MIN_W,
+        seek_w: SEEK_MIN_W,
+        clocks: false,
+        mode_labels: false,
+    }
+}
+
+/// The card of the bar inside the bottom panel `full`: bottom-anchored so the
+/// air above it (`PLAYER_GAP_TOP`) and below (`PLAYER_GAP_BOTTOM`) is the same
+/// whatever the panel height.
+pub fn player_card_rect(full: Rect) -> Rect {
+    let bottom = full.bottom() - Metrics::PLAYER_GAP_BOTTOM;
+    Rect::from_min_max(
+        pos2(
+            full.left() + Metrics::APP_PAD,
+            bottom - Metrics::PLAYER_CARD_H,
+        ),
+        pos2(full.right() - Metrics::APP_PAD, bottom),
+    )
+}
+
+/// Padding between the card edge and its items.
+const PLAYER_PAD: f32 = Metrics::LG;
+
 /// Draw the transport bar into `ui` (the full-width bottom panel).
 pub fn draw_bar(ui: &mut Ui, env: &MusicEnv, st: &mut MusicUi) -> Vec<MusicAction> {
     let mut actions = Vec::new();
-    let full = ui.max_rect();
-    let rect = Rect::from_min_max(
-        pos2(full.left() + Metrics::APP_PAD, full.top()),
-        pos2(full.right() - Metrics::APP_PAD, full.bottom() - 8.0),
-    );
+    let rect = player_card_rect(ui.max_rect());
     ui.painter().rect(
         rect,
         Rounding::same(Metrics::R_PANEL),
         Palette::PANEL,
         Stroke::new(1.0_f32, Palette::BORDER),
     );
+    let inner = rect.shrink2(vec2(PLAYER_PAD, 0.0));
+    let layout = player_layout(inner.width());
     let mut ui = ui.new_child(
         UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(Metrics::LG, 0.0)))
+            .max_rect(inner)
             .layout(Layout::left_to_right(Align::Center)),
     );
+    // Clip to the card: whatever a too narrow window cannot hold is cut off at
+    // the card edge instead of spilling over its neighbours.
+    ui.set_clip_rect(inner.expand2(vec2(PLAYER_PAD - 1.0, 0.0)));
     ui.spacing_mut().item_spacing.x = Metrics::SM;
 
     let live = &env.live;
@@ -1002,32 +1158,42 @@ pub fn draw_bar(ui: &mut Ui, env: &MusicEnv, st: &mut MusicUi) -> Vec<MusicActio
     {
         actions.push(MusicAction::Command(PlaylistCommand::Next));
     }
-    ui.add_space(Metrics::SM);
 
-    // Now playing.
+    // Now playing: truncated to its block, the full text is in the tooltip.
     ui.allocate_ui_with_layout(
-        vec2(NOW_PLAYING_W, 36.0),
+        vec2(layout.now_playing_w, 36.0),
         Layout::top_down(Align::Min),
         |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let title = track_display(live, |id| env.track_name(id));
             match &title {
-                Some(title) => ui.label(
-                    RichText::new(elide(title, 30))
-                        .font(ui_font(13.0))
-                        .color(Palette::WHITE),
-                ),
-                None => ui.label(
-                    RichText::new("No music playing")
-                        .font(ui_font(13.0))
-                        .color(Palette::ZINC_500),
+                Some(title) => ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(title)
+                                .font(ui_font(13.0))
+                                .color(Palette::WHITE),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(title),
+                None => ui.add(
+                    egui::Label::new(
+                        RichText::new("No music playing")
+                            .font(ui_font(13.0))
+                            .color(Palette::ZINC_500),
+                    )
+                    .truncate(),
                 ),
             };
             if let Some(message) = st.message().or(live.error.as_deref()) {
-                ui.label(
-                    RichText::new(elide(&message.to_uppercase(), 36))
-                        .font(mono_font(9.0))
-                        .color(Palette::ROSE_400),
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(message.to_uppercase())
+                            .font(mono_font(9.0))
+                            .color(Palette::ROSE_400),
+                    )
+                    .truncate(),
                 )
                 .on_hover_text(message);
             } else {
@@ -1038,36 +1204,34 @@ pub fn draw_bar(ui: &mut Ui, env: &MusicEnv, st: &mut MusicUi) -> Vec<MusicActio
                     }
                     (None, _) => "Open Music to build a playlist".to_string(),
                 };
-                ui.label(row_subline(sub));
+                ui.add(egui::Label::new(row_subline(sub)).truncate());
             }
         },
     );
 
-    // Seek: clock, bar, clock. The right-hand group has a fixed width, the
-    // bar takes what is left.
-    const CLOCK_W: f32 = 44.0;
-    const RIGHT_W: f32 = 86.0 + 104.0 + 88.0 + 3.0 * Metrics::SM;
-    let seek_w = (ui.available_width() - RIGHT_W - 2.0 * CLOCK_W - 3.0 * Metrics::SM).max(60.0);
+    // Seek: clock, bar, clock. The bar takes whatever the layout left it.
     let duration = live.duration_ms.filter(|_| view.active);
     let shown_pos = match (st.seek_drag, duration) {
         (Some(fraction), Some(_)) => seek_target_ms(fraction, duration).unwrap_or(0),
         _ => live.position_ms,
     };
-    ui.allocate_ui_with_layout(
-        vec2(CLOCK_W, 16.0),
-        Layout::right_to_left(Align::Center),
-        |ui| {
-            let text = if view.active {
-                format_clock(shown_pos)
-            } else {
-                "-:--".to_string()
-            };
-            ui.label(telemetry(text, 11.0, Palette::ZINC_400));
-        },
-    );
+    if layout.clocks {
+        ui.allocate_ui_with_layout(
+            vec2(CLOCK_W, 16.0),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                let text = if view.active {
+                    format_clock(shown_pos)
+                } else {
+                    "-:--".to_string()
+                };
+                ui.label(telemetry(text, 11.0, Palette::ZINC_400));
+            },
+        );
+    }
     if let Some(fraction) = seek_bar(
         &mut ui,
-        seek_w,
+        layout.seek_w,
         progress_fraction(live.position_ms, duration),
         view.can_seek,
         &mut st.seek_drag,
@@ -1076,55 +1240,103 @@ pub fn draw_bar(ui: &mut Ui, env: &MusicEnv, st: &mut MusicUi) -> Vec<MusicActio
             actions.push(MusicAction::Command(PlaylistCommand::Seek(ms)));
         }
     }
-    ui.allocate_ui_with_layout(
-        vec2(CLOCK_W, 16.0),
-        Layout::left_to_right(Align::Center),
-        |ui| {
-            let text = match duration {
-                Some(d) => format_clock(d),
-                None => "-:--".to_string(),
-            };
-            ui.label(telemetry(text, 11.0, Palette::ZINC_400));
-        },
-    );
+    if layout.clocks {
+        ui.allocate_ui_with_layout(
+            vec2(CLOCK_W, 16.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                let text = match duration {
+                    Some(d) => format_clock(d),
+                    None => "-:--".to_string(),
+                };
+                ui.label(telemetry(text, 11.0, Palette::ZINC_400));
+            },
+        );
+    }
 
-    // Shuffle / repeat of the loaded playlist.
+    // Shuffle / repeat of the loaded playlist: text buttons while there is
+    // room, square icons (same tooltips) when there is not.
     let loaded: Option<PlaylistId> = live
         .playlist
         .as_deref()
         .and_then(|id| uuid::Uuid::parse_str(id).ok());
-    let shuffle = ConsoleButton::new("Shuffle")
-        .small()
-        .width(86.0)
-        .kind(if live.shuffle {
-            BtnKind::Armed
-        } else {
-            BtnKind::Ghost
-        })
-        .enabled(loaded.is_some())
-        .tooltip("Play the tracks in random order")
-        .id_salt("mb_shuffle")
-        .show(&mut ui);
-    if let (true, Some(playlist)) = (shuffle.clicked(), loaded) {
+    let shuffle_kind = if live.shuffle {
+        BtnKind::Armed
+    } else {
+        BtnKind::Ghost
+    };
+    let repeat_kind = if live.repeat == RepeatMode::Off {
+        BtnKind::Ghost
+    } else {
+        BtnKind::Armed
+    };
+    let shuffle_tip = if live.shuffle {
+        "Shuffle is on: tracks play in random order"
+    } else {
+        "Play the tracks in random order"
+    };
+    let repeat_tip = format!(
+        "Repeat {}: what happens at the end (off, all tracks again, or the same track)",
+        repeat_label(live.repeat)
+    );
+    let (shuffle_clicked, repeat_clicked) = if layout.mode_labels {
+        let shuffle = ConsoleButton::new("Shuffle")
+            .small()
+            .width(layout.shuffle_w())
+            .kind(shuffle_kind)
+            .enabled(loaded.is_some())
+            .tooltip(shuffle_tip)
+            .id_salt("mb_shuffle")
+            .show(&mut ui);
+        let repeat = ConsoleButton::new(format!("Repeat {}", repeat_label(live.repeat)))
+            .small()
+            .width(layout.repeat_w())
+            .kind(repeat_kind)
+            .enabled(loaded.is_some())
+            .tooltip(repeat_tip)
+            .id_salt("mb_repeat")
+            .show(&mut ui);
+        (shuffle.clicked(), repeat.clicked())
+    } else {
+        let shuffle = tool_button(
+            &mut ui,
+            Ico::Shuffle,
+            MODE_ICON_W,
+            shuffle_kind,
+            loaded.is_some(),
+            shuffle_tip,
+            "mb_shuffle",
+        );
+        let repeat = tool_button(
+            &mut ui,
+            Ico::Glyph(glyph::LOOP),
+            MODE_ICON_W,
+            repeat_kind,
+            loaded.is_some(),
+            &repeat_tip,
+            "mb_repeat",
+        );
+        if live.repeat == RepeatMode::One {
+            // The "same track" mode needs a mark: an icon alone cannot tell it
+            // from "all tracks".
+            ui.painter().text(
+                repeat.rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "1",
+                mono_font(9.0),
+                Palette::ROSE_400,
+            );
+        }
+        (shuffle.clicked(), repeat.clicked())
+    };
+    if let (true, Some(playlist)) = (shuffle_clicked, loaded) {
         actions.push(MusicAction::SetMode {
             playlist,
             shuffle: !live.shuffle,
             repeat: live.repeat,
         });
     }
-    let repeat = ConsoleButton::new(format!("Repeat {}", repeat_label(live.repeat)))
-        .small()
-        .width(104.0)
-        .kind(if live.repeat == RepeatMode::Off {
-            BtnKind::Ghost
-        } else {
-            BtnKind::Armed
-        })
-        .enabled(loaded.is_some())
-        .tooltip("What happens at the end: off, all tracks again, or the same track")
-        .id_salt("mb_repeat")
-        .show(&mut ui);
-    if let (true, Some(playlist)) = (repeat.clicked(), loaded) {
+    if let (true, Some(playlist)) = (repeat_clicked, loaded) {
         actions.push(MusicAction::SetMode {
             playlist,
             shuffle: live.shuffle,
@@ -1133,7 +1345,7 @@ pub fn draw_bar(ui: &mut Ui, env: &MusicEnv, st: &mut MusicUi) -> Vec<MusicActio
     }
     if ConsoleButton::ghost("Music…")
         .small()
-        .width(88.0)
+        .width(MUSIC_W)
         .tooltip("Playlists, scene music and emitters")
         .id_salt("mb_music")
         .show(&mut ui)

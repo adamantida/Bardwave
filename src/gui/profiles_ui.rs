@@ -323,19 +323,65 @@ pub fn title_suffix() -> String {
     }
 }
 
-/// The profile button of the top bar and its drop-down.
-pub fn profile_menu(ui: &mut Ui, state: &mut SoundSharedApp) {
+/// How much room the profile control gets in the top bar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProfileStyle {
+    /// Draw the `PROFILE` caption before the button.
+    pub label: bool,
+    /// Widest the name text may be (the rest is cut with an ellipsis; the full
+    /// name is in the tooltip).
+    pub name_w: f32,
+}
+
+/// Longest prefix of `text` (plus an ellipsis when cut) that fits `max_w`.
+pub fn fit_text(ui: &Ui, text: &str, font: egui::FontId, max_w: f32) -> String {
+    let width = |t: &str| {
+        ui.fonts(|f| {
+            f.layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    if width(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let cut = |keep: usize| {
+        let mut out: String = chars[..keep].iter().collect();
+        out.push('\u{2026}');
+        out
+    };
+    // Binary search for the most characters that still fit with the ellipsis.
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if width(&cut(mid)) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    cut(lo)
+}
+
+/// The `PROFILE <name>` control of the top bar: the caption (when `style` has
+/// room for it) and a menu button that switches, creates and manages profiles.
+/// The caller places it; no spacing is added before it.
+pub fn profile_menu(ui: &mut Ui, state: &mut SoundSharedApp, style: ProfileStyle) {
     let env = ProfileEnv::real();
     if !state.profiles_ui.loaded {
         state.profiles_ui.refresh(&env);
     }
     let active = env.active.clone();
-    ui.add_space(Metrics::LG);
-    ui.label(micro_label("Profile"));
+    let full_name = display_name(&active).to_string();
+    let font = crate::gui::widgets::glyph_font(11.0);
+    let shown = fit_text(ui, &short(&full_name), font.clone(), style.name_w);
+    if style.label {
+        ui.label(micro_label("Profile"));
+        ui.add_space(Metrics::SM);
+    }
     let menu = ui.menu_button(
-        RichText::new(short(display_name(&active)))
-            .font(crate::gui::widgets::glyph_font(11.0))
-            .color(Palette::WHITE),
+        RichText::new(shown).font(font).color(Palette::WHITE),
         |ui| {
             ui.set_min_width(220.0);
             ui.label(micro_label("Switch to (restarts Bardwave)"));
@@ -372,9 +418,9 @@ pub fn profile_menu(ui: &mut Ui, state: &mut SoundSharedApp) {
             }
         },
     );
-    menu.response
-        .clone()
-        .on_hover_text("Switch, create or manage profiles");
+    menu.response.clone().on_hover_text(format!(
+        "Profile: {full_name}. Switch, create or manage profiles"
+    ));
     if menu.response.clicked() {
         // Opening the menu: pick up profiles created or removed elsewhere.
         state.profiles_ui.refresh(&env);

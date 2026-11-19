@@ -100,6 +100,28 @@ impl Metrics {
     pub const TOPBAR_H: f32 = 64.0;
     /// Bottom status strip height.
     pub const STATUS_H: f32 = 28.0;
+    /// Height of the player card (transport bar) itself.
+    pub const PLAYER_CARD_H: f32 = 48.0;
+    /// Air above the player card. The panel above it already ends `BOTTOM_PAD`
+    /// higher, so the visible gap to the library / network panels is
+    /// `PLAYER_GAP_TOP + CONTENT_BOTTOM_PAD`, the same 24px as the side pads.
+    pub const PLAYER_GAP_TOP: f32 = Self::LG;
+    /// Air between the player card and the status strip.
+    pub const PLAYER_GAP_BOTTOM: f32 = Self::SM;
+    /// Total height of the bottom player bar (gap + card + gap).
+    pub const PLAYER_BAR_H: f32 =
+        Self::PLAYER_GAP_TOP + Self::PLAYER_CARD_H + Self::PLAYER_GAP_BOTTOM;
+    /// Bottom padding of the main area: what is left of `APP_PAD` after the
+    /// player bar took its own top gap.
+    pub const CONTENT_BOTTOM_PAD: f32 = Self::APP_PAD - Self::PLAYER_GAP_TOP;
+    /// Smallest window the console is laid out for (see `top_bar::top_bar_layout`,
+    /// `music::player_layout` and the scene deck: all three are tested down to
+    /// this width). 960 keeps the library column at 548px, which holds the group
+    /// rail (148) and 240px sound rows; narrower windows collapse that rail.
+    pub const MIN_WINDOW_W: f32 = 960.0;
+    /// Smallest window height: top bar 64 + player bar 72 + strip 28 + 32px of
+    /// main-area padding leave 444px for the panels (the old 620 left 424).
+    pub const MIN_WINDOW_H: f32 = 640.0;
     /// Fixed width of the network panel column.
     pub const RIGHT_COL_W: f32 = 340.0;
     /// Gap between the two main columns.
