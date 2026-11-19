@@ -465,7 +465,7 @@ pub(crate) struct AudioEngineInner {
     /// Per-sound bus, applied to new tracks of that sound like the volume
     sound_buses: RwLock<HashMap<SoundId, Bus>>,
     /// Active tracks: track_id -> SoundId
-    active_tracks: RwLock<HashMap<Uuid, SoundId>>,
+    pub(crate) active_tracks: RwLock<HashMap<Uuid, SoundId>>,
     /// CPAL output stream
     stream: Mutex<Option<cpal::Stream>>,
     /// Engine running state

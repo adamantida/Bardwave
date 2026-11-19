@@ -75,6 +75,56 @@ pub enum AudioCommand {
         fade_ms: u32,
         response: Sender<anyhow::Result<()>>,
     },
+    /// Music playlist: skip to the next track.
+    PlaylistNext {
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Music playlist: previous track (or restart the current one).
+    PlaylistPrev {
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Music playlist: jump to a position (milliseconds) in the track.
+    PlaylistSeek {
+        ms: u64,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Music playlist: pause.
+    PlaylistPause {
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Music playlist: resume after a pause.
+    PlaylistResume {
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Music playlist: shuffle on or off.
+    PlaylistSetShuffle {
+        shuffle: bool,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Music playlist: end-of-list behaviour.
+    PlaylistSetRepeat {
+        repeat: crate::config::RepeatMode,
+        response: Sender<anyhow::Result<()>>,
+    },
+}
+
+impl AudioCommand {
+    /// The music command and the reply channel of a `Playlist*` command.
+    pub fn into_playlist(
+        self,
+    ) -> Result<(crate::audio::PlaylistCommand, Sender<anyhow::Result<()>>), Self> {
+        use crate::audio::PlaylistCommand as C;
+        Ok(match self {
+            Self::PlaylistNext { response } => (C::Next, response),
+            Self::PlaylistPrev { response } => (C::Prev, response),
+            Self::PlaylistSeek { ms, response } => (C::Seek(ms), response),
+            Self::PlaylistPause { response } => (C::Pause, response),
+            Self::PlaylistResume { response } => (C::Resume, response),
+            Self::PlaylistSetShuffle { shuffle, response } => (C::SetShuffle(shuffle), response),
+            Self::PlaylistSetRepeat { repeat, response } => (C::SetRepeat(repeat), response),
+            other => return Err(other),
+        })
+    }
 }
 
 /// Sound information for GUI display
