@@ -149,8 +149,11 @@ impl LibraryUi {
 
     /// Queue files for the engine loader.
     pub(crate) fn enqueue_loads(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        // Membership of the queue is checked through a set built once per call:
+        // a linear `VecDeque::contains` per path is quadratic for a big folder.
+        let mut queued: HashSet<PathBuf> = self.load_queue.iter().cloned().collect();
         for path in paths {
-            if !self.load_in_flight.contains_key(&path) && !self.load_queue.contains(&path) {
+            if !self.load_in_flight.contains_key(&path) && queued.insert(path.clone()) {
                 self.load_queue.push_back(path);
             }
         }
@@ -319,4 +322,34 @@ pub struct TagEdit {
     pub error: Option<String>,
     /// Put the focus into the field on the first frame.
     pub focus: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ui() -> LibraryUi {
+        LibraryUi::new(egui::Context::default())
+    }
+
+    #[test]
+    fn enqueue_loads_skips_duplicates_and_in_flight() {
+        let mut ui = ui();
+        ui.load_in_flight
+            .insert(PathBuf::from("busy.wav"), Instant::now());
+        ui.enqueue_loads(["a.wav", "b.wav", "a.wav", "busy.wav"].map(PathBuf::from));
+        ui.enqueue_loads(["b.wav", "c.wav"].map(PathBuf::from));
+        let queued: Vec<_> = ui.load_queue.iter().cloned().collect();
+        assert_eq!(queued, ["a.wav", "b.wav", "c.wav"].map(PathBuf::from));
+    }
+
+    #[test]
+    fn enqueue_loads_is_not_quadratic_for_a_big_folder() {
+        let mut ui = ui();
+        let start = Instant::now();
+        ui.enqueue_loads((0..60_000).map(|i| PathBuf::from(format!("/samples/dir/{i}.wav"))));
+        assert_eq!(ui.load_queue.len(), 60_000);
+        // A linear scan per file takes tens of seconds here; a set takes ms.
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
 }
