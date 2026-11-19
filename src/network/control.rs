@@ -655,30 +655,34 @@ impl ControlContext {
     }
 }
 
-/// The phone panel's page. Today the plain page below; the mobile panel
-/// replaces it with a single line:
-///
-/// ```text
-/// const CONTROL_HTML: &str = include_str!(concat!(
-///     env!("CARGO_MANIFEST_DIR"),
-///     "/src/network/static/control.html"
-/// ));
-/// ```
-///
-/// (and `LEGACY_CONTROL_HTML` below can then be deleted).
-const CONTROL_HTML: &str = LEGACY_CONTROL_HTML;
+/// The phone panel's page (`control.html`; its script and styles are served
+/// from [`PANEL_ASSETS`]).
+pub const CONTROL_HTML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/control.html"
+));
 
 /// Static files of the phone panel, served without authentication (they hold
 /// no secrets and are fetched by `<script src>` / `<link href>` tags that
 /// cannot carry the token): `(route, content type, body)`.
-///
-/// Adding a file is one line here, e.g.
-///
-/// ```text
-/// ("/control.js", "application/javascript; charset=utf-8", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/network/static/control.js"))),
-/// ("/control.css", "text/css; charset=utf-8", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/network/static/control.css"))),
-/// ```
-const PANEL_ASSETS: &[(&str, &str, &str)] = &[];
+pub const PANEL_ASSETS: &[(&str, &str, &str)] = &[
+    (
+        "/control.js",
+        "application/javascript; charset=utf-8",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/network/static/control.js"
+        )),
+    ),
+    (
+        "/control.css",
+        "text/css; charset=utf-8",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/network/static/control.css"
+        )),
+    ),
+];
 
 /// Routes of the control page and API, for this computer only (no remote
 /// access). Kept for callers that predate the game-master token.
@@ -1492,158 +1496,6 @@ async fn control_bus(
     let action = ControlAction::Mix(MixControl::SetBusVolume(bus, q.value));
     run(&ctx, access, &headers, action).await
 }
-
-/// The control page: a plain list of the library with play/stop, repeat and
-/// volume, in the listener page's colours. Self-contained (no CDN).
-const LEGACY_CONTROL_HTML: &str = r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bardwave | Control</title>
-<style>
-  :root { --bg:#0A0A0A; --panel:#111111; --line:#27272A; --muted:#71717A; --text:#E4E4E7;
-          --rose:#E11D48; --rose-l:#FB7185; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text);
-         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  main { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
-  h1 { font-size: 13px; letter-spacing: .25em; text-transform: uppercase; color: var(--rose); margin: 0 0 4px; }
-  .sub { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
-  .bar { display:flex; gap:12px; align-items:center; padding:12px 16px; background:var(--panel);
-         border:1px solid var(--line); margin-bottom:12px; }
-  .bar label { font-size:11px; letter-spacing:.2em; text-transform:uppercase; color:var(--muted); }
-  .scenes { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
-  .scenes:empty { display:none; }
-  button.scene { padding:10px 14px; background:var(--panel); }
-  button.scene.active { background:var(--rose); border-color:var(--rose); color:#fff; }
-  .row { display:flex; gap:12px; align-items:center; padding:10px 16px; background:var(--panel);
-         border:1px solid var(--line); margin-bottom:8px; }
-  .row.playing { border-color: var(--rose); }
-  .name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .group { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; }
-  button { background:transparent; color:var(--text); border:1px solid var(--line); padding:6px 12px;
-           font: 600 11px/1 system-ui, sans-serif; letter-spacing:.12em; text-transform:uppercase; cursor:pointer; }
-  button:hover { border-color: var(--muted); }
-  button.play { background: var(--rose); border-color: var(--rose); color:#fff; min-width: 70px; }
-  .row.playing button.play { background: transparent; color: var(--rose-l); }
-  button.loop.on { color: var(--rose-l); border-color: var(--rose); }
-  input[type=range] { accent-color: var(--rose); width: 110px; }
-  .pct { width: 38px; text-align:right; font-variant-numeric: tabular-nums; color: var(--muted); font-size:12px; }
-  .err { color: var(--rose-l); font-size: 12px; min-height: 16px; }
-  .empty { color: var(--muted); padding: 24px 16px; border:1px dashed var(--line); }
-</style>
-</head>
-<body>
-<main>
-  <h1>Bardwave control</h1>
-  <div class="sub">Server-only mode. Sounds come from the [library] section of config.toml.</div>
-  <div class="bar">
-    <label for="master">Master</label>
-    <input id="master" type="range" min="0" max="100">
-    <span class="pct" id="masterPct"></span>
-    <span style="flex:1"></span>
-    <button id="stopAll">Stop all</button>
-  </div>
-  <div class="scenes" id="scenes"></div>
-  <div class="err" id="err"></div>
-  <div id="list"></div>
-</main>
-<script>
-(function () {
-  'use strict';
-  const G = new URLSearchParams(location.search).get("g");
-  const H = { "X-Bardwave-Control": "1" };
-  if (G) H["Authorization"] = "Bearer " + G;
-  const $ = (id) => document.getElementById(id);
-  let dragging = false;
-
-  async function call(path, method) {
-    try {
-      const res = await fetch(path, { method: method || 'POST', headers: H, cache: 'no-store' });
-      if (!res.ok) throw new Error(await res.text());
-      $('err').textContent = '';
-      render(await res.json());
-    } catch (e) {
-      $('err').textContent = String(e.message || e);
-    }
-  }
-
-  function renderScenes(scenes) {
-    const box = $('scenes');
-    box.textContent = '';
-    if (!scenes.length) return;
-    for (const sc of scenes) {
-      const b = document.createElement('button');
-      b.className = 'scene' + (sc.active ? ' active' : '');
-      b.textContent = sc.name;
-      if (sc.color && /^#[0-9a-fA-F]{3,6}$/.test(sc.color) && !sc.active) b.style.borderColor = sc.color;
-      b.onclick = () => call('/api/control/scene/activate?id=' + sc.id);
-      box.appendChild(b);
-    }
-    const stop = document.createElement('button');
-    stop.textContent = 'Stop scene';
-    stop.onclick = () => call('/api/control/scene/stop');
-    box.appendChild(stop);
-  }
-
-  function render(state) {
-    if (!dragging) {
-      $('master').value = Math.round(state.master_volume * 100);
-      $('masterPct').textContent = Math.round(state.master_volume * 100) + '%';
-    }
-    renderScenes(state.scenes || []);
-    const list = $('list');
-    if (!state.sounds.length) {
-      list.innerHTML = '<div class="empty">The library is empty. Add sounds in the console (or in config.toml) and restart.</div>';
-      return;
-    }
-    list.textContent = '';
-    for (const s of state.sounds) {
-      const row = document.createElement('div');
-      row.className = 'row' + (s.playing ? ' playing' : '');
-      const play = document.createElement('button');
-      play.className = 'play';
-      play.textContent = s.playing ? 'Stop' : 'Play';
-      play.onclick = () => call('/api/control/' + (s.playing ? 'stop' : 'play') + '?id=' + s.id);
-      const name = document.createElement('div');
-      name.className = 'name';
-      name.textContent = s.name;
-      if (s.group) {
-        const g = document.createElement('div');
-        g.className = 'group';
-        g.textContent = s.group;
-        name.appendChild(g);
-      }
-      const loop = document.createElement('button');
-      loop.className = 'loop' + (s.looped ? ' on' : '');
-      loop.textContent = 'Repeat';
-      loop.onclick = () => call('/api/control/loop?id=' + s.id + '&on=' + !s.looped);
-      const vol = document.createElement('input');
-      vol.type = 'range'; vol.min = 0; vol.max = 100; vol.value = Math.round(s.volume * 100);
-      const pct = document.createElement('span');
-      pct.className = 'pct';
-      pct.textContent = vol.value + '%';
-      vol.oninput = () => { dragging = true; pct.textContent = vol.value + '%'; };
-      vol.onchange = () => { dragging = false; call('/api/control/volume?id=' + s.id + '&value=' + vol.value / 100); };
-      row.append(play, name, loop, vol, pct);
-      list.appendChild(row);
-    }
-  }
-
-  $('master').oninput = () => { dragging = true; $('masterPct').textContent = $('master').value + '%'; };
-  $('master').onchange = () => { dragging = false; call('/api/control/master?value=' + $('master').value / 100); };
-  $('stopAll').onclick = () => call('/api/control/stop_all');
-
-  // Follow sounds that end by themselves.
-  function poll() { if (!dragging) call('/api/control/state', 'GET'); }
-  poll();
-  setInterval(poll, 1000);
-})();
-</script>
-</body>
-</html>
-"##;
 
 #[cfg(test)]
 mod tests {
