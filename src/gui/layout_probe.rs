@@ -61,6 +61,32 @@ pub fn run_frames(
     last.expect("at least one frame")
 }
 
+/// [`run_frames`] at `pixels_per_point`: the screen is `size` points.
+pub fn run_frames_at(
+    ctx: &Context,
+    size: egui::Vec2,
+    pixels_per_point: f32,
+    frames: usize,
+    mut run: impl FnMut(&Context),
+) -> FullOutput {
+    let mut last = None;
+    for n in 0..frames {
+        let mut input = egui::RawInput {
+            time: Some(n as f64 / 60.0),
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let info = egui::ViewportInfo {
+            native_pixels_per_point: Some(pixels_per_point),
+            ..Default::default()
+        };
+        input.viewports.insert(egui::ViewportId::ROOT, info);
+        ctx.set_pixels_per_point(pixels_per_point);
+        last = Some(ctx.run(input, &mut run));
+    }
+    last.expect("at least one frame")
+}
+
 /// Panics when two texts overlap by more than a hair, or when one of them
 /// leaves `bounds`. `what` names the scene in the failure message.
 pub fn assert_clean(boxes: &[TextBox], bounds: Rect, what: &str) {

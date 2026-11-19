@@ -83,9 +83,21 @@ pub struct ProfilesUi {
     recent: Vec<Option<String>>,
     loaded: bool,
     job: Option<Receiver<Result<String, ProfileError>>>,
+    /// Layout tests: the profile the menu shows (`Some(None)` is Default).
+    #[cfg(test)]
+    pub(crate) test_active: Option<Option<String>>,
 }
 
 impl ProfilesUi {
+    /// The running profile (`None` is the default one).
+    pub fn running_profile(&self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(active) = &self.test_active {
+            return active.clone();
+        }
+        crate::paths::active_profile()
+    }
+
     /// Re-read the profile list and the recent list from disk.
     pub fn refresh(&mut self, env: &ProfileEnv) {
         self.names = profiles::list_profiles(&env.root);
@@ -364,6 +376,13 @@ pub fn fit_text(ui: &Ui, text: &str, font: egui::FontId, max_w: f32) -> String {
     cut(lo)
 }
 
+/// The running profile's name as the top bar shows it before any width cap
+/// (`Default` for the default profile, long names already shortened).
+pub fn bar_name(state: &SoundSharedApp) -> String {
+    let active = state.profiles_ui.running_profile();
+    short(display_name(&active))
+}
+
 /// The `PROFILE <name>` control of the top bar: the caption (when `style` has
 /// room for it) and a menu button that switches, creates and manages profiles.
 /// The caller places it; no spacing is added before it.
@@ -372,6 +391,10 @@ pub fn profile_menu(ui: &mut Ui, state: &mut SoundSharedApp, style: ProfileStyle
     if !state.profiles_ui.loaded {
         state.profiles_ui.refresh(&env);
     }
+    let env = ProfileEnv {
+        active: state.profiles_ui.running_profile(),
+        ..env
+    };
     let active = env.active.clone();
     let full_name = display_name(&active).to_string();
     let font = crate::gui::widgets::glyph_font(11.0);

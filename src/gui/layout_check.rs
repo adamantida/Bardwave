@@ -568,11 +568,24 @@ pub enum LibraryKind {
     LongNames,
 }
 
+/// What the top bar has to show in a scenario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopState {
+    /// Nothing special: Default profile, no recording.
+    Plain,
+    /// A long recording with losses and a warning, a 32-character profile
+    /// name and a five-digit port: the widest the bar gets.
+    Busy,
+    /// [`TopState::Busy`] with the first-run Getting started card open.
+    Wizard,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scenario {
     pub library: LibraryKind,
     pub scenes: usize,
     pub server_running: bool,
+    pub top: TopState,
 }
 
 impl Scenario {
@@ -580,6 +593,7 @@ impl Scenario {
         library: LibraryKind::Empty,
         scenes: 0,
         server_running: false,
+        top: TopState::Plain,
     };
 
     /// Controls the operator must reach without scrolling in this state, at
@@ -596,7 +610,7 @@ impl Scenario {
 
     pub fn name(&self) -> String {
         format!(
-            "{} sounds, {} scenes, server {}",
+            "{} sounds, {} scenes, server {}, top bar {:?}",
             match self.library {
                 LibraryKind::Empty => "no",
                 LibraryKind::LongNames => "3 long",
@@ -606,7 +620,8 @@ impl Scenario {
                 "running"
             } else {
                 "stopped"
-            }
+            },
+            self.top
         )
     }
 }
@@ -639,7 +654,8 @@ const SCENE_NAMES: [&str; 2] = [
 /// off and the first-run wizard is done.
 fn build_gui(scenario: Scenario, pixels_per_point: f32) -> (GuiApp, Context) {
     let mut config = Config::default();
-    config.gui.onboarding_done = true;
+    // A first run opens the Getting started card by itself.
+    config.gui.onboarding_done = scenario.top != TopState::Wizard;
     config.gui.check_updates = false;
     config.gui.global_hotkeys = false;
     config.gui.ui_scale = pixels_per_point;
@@ -691,6 +707,23 @@ fn build_gui(scenario: Scenario, pixels_per_point: f32) -> (GuiApp, Context) {
         state.local_url = Some("http://127.0.0.1:8080".to_string());
         state.listener_count = 3;
         state.peak_listeners = 5;
+    }
+    if scenario.top != TopState::Plain {
+        app.recorder.fake_for_layout(
+            Some(crate::audio::recorder::RecorderStats {
+                state: crate::audio::recorder::RecorderState::Recording,
+                frames_written: 10 * 3600 * 48_000,
+                bytes_written: 12_000_000_000,
+                dropped_frames: 1234,
+                parts: 1,
+                current_path: "/fake/rec.wav".into(),
+                warning: Some("Disk space is running low (2.1 GB left)".into()),
+                error: None,
+            }),
+            None,
+        );
+        app.profiles_ui.test_active = Some(Some("Campaign of the Seven Mountains 2".into()));
+        app.app_state.config.lock().unwrap().server.port = 65535;
     }
     (GuiApp { state: app }, ctx)
 }
@@ -1018,18 +1051,71 @@ mod tests {
                 library: LibraryKind::LongNames,
                 scenes: 2,
                 server_running: false,
+                top: TopState::Plain,
             },
             Scenario {
                 library: LibraryKind::LongNames,
                 scenes: 0,
                 server_running: true,
+                top: TopState::Plain,
             },
             Scenario {
                 library: LibraryKind::Empty,
                 scenes: 0,
                 server_running: true,
+                top: TopState::Plain,
             },
         ]
+    }
+
+    /// The widest top bar (recording with losses and a warning, a 32-character
+    /// profile, a five-digit port, the server running) and the same with the
+    /// first-run card open.
+    fn busy_top_scenarios() -> Vec<Scenario> {
+        [TopState::Busy, TopState::Wizard]
+            .into_iter()
+            .flat_map(|top| {
+                [false, true]
+                    .into_iter()
+                    .map(move |server_running| Scenario {
+                        server_running,
+                        top,
+                        ..Scenario::DEFAULT
+                    })
+            })
+            .collect()
+    }
+
+    /// Whole console, busy top bar, every size at the scales a user can pick
+    /// (0.8 to 1.6): no violation anywhere. With the Getting started card open
+    /// only the top bar is judged: the card is a floating layer over the
+    /// console, and the checker (which sees text against text) cannot tell
+    /// the card's lines from the ones under it.
+    #[test]
+    fn the_busy_top_bar_has_no_layout_violations_in_the_console() {
+        let mut lines = Vec::new();
+        for scenario in busy_top_scenarios() {
+            for scale in [0.8, 1.0, 1.3, 1.6] {
+                for (w, h) in SIZES {
+                    let report = run_frame_with(vec2(w, h), scale, scenario);
+                    for v in &report.violations {
+                        let in_bar = v.finding.rect.top() < crate::gui::theme::Metrics::TOPBAR_H;
+                        if scenario.top == TopState::Wizard && !in_bar {
+                            continue;
+                        }
+                        lines.push(format!("[{}] {v}", scenario.name()));
+                    }
+                }
+            }
+        }
+        for line in &lines {
+            println!("{line}");
+        }
+        assert!(
+            lines.is_empty(),
+            "{} violations (listed above)",
+            lines.len()
+        );
     }
 
     /// Every size x scale x state. Prints every violation and fails if any.
