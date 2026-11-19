@@ -14,7 +14,7 @@ No subscriptions, no accounts, no cloud. A self-hosted alternative to Syrinscape
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-a04a4a.svg?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-7a3b3b.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/platform-Windows-3b3b3b.svg?style=flat-square&logo=windows&logoColor=white)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-3b3b3b.svg?style=flat-square&logo=windows&logoColor=white)](#requirements)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-a04a4a.svg?style=flat-square)](#contributing)
 
 [Why](#why) · [Features](#features) · [Getting started](#getting-started) · [Configuration](#configuration) · [How it works](#how-it-works) · [Roadmap](#roadmap)
@@ -86,7 +86,7 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 
 ### Requirements
 
-- **Windows 10/11** (the audio and network code is portable Rust; only the local-IP detection is Windows-specific today — see [Roadmap](#roadmap)).
+- **Windows 10/11** (primary target), **macOS** or **Linux**. The audio, network and local-IP detection code is portable Rust: Windows reads the adapter table via `GetAdaptersAddresses`, macOS/Linux via `getifaddrs`. See [macOS / Linux](#macos--linux) for the platform notes.
 - [Rust toolchain](https://rustup.rs) 1.85 or newer.
 - A sound card. No, really — this is the point of the app.
 
@@ -99,6 +99,19 @@ cargo run --release
 ```
 
 The console window opens. Click **Add sound** (or the ⨁ button) and pick a few audio files from your library, then press **Start** in the SERVER panel.
+
+#### macOS / Linux
+
+```bash
+git clone https://github.com/adamantida/Bardwave.git
+cd Bardwave
+cargo run --release
+```
+
+- **ffmpeg** is needed only for YouTube links and is not downloaded on these systems: install it with `brew install ffmpeg` (macOS) or `apt install ffmpeg` (Debian/Ubuntu). `yt-dlp` is fetched automatically.
+- On macOS the system asks whether Bardwave may accept incoming connections the first time you press **Start**. Allow it, otherwise players on the LAN cannot connect.
+- On Linux the build needs the development packages for GTK 3, ALSA and xkbcommon (on Debian/Ubuntu: `pkg-config libgtk-3-dev libasound2-dev libxkbcommon-dev libssl-dev`, as in the CI workflow). If a firewall is active, open the listen port (8080 by default).
+- Automatic router port forwarding (UPnP) works as on Windows; only the Windows firewall rule is Windows-specific.
 
 #### Sounds from YouTube
 
@@ -262,7 +275,7 @@ To retry a failed release, run it by hand: Actions → **Release** → **Run wor
 
 Honest list of what is **not** done yet — this is an early build, not a finished competitor:
 
-- [ ] Cross-platform local-IP detection (macOS/Linux)
+- [x] Cross-platform local-IP detection (Windows, macOS/Linux via `getifaddrs`)
 - [ ] Crossfade between scenes
 - [ ] Packaging: an installer, a macOS build, maybe a Steam/itch release (releases already ship a portable Windows zip and a Linux tar.gz, each with a commented `config.toml`)
 
