@@ -311,6 +311,23 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber new/* SHA256SUMS
+          # release-macos.yml attaches the .dmg on its own schedule and rebuilds
+          # SHA256SUMS the same way. If it added a file after the list above was
+          # computed, rebuild the list from what the release has now.
+          for attempt in 1 2 3 4 5; do
+            expected="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' | grep -vx 'SHA256SUMS' | LC_ALL=C sort)"
+            listed="$(awk '{print $2}' SHA256SUMS | LC_ALL=C sort)"
+            [ "$expected" = "$listed" ] && break
+            echo "An asset was added meanwhile (attempt $attempt); refreshing SHA256SUMS."
+            rm -rf all SHA256SUMS
+            mkdir all
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir all --pattern '*'
+            rm -f all/SHA256SUMS
+            (cd all && LC_ALL=C sha256sum -- * | LC_ALL=C sort -k2 > ../SHA256SUMS)
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS
+            sleep 15
+          done
           {
             echo "### Uploaded to $TAG"
             ls -1 new

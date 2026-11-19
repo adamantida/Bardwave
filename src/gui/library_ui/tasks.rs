@@ -68,11 +68,22 @@ pub enum LibEvent {
         token: u64,
         result: Result<ExportReport, BundleError>,
     },
-    /// Import finished: the report and the merged library content to apply.
+    /// Import finished: the report and the library content before and after
+    /// the import, for the UI to merge into the live library.
     ImportDone {
         token: u64,
-        result: Result<(ImportReport, Box<LibraryConfig>), BundleError>,
+        result: Result<(ImportReport, Box<ImportedConfig>), BundleError>,
     },
+}
+
+/// The library content around an import, as seen by the import worker.
+#[derive(Debug, Clone)]
+pub struct ImportedConfig {
+    /// The library the worker started from (a snapshot taken when the import
+    /// began).
+    pub base: LibraryConfig,
+    /// That library after the bundle was merged into it.
+    pub imported: LibraryConfig,
 }
 
 /// Starts background jobs; cheap to clone.
@@ -308,9 +319,10 @@ impl Tasks {
         }
     }
 
-    /// Import `zip` into a private copy of `library` and report the merged
-    /// content; the UI applies it in one step, so a failed or cancelled import
-    /// leaves the real library untouched.
+    /// Import `zip` into a private copy of `library` and report the library
+    /// before and after. The UI merges the difference into the live library
+    /// by id (see `merge_import` in `ops.rs`), so edits made while the import
+    /// ran survive, and a failed or cancelled import leaves it untouched.
     pub fn import(
         &self,
         token: u64,
@@ -320,6 +332,7 @@ impl Tasks {
         cancel: Arc<AtomicBool>,
     ) {
         let spawned = self.spawn("library-import", move |tasks| {
+            let base = library.to_config();
             let mut throttle = Throttle::new();
             let result =
                 import_bundle_with(&mut library, &zip, &options, &cancel, &mut |progress| {
@@ -330,7 +343,10 @@ impl Tasks {
                         });
                     }
                 })
-                .map(|report| (report, Box::new(library.to_config())));
+                .map(|report| {
+                    let imported = library.to_config();
+                    (report, Box::new(ImportedConfig { base, imported }))
+                });
             tasks.send(LibEvent::ImportDone { token, result });
         });
         if !spawned {

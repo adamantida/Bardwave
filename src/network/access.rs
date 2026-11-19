@@ -138,6 +138,10 @@ pub const GM_MAX_FAILURES: usize = 10;
 /// The window in which [`GM_MAX_FAILURES`] failures lock a client out.
 pub const GM_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
+/// Multiplier of [`GM_MAX_FAILURES`] for requests relayed by a proxy or tunnel
+/// on this computer (see [`GmAuth`]): such clients share one address.
+pub const GM_PROXY_FAILURE_FACTOR: usize = 6;
+
 /// The game-master token, shared by the console and the server.
 ///
 /// Unlike [`AccessGuard`] there is no "open" state: with no token (or an empty
@@ -321,10 +325,31 @@ pub fn is_loopback_peer(addr: &SocketAddr) -> bool {
 ///
 /// "Local" comes from the socket address only: `X-Forwarded-For` and friends
 /// are never believed (they can only make a request *less* trusted).
+///
+/// # Lockout behind a proxy or tunnel
+///
+/// The limiter counts failures per socket address. Behind a reverse proxy or
+/// tunnel (cloudflared, ngrok, nginx...) running on this computer every remote
+/// client arrives from the proxy's loopback address, so they would all share
+/// one counter, and one noisy or hostile client would lock the real game master
+/// out of the panel. Such requests (proxy headers present *and* a loopback
+/// peer) therefore use a separate, more tolerant counter: its limit is
+/// [`GM_PROXY_FAILURE_FACTOR`] times [`GM_MAX_FAILURES`]. Brute-forcing the
+/// token stays infeasible at that rate, and direct clients keep the strict
+/// per-address limit, which a client cannot escape by adding proxy headers
+/// (the relaxed counter applies only when the peer really is loopback).
+///
+/// Known limitation: clients behind the same proxy still share the relaxed
+/// counter, so a hostile one can lock the others out by exceeding it. The
+/// forwarded address is not used to tell them apart because the client controls
+/// it and could rotate it to dodge the limit. Rotating the game-master token
+/// from the console or reaching the panel locally is the way out.
 #[derive(Clone)]
 pub struct GmAuth {
     guard: GmGuard,
     limiter: Arc<Mutex<AttemptLimiter>>,
+    /// Failures of requests relayed by a proxy on this computer.
+    proxy_limiter: Arc<Mutex<AttemptLimiter>>,
     is_local: LocalityFn,
 }
 
@@ -344,6 +369,10 @@ impl GmAuth {
                 GM_MAX_FAILURES,
                 GM_FAILURE_WINDOW,
             ))),
+            proxy_limiter: Arc::new(Mutex::new(AttemptLimiter::new(
+                GM_MAX_FAILURES * GM_PROXY_FAILURE_FACTOR,
+                GM_FAILURE_WINDOW,
+            ))),
             is_local: Arc::new(is_loopback_peer),
         }
     }
@@ -355,9 +384,15 @@ impl GmAuth {
         self
     }
 
-    /// Replace the limiter (tests use a small one).
+    /// Replace the limiters (tests use small ones): the strict per-address one
+    /// gets `max_failures`, the proxy one [`GM_PROXY_FAILURE_FACTOR`] times
+    /// that.
     pub fn with_limits(mut self, max_failures: usize, window: Duration) -> Self {
         self.limiter = Arc::new(Mutex::new(AttemptLimiter::new(max_failures, window)));
+        self.proxy_limiter = Arc::new(Mutex::new(AttemptLimiter::new(
+            max_failures * GM_PROXY_FAILURE_FACTOR,
+            window,
+        )));
         self
     }
 
@@ -396,7 +431,14 @@ impl GmAuth {
             .map(|p| p.ip())
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
-        let mut limiter = self.limiter.lock();
+        // A request relayed by a proxy on this computer carries the proxy's
+        // loopback address, not the client's: count it apart (see the type docs).
+        let relayed = proxied && peer.as_ref().is_some_and(|p| (self.is_local)(p));
+        let mut limiter = if relayed {
+            self.proxy_limiter.lock()
+        } else {
+            self.limiter.lock()
+        };
         if let Some(wait) = limiter.blocked_for(ip, now) {
             // Round up, never advertise 0.
             let retry_after_secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
@@ -614,6 +656,62 @@ mod tests {
             ),
             Ok(GmAccess::Token)
         );
+    }
+
+    #[test]
+    fn proxied_clients_do_not_lock_out_direct_ones_and_get_a_wider_budget() {
+        let auth = GmAuth::new(GmGuard::new(Some("secret".into())))
+            .with_limits(3, Duration::from_secs(60));
+        let t0 = Instant::now();
+        let proxy = peer("127.0.0.1");
+        // More failures than the strict limit do not lock the shared address...
+        for _ in 0..(3 * GM_PROXY_FAILURE_FACTOR - 1) {
+            assert_eq!(
+                auth.authorize_at(proxy, true, Some("bad"), None, t0),
+                Err(GmDenied::Unauthorized)
+            );
+        }
+        assert_eq!(
+            auth.authorize_at(proxy, true, Some("secret"), None, t0),
+            Ok(GmAccess::Token)
+        );
+        // ...until the wider budget is spent.
+        assert_eq!(
+            auth.authorize_at(proxy, true, Some("bad"), None, t0),
+            Err(GmDenied::Unauthorized)
+        );
+        assert!(matches!(
+            auth.authorize_at(proxy, true, Some("secret"), None, t0),
+            Err(GmDenied::TooManyAttempts { .. })
+        ));
+        // A direct client has its own, strict counter and is unaffected.
+        let direct = peer("203.0.113.7");
+        assert_eq!(
+            auth.authorize_at(direct, false, Some("secret"), None, t0),
+            Ok(GmAccess::Token)
+        );
+        for _ in 0..3 {
+            let _ = auth.authorize_at(direct, false, Some("bad"), None, t0);
+        }
+        assert!(matches!(
+            auth.authorize_at(direct, false, Some("secret"), None, t0),
+            Err(GmDenied::TooManyAttempts { .. })
+        ));
+    }
+
+    #[test]
+    fn faking_proxy_headers_does_not_widen_a_direct_clients_budget() {
+        let auth = GmAuth::new(GmGuard::new(Some("secret".into())))
+            .with_limits(3, Duration::from_secs(60));
+        let t0 = Instant::now();
+        let remote = peer("203.0.113.7");
+        for _ in 0..3 {
+            let _ = auth.authorize_at(remote, true, Some("bad"), None, t0);
+        }
+        assert!(matches!(
+            auth.authorize_at(remote, true, Some("secret"), None, t0),
+            Err(GmDenied::TooManyAttempts { .. })
+        ));
     }
 
     #[test]

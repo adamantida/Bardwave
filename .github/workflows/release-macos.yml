@@ -1,7 +1,10 @@
 name: Release macOS
 
 # Builds the universal (aarch64 + x86_64) Bardwave.app, packs it into a .dmg and
-# attaches the .dmg and its sha256 to an existing GitHub release.
+# attaches the .dmg and its sha256 to an existing GitHub release, and rebuilds the
+# release-wide SHA256SUMS so the .dmg is listed in it (release-extras.yml builds the same
+# file for the other installers; whichever of the two finishes last sees every asset, and
+# both re-check the list after uploading, see "Refresh SHA256SUMS").
 # - release: published        -> the release that was just published;
 # - workflow_dispatch (tag)   -> any existing release, by hand (also the fallback: releases
 #                                created with the default GITHUB_TOKEN by release.yml do not
@@ -121,6 +124,34 @@ jobs:
             "dist/Bardwave-$TAG-macos-universal.dmg" \
             "dist/Bardwave-$TAG-macos-universal.dmg.sha256" \
             --clobber --repo "$GITHUB_REPOSITORY"
+
+      # SHA256SUMS lists every file of the release, like the one release-extras.yml writes
+      # (the file is rebuilt from scratch, never appended to). The two workflows can run at
+      # the same time, so after uploading the list is compared with the assets the release
+      # has by then and the step repeats until they agree.
+      - name: Refresh SHA256SUMS
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            rm -rf all SHA256SUMS
+            mkdir all
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir all --pattern '*'
+            rm -f all/SHA256SUMS
+            (cd all && LC_ALL=C shasum -a 256 * | LC_ALL=C sort -k2 > ../SHA256SUMS)
+            cat SHA256SUMS
+            gh release upload "$TAG" SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+            expected="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' | grep -vx 'SHA256SUMS' | LC_ALL=C sort)"
+            listed="$(awk '{print $2}' SHA256SUMS | LC_ALL=C sort)"
+            if [ "$expected" = "$listed" ]; then
+              echo "SHA256SUMS lists all $(echo "$listed" | wc -l | tr -d ' ') assets."
+              exit 0
+            fi
+            echo "An asset was added meanwhile (attempt $attempt); refreshing again."
+            sleep 15
+          done
+          echo "::error::SHA256SUMS is still missing assets after 5 attempts"
+          exit 1
 
       - name: Remove signing keychain
         if: always() && steps.cert.outputs.keychain != ''

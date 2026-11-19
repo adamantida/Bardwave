@@ -8,8 +8,10 @@ use egui::{Event, Key as EKey, Modifiers, RawInput};
 use soundshared::audio::director::mock::MockPlayback;
 use soundshared::audio::{CatalogSound, Director, Playback};
 use soundshared::config::{
-    canonical_hotkey, Config, HotkeyAction, HotkeyConfig, SceneConfig, SceneItemConfig, SceneStart,
+    canonical_hotkey, Bus, Config, HotkeyAction, HotkeyConfig, SceneConfig, SceneItemConfig,
+    SceneStart,
 };
+use soundshared::gui::hotkeys_ui::{route, run_duck_op, DuckOp, Route};
 use soundshared::hotkeys::testing::SpyPlayback;
 use soundshared::hotkeys::{
     find_conflicts_for, poll_local, Binding, DispatchOutcome, HotkeyDispatcher, HotkeyMap,
@@ -182,27 +184,60 @@ fn key_without_a_binding_is_left_alone() {
     assert_eq!(left, 1);
 }
 
+/// Ducking does not go through `HotkeyDispatcher` in the app: the console
+/// routes a key event with [`route`] and runs it on the Director's own duck
+/// state ([`run_duck_op`]), so the hotkey, the DUCK button and the phone panel
+/// agree on what is ducked. This follows that path from the key to the buses.
 #[test]
 fn duck_hold_from_key_down_to_key_up() {
     let config = config();
     let map = HotkeyMap::build_for(&config.hotkeys, Platform::current());
     let (mut director, pb) = rig();
-    let mut dispatcher = HotkeyDispatcher::new();
     let ctx = egui::Context::default();
 
-    let (down, _) = local_frame(&ctx, &map, vec![key(EKey::D, true, true, false)]);
-    dispatcher
-        .handle(&mut director, &pb, &mut NoExtras, &down[0])
-        .unwrap();
-    assert_eq!(pb.duck_log().len(), 2);
-    assert!(pb.duck_log()[0].starts_with("duck"));
+    let run = |director: &mut Director, event: &soundshared::hotkeys::HotkeyEvent| match route(
+        &event.action,
+        event.phase,
+    ) {
+        Some(Route::Duck(op)) => run_duck_op(director, &pb, op).unwrap(),
+        other => panic!("a duck key must be routed to the duck state, got {other:?}"),
+    };
 
+    let (down, _) = local_frame(&ctx, &map, vec![key(EKey::D, true, true, false)]);
+    assert_eq!(
+        route(&down[0].action, down[0].phase),
+        Some(Route::Duck(DuckOp::HoldStart))
+    );
+    run(&mut director, &down[0]);
+    assert!(director.is_ducked(Bus::Music));
+    assert!(pb.duck_log().iter().any(|l| l.starts_with("duck Music")));
+
+    pb.clear_duck_log();
     let (up, _) = local_frame(&ctx, &map, vec![key(EKey::D, false, false, false)]);
-    dispatcher
-        .handle(&mut director, &pb, &mut NoExtras, &up[0])
-        .unwrap();
-    assert_eq!(pb.duck_log().len(), 4);
-    assert!(pb.duck_log()[3].starts_with("release"));
+    assert_eq!(
+        route(&up[0].action, up[0].phase),
+        Some(Route::Duck(DuckOp::HoldEnd))
+    );
+    run(&mut director, &up[0]);
+    assert!(!director.is_ducked(Bus::Music));
+    assert!(pb.duck_log().iter().any(|l| l.starts_with("release Music")));
+}
+
+/// A latched DuckToggle (the other duck binding) shares the same state: the
+/// release of a hold must not undo it.
+#[test]
+fn duck_toggle_latches_and_survives_the_end_of_a_hold() {
+    let (mut director, pb) = rig();
+    run_duck_op(&mut director, &pb, DuckOp::Toggle).unwrap();
+    assert!(director.is_ducked(Bus::Music));
+    run_duck_op(&mut director, &pb, DuckOp::HoldStart).unwrap();
+    run_duck_op(&mut director, &pb, DuckOp::HoldEnd).unwrap();
+    assert!(
+        director.is_ducked(Bus::Music),
+        "the latch outlives the hold"
+    );
+    run_duck_op(&mut director, &pb, DuckOp::Toggle).unwrap();
+    assert!(!director.is_ducked(Bus::Music));
 }
 
 #[test]
