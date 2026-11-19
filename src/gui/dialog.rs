@@ -376,6 +376,10 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                 state.submit_add_youtube();
             }
         }
+
+        Dialog::Music => crate::gui::music::show_music_dialog(ctx, state),
+
+        Dialog::EditEmitters(scene) => crate::gui::music::show_emitters_dialog(ctx, state, scene),
     }
 }
 

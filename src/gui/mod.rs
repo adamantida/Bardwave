@@ -18,6 +18,7 @@ pub mod dialog;
 pub mod groups;
 pub mod motion;
 pub mod scenes;
+pub mod music;
 pub mod server_panel;
 pub mod sound_list;
 pub mod theme;
@@ -128,6 +129,15 @@ impl App for GuiApp {
             .frame(egui::Frame::none().fill(Palette::APP))
             .show(ctx, |ui| {
                 top_bar::status_strip(ui, &self.state);
+            });
+
+        // Music transport: now playing, seek, shuffle / repeat. Declared after
+        // the status strip so it sits right above it.
+        TopBottomPanel::bottom("music_bar")
+            .exact_height(music::MUSIC_BAR_H)
+            .frame(egui::Frame::none().fill(Palette::APP))
+            .show(ctx, |ui| {
+                music::music_bar(ui, &mut self.state);
             });
 
         CentralPanel::default()

@@ -66,6 +66,11 @@ pub enum Dialog {
     EditScene(Box<crate::gui::scenes::SceneForm>),
     /// Confirm deletion of a scene.
     DeleteScene { id: crate::gui::groups::SceneId },
+    /// Playlist manager (see [`crate::gui::music`]); its in-progress state
+    /// lives in [`SoundSharedApp::music`].
+    Music,
+    /// Emitters and music layer of one scene ("Emitters & music…").
+    EditEmitters(crate::gui::groups::SceneId),
 }
 
 /// How long the library may stay unsaved before it is flushed to disk.
@@ -226,6 +231,8 @@ pub struct SoundSharedApp {
     output_meter: f32,
     /// State of the scene deck: pending replies, transition display, notices.
     pub(crate) scenes: crate::gui::scenes::SceneUi,
+    /// Music panel, playlist manager and emitters dialog state.
+    pub(crate) music: crate::gui::music::MusicUi,
 }
 
 /// Hand the Director the current scenes and the loaded library sounds.
@@ -245,7 +252,7 @@ pub(crate) fn sync_director(
 
 /// Copy "is it playing" from the engine into the rows: scenes and delayed
 /// starts start sounds without going through the row's Play button.
-fn mirror_playing(sounds: &Mutex<HashMap<SoundId, SoundEntry>>, engine: &AudioEngine) {
+pub(crate) fn mirror_playing(sounds: &Mutex<HashMap<SoundId, SoundEntry>>, engine: &AudioEngine) {
     for entry in sounds.lock().unwrap().values_mut() {
         entry.playing = engine.is_sound_playing(entry.id).unwrap_or(false);
     }
@@ -356,6 +363,7 @@ impl SoundSharedApp {
             youtube_busy: false,
             output_meter: 0.0,
             scenes: Default::default(),
+            music: Default::default(),
         };
 
         // Request initial server status
@@ -1460,6 +1468,7 @@ impl SoundSharedApp {
             let until = due.saturating_duration_since(Instant::now());
             wait = wait.min(until.max(Duration::from_millis(5)));
         }
+        wait = wait.min(self.music.repaint_hint(&self.dialog));
         ctx.request_repaint_after(wait);
     }
 
@@ -1473,6 +1482,7 @@ impl SoundSharedApp {
         self.director.configure_audio(&audio_cfg);
         self.director.tick(engine);
         mirror_playing(&self.sounds, engine);
+        self.music.observe(&self.director, Instant::now());
         // Loudness measured in the background: store the gains in the library.
         for update in self.director.take_gain_updates() {
             let path = uuid::Uuid::parse_str(&update.library_id)
