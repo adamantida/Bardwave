@@ -30,6 +30,10 @@ Read this before relying on the items below. They are implemented and covered by
 - Previews have their own fixed-gain bus (the Ambience fader and ducking no longer affect them), and the local limiter now recovers gradually when the last preview ends instead of snapping back.
 - Not verified: device names and enumeration on Windows (WASAPI) and Linux (ALSA/JACK); a second output stream was run on macOS only.
 
+**Session recording**
+- REC button in the top bar saves the mix the players hear as a WAV file (48 kHz stereo, 16-bit PCM, or 32-bit float with `[gui] record_float32 = true`), with a time and size readout. Files are named `bardwave-YYYYMMDD-HHMMSS.wav` (UTC) in `recordings/` of the data directory, or in the folder chosen with the folder button (`[gui] recordings_dir`).
+- The WAV header is refreshed every second, so a file left by a crash is still playable; long sessions continue in `_part2.wav`, ... near 1.8 GB (a size warning appears at 1.5 GB); starting is refused when the disk is known to be almost full; frames lost to a slow disk are counted and reported. Unix only for the free-space check; not verified on Windows.
+
 **Scenes and transitions**
 - Scenes (`[[library.scenes]]`): named sets of sounds with per-item volume, loop, automatic/manual start and start delay, a button colour, `fade_in_ms` / `fade_out_ms`, `stop_others`.
 - Pan controls: a centred slider (notch at zero, double click resets, tooltip like `L 40%`) in the right-click menu of a sound and in every row of the scene editor. `pan` (`-1.0..=1.0`, default `0`, not written when centred) is stored per library sound and per scene item; a non-zero item value overrides the sound's pan inside that scene. The Director applies it when a sound starts and live while it plays.

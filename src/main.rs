@@ -566,7 +566,12 @@ fn main() -> Result<()> {
     audio_engine.set_stream_threshold_secs(config.audio.stream_threshold_secs);
 
     // Get the broadcast output receiver for WebSocket streaming
-    let broadcast_output_rx = audio_engine.broadcast_output_receiver();
+    // The recorder taps the stream on its way to the players (a second reader
+    // of the mixer channel would steal frames from them).
+    let broadcast_output_rx = soundshared::audio::recorder::spawn_tee(
+        audio_engine.broadcast_output_receiver(),
+        soundshared::audio::recorder::global_tap(),
+    );
 
     // Wrap audio engine in Arc<Mutex> for sharing with GUI (main thread)
     #[allow(clippy::arc_with_non_send_sync)]
