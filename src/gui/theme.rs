@@ -108,6 +108,13 @@ impl Metrics {
     pub const ROW_H: f32 = 64.0;
     /// Gap between sound rows.
     pub const ROW_GAP: f32 = 10.0;
+    /// Smallest gap between a caption and the control it names (panels zero
+    /// egui's implicit spacing, so every such gap is placed by hand).
+    pub const LABEL_GAP: f32 = Self::SM;
+    /// Smallest gap between two blocks of a panel.
+    pub const BLOCK_GAP: f32 = Self::MD;
+    /// Gap between the lines of a two-line lockup (title over caption).
+    pub const LOCKUP_GAP: f32 = 2.0;
 
     // Radii — nothing above 4.
     pub const R_PANEL: f32 = 4.0;

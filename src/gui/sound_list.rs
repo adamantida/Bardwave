@@ -76,7 +76,7 @@ pub fn sound_library_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) 
 
         ui.add_space(Metrics::MD);
         hairline(ui);
-        ui.add_space(Metrics::MD - 2.0);
+        ui.add_space(Metrics::BLOCK_GAP);
         master_output(ui, state);
     });
 }
@@ -89,7 +89,7 @@ fn header(ui: &mut Ui, state: &mut SoundSharedApp) {
             ui.label(micro_label_accent("01 / Library"));
             ui.horizontal(|ui| {
                 ui.label(panel_title("Sound Library"));
-                ui.add_space(Metrics::XS);
+                ui.add_space(Metrics::LABEL_GAP);
                 let total = state.count_for(GroupFilter::All);
                 ui.label(micro_label(match total {
                     1 => "1 Track".to_string(),
@@ -150,7 +150,7 @@ fn group_rail(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
                     }
                 });
             });
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::LABEL_GAP);
 
             egui::ScrollArea::vertical()
                 .id_salt("group_rail_scroll")
@@ -183,9 +183,9 @@ fn group_rail(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
                     }
 
                     if !state.library().groups().is_empty() {
-                        ui.add_space(Metrics::SM);
+                        ui.add_space(Metrics::BLOCK_GAP);
                         ui.label(micro_label("Categories"));
-                        ui.add_space(2.0);
+                        ui.add_space(Metrics::LABEL_GAP);
                     }
 
                     // Collect first so the rail can mutate the library on click
@@ -948,6 +948,44 @@ fn action_is_none(action: &RowAction) -> bool {
     matches!(action, RowAction::None)
 }
 
+/// Height of the empty state's core: title, filter line, hint and the primary
+/// button with their gaps.
+const EMPTY_CORE_H: f32 = 136.0;
+/// Height of the "...or drop in a YouTube link" block (gap, caption, gap,
+/// button).
+const EMPTY_YOUTUBE_H: f32 = 84.0;
+/// Height of the "Show All" block (gap, button).
+const EMPTY_SHOW_ALL_H: f32 = 48.0;
+
+/// What the empty state shows for the height it is given.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EmptyLayout {
+    /// Space above the title.
+    top_pad: f32,
+    /// Show the YouTube alternative.
+    youtube: bool,
+    /// Show the "Show All" button.
+    show_all: bool,
+}
+
+/// Decide how much of the empty state fits in `height`.
+///
+/// The optional blocks are dropped rather than letting the column spill over
+/// the master strip below it ("Show All" is kept before the YouTube hint when
+/// there is a group filter to leave); the header offers the same actions.
+fn empty_layout(height: f32, has_group_filter: bool) -> EmptyLayout {
+    let show_all = has_group_filter && height >= EMPTY_CORE_H + EMPTY_SHOW_ALL_H + Metrics::SM;
+    let base = EMPTY_CORE_H + if show_all { EMPTY_SHOW_ALL_H } else { 0.0 };
+    let youtube = height >= base + EMPTY_YOUTUBE_H + Metrics::SM;
+    let content = base + if youtube { EMPTY_YOUTUBE_H } else { 0.0 };
+    let top_pad = ((height - content) * 0.4).clamp(Metrics::SM, 120.0);
+    EmptyLayout {
+        top_pad,
+        youtube,
+        show_all,
+    }
+}
+
 /// Centred empty state with a contextual call to action.
 fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, height: f32) {
     // A search or tag filter that matches nothing is not an empty library.
@@ -981,9 +1019,13 @@ fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, hei
         },
     };
 
+    let layout = empty_layout(
+        height,
+        matches!(filter, GroupFilter::Group(_) | GroupFilter::Ungrouped),
+    );
     ui.allocate_ui(Vec2::new(ui.available_width(), height), |ui| {
         ui.vertical_centered(|ui| {
-            ui.add_space((height * 0.28).clamp(12.0, 120.0));
+            ui.add_space(layout.top_pad);
             ui.label(telemetry("NO SIGNAL", 22.0, Palette::BORDER_STRONG));
             ui.add_space(Metrics::SM);
             ui.label(telemetry(
@@ -991,7 +1033,7 @@ fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, hei
                 11.0,
                 Palette::ZINC_400,
             ));
-            ui.add_space(Metrics::XS);
+            ui.add_space(Metrics::SM);
             ui.label(micro_label(match filter {
                 GroupFilter::Group(_) => "Add a sound to attach it to this group",
                 _ => "Add a WAV / OGG / MP3 to start a board",
@@ -1008,19 +1050,21 @@ fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, hei
             }
             // The panel zeroes egui's implicit vertical spacing, so every gap
             // between the stacked call-to-action pieces is placed here.
-            ui.add_space(Metrics::XL);
-            ui.label(micro_label("…or drop in a YouTube link"));
-            ui.add_space(Metrics::MD);
-            if ConsoleButton::ghost("YouTube")
-                .glyph(glyph::WAVE)
-                .width(150.0)
-                .id_salt("empty_add_youtube")
-                .show(ui)
-                .clicked()
-            {
-                state.open_add_youtube();
+            if layout.youtube {
+                ui.add_space(Metrics::XL);
+                ui.label(micro_label("…or drop in a YouTube link"));
+                ui.add_space(Metrics::MD);
+                if ConsoleButton::ghost("YouTube")
+                    .glyph(glyph::WAVE)
+                    .width(150.0)
+                    .id_salt("empty_add_youtube")
+                    .show(ui)
+                    .clicked()
+                {
+                    state.open_add_youtube();
+                }
             }
-            if matches!(filter, GroupFilter::Group(_) | GroupFilter::Ungrouped) {
+            if layout.show_all {
                 ui.add_space(Metrics::MD);
                 if ConsoleButton::ghost("Show All")
                     .glyph(glyph::FOLDER)
@@ -1040,6 +1084,7 @@ fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, hei
 fn master_output(ui: &mut Ui, state: &mut SoundSharedApp) {
     ui.horizontal(|ui| {
         ui.label(micro_label("Master Output"));
+        ui.add_space(Metrics::LABEL_GAP);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let muted = state.is_muted();
             let mute_label = if muted { "Unmute" } else { "Mute" };
@@ -1079,4 +1124,59 @@ fn master_output(ui: &mut Ui, state: &mut SoundSharedApp) {
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roomy_empty_state_shows_everything() {
+        let layout = empty_layout(400.0, true);
+        assert!(layout.youtube && layout.show_all);
+        assert!(layout.top_pad >= Metrics::SM && layout.top_pad <= 120.0);
+    }
+
+    #[test]
+    fn short_empty_state_drops_optional_blocks() {
+        let layout = empty_layout(100.0, true);
+        assert!(!layout.youtube && !layout.show_all);
+        assert_eq!(layout.top_pad, Metrics::SM);
+    }
+
+    #[test]
+    fn show_all_is_kept_before_the_youtube_hint() {
+        let height = EMPTY_CORE_H + EMPTY_SHOW_ALL_H + Metrics::SM + 1.0;
+        let layout = empty_layout(height, true);
+        assert!(layout.show_all && !layout.youtube);
+    }
+
+    #[test]
+    fn show_all_needs_a_group_filter() {
+        assert!(!empty_layout(500.0, false).show_all);
+    }
+
+    #[test]
+    fn shown_content_always_fits() {
+        let mut height = 60.0;
+        while height < 600.0 {
+            for filter in [false, true] {
+                let layout = empty_layout(height, filter);
+                let content = EMPTY_CORE_H
+                    + if layout.show_all {
+                        EMPTY_SHOW_ALL_H
+                    } else {
+                        0.0
+                    }
+                    + if layout.youtube { EMPTY_YOUTUBE_H } else { 0.0 };
+                if height >= EMPTY_CORE_H + 2.0 * Metrics::SM {
+                    assert!(
+                        layout.top_pad + content <= height + f32::EPSILON,
+                        "height {height}: {layout:?}"
+                    );
+                }
+            }
+            height += 7.0;
+        }
+    }
 }

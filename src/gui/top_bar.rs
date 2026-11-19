@@ -5,11 +5,52 @@
 
 use crate::gui::app::{ServerStatus, SoundSharedApp};
 use crate::gui::theme::{micro_label, wordmark, Metrics, Palette};
-use crate::gui::widgets::{glyph, level_slider, signal_dot, IconButton};
+use crate::gui::widgets::{glyph, level_slider, signal_dot};
 use egui::{Align, Layout, Rect, Rounding, Sense, Ui, Vec2};
 
-/// Height reserved for the master volume slider inside the bar.
+/// Width of the master volume slider in the roomy bar.
 const MASTER_SLIDER_W: f32 = 150.0;
+/// Width of the master volume slider in the compact bar.
+const MASTER_SLIDER_W_COMPACT: f32 = 110.0;
+/// Below this window width the bar drops its optional text (the brand caption,
+/// the server line) and tightens its gaps, so the live status never gets
+/// squeezed out at the 960 px minimum window. The full bar needs about
+/// 1150 px.
+const COMPACT_BELOW: f32 = 1180.0;
+
+/// How much room the command bar has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarDensity {
+    Full,
+    Compact,
+}
+
+impl BarDensity {
+    /// Gap between the bar's groups on each side of a divider.
+    pub fn group_gap(self) -> f32 {
+        match self {
+            Self::Full => Metrics::XL,
+            Self::Compact => Metrics::MD,
+        }
+    }
+
+    /// Width of the master volume slider.
+    pub fn master_slider_w(self) -> f32 {
+        match self {
+            Self::Full => MASTER_SLIDER_W,
+            Self::Compact => MASTER_SLIDER_W_COMPACT,
+        }
+    }
+}
+
+/// Density for a bar of `width` points.
+pub fn bar_density(width: f32) -> BarDensity {
+    if width < COMPACT_BELOW {
+        BarDensity::Compact
+    } else {
+        BarDensity::Full
+    }
+}
 
 /// Renders the top command bar.
 pub fn top_bar(ui: &mut Ui, state: &mut SoundSharedApp) {
@@ -17,30 +58,34 @@ pub fn top_bar(ui: &mut Ui, state: &mut SoundSharedApp) {
     ui.painter()
         .rect_filled(bar_rect, Rounding::ZERO, Palette::APP);
 
-    // Reserve the full bar and lay the three groups out on one row.
+    let density = bar_density(bar_rect.width());
+    let gap = density.group_gap();
+
+    // Reserve the full bar and lay the groups out on one row.
     ui.allocate_ui_with_layout(
         ui.available_size(),
         Layout::left_to_right(Align::Center),
         |ui| {
             ui.add_space(Metrics::PANEL_PAD);
-            brand(ui);
-            ui.add_space(Metrics::XL);
+            brand(ui, density);
+            ui.add_space(gap);
             vertical_divider(ui);
-            ui.add_space(Metrics::XL);
-            master_volume(ui, state);
-            ui.add_space(Metrics::XL);
+            ui.add_space(gap);
+            master_volume(ui, state, density.master_slider_w());
+            ui.add_space(gap);
             vertical_divider(ui);
-            ui.add_space(Metrics::XL);
+            ui.add_space(gap);
             quick_clear(ui, state);
-            ui.add_space(Metrics::XL);
+            ui.add_space(gap);
             vertical_divider(ui);
-            ui.add_space(Metrics::XL);
+            ui.add_space(gap);
             crate::gui::recorder_ui::top_bar_controls(ui, state);
+            ui.add_space(Metrics::BLOCK_GAP);
             crate::gui::profiles_ui::profile_menu(ui, state);
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(Metrics::PANEL_PAD);
-                live_status(ui, state);
+                live_status(ui, state, density);
             });
         },
     );
@@ -55,7 +100,7 @@ pub fn top_bar(ui: &mut Ui, state: &mut SoundSharedApp) {
 }
 
 /// Brand lockup: rose signal mark + wordmark + `BROADCAST CONSOLE` subtitle.
-fn brand(ui: &mut Ui) {
+fn brand(ui: &mut Ui, density: BarDensity) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
         ui.painter()
@@ -71,21 +116,23 @@ fn brand(ui: &mut Ui) {
         ui.add_space(Metrics::SM);
 
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.spacing_mut().item_spacing.y = Metrics::LOCKUP_GAP;
             ui.label(wordmark("Bardwave"));
-            ui.label(micro_label("Broadcast Console").size(9.0));
+            if density == BarDensity::Full {
+                ui.label(micro_label("Broadcast Console").size(9.0));
+            }
         });
     });
 }
 
 /// Master volume: micro label, 150px slider, mono readout.
-fn master_volume(ui: &mut Ui, state: &mut SoundSharedApp) {
+fn master_volume(ui: &mut Ui, state: &mut SoundSharedApp, slider_w: f32) {
     ui.horizontal(|ui| {
         ui.label(micro_label("Master"));
-        ui.add_space(Metrics::SM);
+        ui.add_space(Metrics::LABEL_GAP);
 
         let mut value = state.get_master_volume();
-        let resp = level_slider(ui, &mut value, MASTER_SLIDER_W, "master_top");
+        let resp = level_slider(ui, &mut value, slider_w, "master_top");
         if resp.changed() {
             state.set_master_volume(value);
         }
@@ -99,24 +146,176 @@ fn master_volume(ui: &mut Ui, state: &mut SoundSharedApp) {
     });
 }
 
-/// A small, quiet "stop everything" action in the command bar.
+/// What is running right now, as far as the "Stop all" button cares.
+///
+/// Sounds are not the only thing a panic has to silence: the active scene (its
+/// delayed starts and emitters), the music layer and the local preview all keep
+/// making noise or scheduling it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoardActivity {
+    /// At least one sound row is playing.
+    pub sounds: bool,
+    /// A scene is active (its emitters and delayed starts are live).
+    pub scene: bool,
+    /// A playlist plays or is paused.
+    pub music: bool,
+    /// The headphone preview is running.
+    pub preview: bool,
+}
+
+impl BoardActivity {
+    /// Anything at all that a stop-all would change.
+    pub fn any(self) -> bool {
+        self.sounds || self.scene || self.music || self.preview
+    }
+}
+
+/// Visual state of the "Stop all" button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanicState {
+    /// Nothing plays: muted, but still readable and still clickable.
+    Idle,
+    /// Something plays: the button is lit.
+    Live,
+}
+
+/// Pick the button state from what is running.
+pub fn panic_state(activity: BoardActivity) -> PanicState {
+    if activity.any() {
+        PanicState::Live
+    } else {
+        PanicState::Idle
+    }
+}
+
+/// Tooltip of the button for a state.
+pub fn panic_tooltip(state: PanicState) -> &'static str {
+    match state {
+        PanicState::Live => "Stop all sounds immediately (panic)",
+        PanicState::Idle => "Stop all sounds immediately (panic) - nothing is playing",
+    }
+}
+
+/// Colours of the "Stop all" button for a state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanicColors {
+    pub fill: egui::Color32,
+    pub border: egui::Color32,
+    pub text: egui::Color32,
+    pub glyph: egui::Color32,
+}
+
+/// Colours of the button.
+///
+/// Live: rose-on-dark like a playing row, white on rose while hovered. Idle:
+/// transparent with a hairline border; the text stays zinc-400 so it reads at
+/// 4.5:1 on the bar, and the missing fill and rose make it look inactive.
+pub fn panic_colors(state: PanicState, hovered: bool) -> PanicColors {
+    let (fill, border, text, glyph) = match (state, hovered) {
+        (PanicState::Live, false) => (
+            Palette::ROSE_950,
+            Palette::ROSE_500,
+            Palette::ROSE_400,
+            Palette::ROSE_400,
+        ),
+        (PanicState::Live, true) => (
+            Palette::ROSE_600,
+            Palette::ROSE_500,
+            Palette::WHITE,
+            Palette::WHITE,
+        ),
+        (PanicState::Idle, false) => (
+            Palette::TRANSPARENT,
+            Palette::BORDER,
+            Palette::ZINC_400,
+            Palette::ZINC_500,
+        ),
+        (PanicState::Idle, true) => (
+            Palette::ROW,
+            Palette::BORDER_STRONG,
+            Palette::ZINC_300,
+            Palette::ZINC_400,
+        ),
+    };
+    PanicColors {
+        fill,
+        border,
+        text,
+        glyph,
+    }
+}
+
+/// Collect what is running from the app (a few flags; the music state is the
+/// copy the frame already observed, so nothing is cloned or blocked on).
+fn board_activity(state: &SoundSharedApp) -> BoardActivity {
+    BoardActivity {
+        sounds: state.sounds.lock().unwrap().values().any(|s| s.playing),
+        scene: state.director.active_scene().is_some(),
+        music: crate::gui::music::is_active(state.music.live()),
+        preview: state.lib_ui.preview.is_some(),
+    }
+}
+
+/// "Stop all": the panic control of the command bar.
+///
+/// The click always goes out, also when the button looks idle: a panic control
+/// that ignores a press because the display thinks nothing plays can never be
+/// trusted. The command goes through the Director (see
+/// `SoundSharedApp::stop_all_sounds`), so the active scene, emitters, delayed
+/// starts, the music layer and the preview stop with the sounds.
 fn quick_clear(ui: &mut Ui, state: &mut SoundSharedApp) {
-    let any_playing = state.get_sounds().iter().any(|s| s.playing);
-    let resp = IconButton::new(glyph::STOP)
-        .size(26.0)
-        .font_size(10.0)
-        .tooltip("Stop all sounds")
-        .id_salt("top_stop_all")
-        .show(ui);
-    if resp.clicked() && any_playing {
+    let panic = panic_state(board_activity(state));
+    let font = crate::gui::theme::mono_font(Metrics::MICRO);
+    let label = "STOP ALL";
+
+    let measure = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font.clone(), Palette::ZINC_400);
+    let icon = 12.0;
+    let pad = Metrics::MD;
+    let width = pad + icon + Metrics::SM + measure.size().x + pad;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, Metrics::BTN_H_SM), Sense::click());
+    let mut resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.clicked() {
+        resp.request_focus();
+    }
+    if resp.fake_primary_click {
+        resp.clicked = true;
+    }
+
+    let colors = panic_colors(panic, resp.hovered());
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        Rounding::same(Metrics::R_BTN),
+        colors.fill,
+        egui::Stroke::new(1.0_f32, colors.border),
+    );
+    let galley = painter.layout_no_wrap(label.to_string(), font, colors.text);
+    crate::gui::widgets::paint_icon(
+        painter,
+        glyph::STOP,
+        egui::pos2(rect.left() + pad + icon / 2.0, rect.center().y),
+        icon,
+        colors.glyph,
+    );
+    painter.galley(
+        egui::pos2(
+            rect.left() + pad + icon + Metrics::SM,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        colors.text,
+    );
+
+    let resp = resp.on_hover_text(panic_tooltip(panic));
+    if resp.clicked() {
         state.stop_all_sounds();
     }
-    ui.add_space(Metrics::XS);
-    ui.label(micro_label("Panic"));
 }
 
 /// Right-hand live signal: pulsing dot, `LIVE`/`OFF AIR`, secondary line.
-fn live_status(ui: &mut Ui, state: &mut SoundSharedApp) {
+fn live_status(ui: &mut Ui, state: &mut SoundSharedApp, density: BarDensity) {
     let server = state.get_server_state();
     let (color, headline, subline, pulse) = match &server.status {
         ServerStatus::Running => (
@@ -147,7 +346,7 @@ fn live_status(ui: &mut Ui, state: &mut SoundSharedApp) {
 
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.spacing_mut().item_spacing.y = Metrics::LOCKUP_GAP;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(headline.to_uppercase())
@@ -158,9 +357,11 @@ fn live_status(ui: &mut Ui, state: &mut SoundSharedApp) {
                 );
                 signal_dot(ui, color, 7.0, pulse && !state.reduced_motion());
             });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(micro_label(subline).size(9.0).extra_letter_spacing(0.8));
-            });
+            if density == BarDensity::Full {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(micro_label(subline).size(9.0).extra_letter_spacing(0.8));
+                });
+            }
         });
     });
 }
@@ -282,4 +483,100 @@ fn local_audio_readout(ui: &mut Ui, state: &SoundSharedApp) {
             );
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gui::scenes::contrast_ratio;
+
+    fn rgb(c: egui::Color32) -> [u8; 3] {
+        [c.r(), c.g(), c.b()]
+    }
+
+    #[test]
+    fn nothing_running_is_idle() {
+        assert_eq!(panic_state(BoardActivity::default()), PanicState::Idle);
+    }
+
+    #[test]
+    fn anything_running_lights_the_button() {
+        let cases = [
+            BoardActivity {
+                sounds: true,
+                ..Default::default()
+            },
+            BoardActivity {
+                scene: true,
+                ..Default::default()
+            },
+            BoardActivity {
+                music: true,
+                ..Default::default()
+            },
+            BoardActivity {
+                preview: true,
+                ..Default::default()
+            },
+        ];
+        for activity in cases {
+            assert_eq!(panic_state(activity), PanicState::Live, "{activity:?}");
+        }
+    }
+
+    #[test]
+    fn live_and_idle_look_different() {
+        for hovered in [false, true] {
+            assert_ne!(
+                panic_colors(PanicState::Live, hovered),
+                panic_colors(PanicState::Idle, hovered)
+            );
+        }
+        assert_ne!(
+            panic_tooltip(PanicState::Live),
+            panic_tooltip(PanicState::Idle)
+        );
+    }
+
+    #[test]
+    fn label_text_reads_in_every_state() {
+        // Idle sits on the bar, the lit button on its own fill.
+        for state in [PanicState::Idle, PanicState::Live] {
+            for hovered in [false, true] {
+                let colors = panic_colors(state, hovered);
+                let background = if colors.fill == Palette::TRANSPARENT {
+                    Palette::APP
+                } else {
+                    colors.fill
+                };
+                let ratio = contrast_ratio(rgb(colors.text), rgb(background));
+                assert!(
+                    ratio >= 4.5,
+                    "{state:?} hovered={hovered}: contrast {ratio:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bar_goes_compact_below_the_threshold() {
+        assert_eq!(bar_density(960.0), BarDensity::Compact);
+        assert_eq!(bar_density(1179.0), BarDensity::Compact);
+        assert_eq!(bar_density(1180.0), BarDensity::Full);
+        assert_eq!(bar_density(1600.0), BarDensity::Full);
+    }
+
+    #[test]
+    fn compact_bar_keeps_block_gaps_and_saves_room() {
+        let (full, compact) = (BarDensity::Full, BarDensity::Compact);
+        assert!(compact.group_gap() >= Metrics::MD);
+        assert!(compact.group_gap() < full.group_gap());
+        assert!(compact.master_slider_w() < full.master_slider_w());
+    }
+
+    #[test]
+    fn spacing_tokens_keep_the_scale() {
+        const { assert!(Metrics::LABEL_GAP >= Metrics::SM) };
+        const { assert!(Metrics::BLOCK_GAP >= Metrics::MD) };
+    }
 }
