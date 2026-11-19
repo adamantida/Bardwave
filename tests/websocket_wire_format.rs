@@ -100,10 +100,13 @@ async fn late_listener_receives_the_stream_format() {
     let (broadcaster, broadcaster_task) = AudioBroadcaster::new(BroadcasterConfig::default());
     tokio::spawn(broadcaster_task.run());
 
-    // Establish the format the way the engine does: one mixed frame.
-    broadcaster
-        .send_audio(AudioFrame::new(vec![0.0f32; 960], 48_000, 2, 0))
-        .expect("queue frame");
+    // Establish the format the way the engine does: mixed 10 ms blocks. The wire
+    // frame is 20 ms, so two blocks complete the first Opus packet.
+    for seq in 0..2 {
+        broadcaster
+            .send_audio(AudioFrame::new(vec![0.0f32; 960], 48_000, 2, seq))
+            .expect("queue frame");
+    }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
