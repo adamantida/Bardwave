@@ -159,7 +159,37 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/api/status", get(api_status))
         .route("/ws/audio", get(websocket_handler))
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        // The default span records the whole URI, which would put the access
+        // key (`?k=`) and the game-master token (`?g=`) into the logs. Only the
+        // method and the path are kept.
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                )
+            }),
+        )
+}
+
+/// [`build_router`] plus the game-master panel (`/control`, `/api/control/*`,
+/// `/ws/control`), when there is one (`--server-only` today).
+///
+/// The panel's WebSocket sessions are tied to the server's shutdown signal, so
+/// Stop server closes them like it closes listeners.
+pub fn build_router_with_control(
+    state: ServerState,
+    control: Option<crate::network::control::ControlContext>,
+) -> Router {
+    match control {
+        Some(control) => {
+            let routes =
+                crate::network::control::routes(control.with_shutdown(state.shutdown_tx.clone()));
+            build_router(state).merge(routes)
+        }
+        None => build_router(state),
+    }
 }
 
 /// Errors that can occur in the server
