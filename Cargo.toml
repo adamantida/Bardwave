@@ -91,6 +91,16 @@ rtrb = "0.3.6"
 # Library bundles (.zip export/import); deflate only, via flate2 (pure Rust)
 zip = { version = "=2.6.1", default-features = false, features = ["deflate-flate2", "flate2"] }
 
+# System-wide hotkeys (console not focused); see src/hotkeys.rs
+global-hotkey = "0.7.0"
+# MIDI input for hotkey bindings, only with `--features midi` (off by default)
+midir = { version = "0.10.1", optional = true }
+
+[features]
+default = []
+# MIDI controller bindings (src/hotkeys.rs `midi` module)
+midi = ["dep:midir"]
+
 # getifaddrs for LAN address detection on Linux / macOS
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
