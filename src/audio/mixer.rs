@@ -48,6 +48,10 @@ const CHANNELS: usize = 2;
 /// Events of streamed tracks that may wait for a listener.
 const STREAM_EVENT_CAPACITY: usize = 64;
 
+/// How many pruned-after-ending track ids [`AudioMixer::take_pruned_ended`]
+/// keeps (oldest dropped first).
+pub const PRUNED_ENDED_CAPACITY: usize = 128;
+
 /// Errors that can occur in the mixer
 #[derive(Debug, thiserror::Error)]
 pub enum MixerError {
@@ -463,6 +467,10 @@ struct TrackState {
     halt: Option<PendingHalt>,
     /// Paused (not stopped or finished): kept by [`AudioMixer::prune_finished`].
     paused: bool,
+    /// The source played out by itself (not stopped by anybody). Cleared
+    /// when the track is rewound. [`AudioMixer::prune_finished`] logs such
+    /// tracks so their end is not lost with them.
+    ended: bool,
     /// Whether track should loop
     looped: bool,
     /// Pan target, -1.0 ..= 1.0.
@@ -483,6 +491,16 @@ impl TrackState {
             0.0
         } else {
             self.volume
+        }
+    }
+
+    /// Cancel a pause/stop fade-out in progress. The explicit fade that was
+    /// carrying the gain to silence goes with it: the gain then slews from
+    /// where it is back to the volume, instead of finishing the fade-out and
+    /// jumping back up.
+    fn cancel_pending_halt(&mut self) {
+        if self.halt.take().is_some() {
+            self.fade = None;
         }
     }
 
@@ -583,6 +601,7 @@ impl TrackState {
     /// Back to the start of the source.
     fn rewind(&mut self) {
         self.position = 0;
+        self.ended = false;
         if let TrackSource::Stream(stream) = &mut self.source {
             stream.rewind();
         }
@@ -590,6 +609,7 @@ impl TrackState {
 
     /// The source has played out.
     fn mark_ended(&mut self) {
+        self.ended = true;
         if let TrackSource::Memory(audio) = &self.source {
             self.position = audio.frames;
         }
@@ -723,13 +743,20 @@ impl Limiter {
     fn process(&mut self, out: &mut [f32]) {
         let release = 1.0 - (-1.0 / (LIMIT_RELEASE_SECS * TARGET_SAMPLE_RATE as f32)).exp();
         for frame in out.as_chunks_mut::<CHANNELS>().0 {
+            // Safety net for a broken file: NaN/inf becomes silence before
+            // anything is measured or multiplied (inf * 0 is NaN, a clamp
+            // passes NaN, and an inf peak would pin the limiter at zero).
+            for sample in frame.iter_mut() {
+                if !sample.is_finite() {
+                    *sample = 0.0;
+                }
+            }
             let peak = frame.iter().fold(0.0f32, |m, s| m.max(s.abs()));
             self.gain += (1.0 - self.gain) * release;
             if peak * self.gain > LIMIT_CEILING {
                 self.gain = LIMIT_CEILING / peak;
             }
             for sample in frame.iter_mut() {
-                // The clamp is only a safety net for NaN/inf from a broken file.
                 *sample = (*sample * self.gain).clamp(-1.0, 1.0);
             }
         }
@@ -904,6 +931,9 @@ pub struct AudioMixer {
     /// `try_send`, which allocates nothing on a bounded channel.
     stream_events_tx: Sender<StreamEvent>,
     stream_events_rx: Receiver<StreamEvent>,
+    /// Tracks that played out and were then pruned before anyone looked, see
+    /// [`take_pruned_ended`](Self::take_pruned_ended). Control thread only.
+    pruned_ended: parking_lot::Mutex<Vec<Uuid>>,
 }
 
 impl AudioMixer {
@@ -930,6 +960,7 @@ impl AudioMixer {
             mix_handle: parking_lot::Mutex::new(None),
             stream_events_tx,
             stream_events_rx,
+            pruned_ended: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -979,6 +1010,7 @@ impl AudioMixer {
             playing: false,
             halt: None,
             paused: false,
+            ended: false,
             looped,
             pan: 0.0,
             pan_l: 1.0,
@@ -1208,6 +1240,37 @@ impl AudioMixer {
         })
     }
 
+    /// Multiply a track's volume by `ratio` without cutting a fade short.
+    ///
+    /// For a correction that arrives while the track plays (a loudness
+    /// measurement). [`set_track_volume`](Self::set_track_volume) drops an
+    /// explicit fade; this one keeps it running: the fade is re-based on the
+    /// gain the track has right now and heads for the scaled target over the
+    /// time that was left, so there is no jump and no restart. A fade-out to
+    /// pause/stop is left alone (its target is silence); the new volume
+    /// applies when the track plays again. The volume stays within 0.0..=1.0.
+    pub fn scale_track_volume(&self, track_id: Uuid, ratio: f32) -> Result<(), MixerError> {
+        if !ratio.is_finite() || ratio < 0.0 {
+            return Err(MixerError::InvalidVolume(ratio));
+        }
+        self.with_track(track_id, |track| {
+            track.volume = (track.volume * ratio).clamp(0.0, 1.0);
+            if track.halt.is_some() {
+                return;
+            }
+            if let Some(fade) = track.fade {
+                let target = (fade.target * ratio).clamp(0.0, 1.0);
+                track.fade = (track.gain != target).then(|| Fade {
+                    start: track.gain,
+                    target,
+                    len: fade.remaining().max(1),
+                    pos: 0,
+                    curve: fade.curve,
+                });
+            }
+        })
+    }
+
     /// Get volume for a specific track
     ///
     /// During an explicit fade this is the volume the fade heads for; see
@@ -1375,7 +1438,7 @@ impl AudioMixer {
                 track.gain = 0.0;
             }
             track.playing = !track.at_end() || track.looped;
-            track.halt = None;
+            track.cancel_pending_halt();
             track.paused = false;
         })
     }
@@ -1394,7 +1457,7 @@ impl AudioMixer {
                 track.gain = 0.0;
             }
             track.playing = !track.at_end() || track.looped;
-            track.halt = None;
+            track.cancel_pending_halt();
             track.paused = false;
             track.fade = Fade::between(track.gain, track.volume, ms_to_frames(duration_ms), curve);
         })
@@ -1599,11 +1662,31 @@ impl AudioMixer {
     ///
     /// Each `play` adds a track; without this a long session accumulates
     /// thousands of dead entries that the audio callback walks on every buffer.
+    ///
+    /// A track that played out by itself is remembered in a short log
+    /// ([`take_pruned_ended`](Self::take_pruned_ended)): whoever waits for its
+    /// end (a playlist) still learns of it when another `play` pruned it first.
     pub fn prune_finished(&self) -> usize {
         let mut tracks = self.core.tracks.write();
         let before = tracks.len();
-        tracks.retain(|_, t| t.playing || t.paused);
+        let mut log = self.pruned_ended.lock();
+        tracks.retain(|id, t| {
+            let keep = t.playing || t.paused;
+            if !keep && t.ended {
+                if log.len() >= PRUNED_ENDED_CAPACITY {
+                    log.remove(0);
+                }
+                log.push(*id);
+            }
+            keep
+        });
         before - tracks.len()
+    }
+
+    /// Ids of the tracks that played to their end and were pruned since the
+    /// last call (at most the newest [`PRUNED_ENDED_CAPACITY`]).
+    pub fn take_pruned_ended(&self) -> Vec<Uuid> {
+        std::mem::take(&mut *self.pruned_ended.lock())
     }
 
     /// Whether the mixer still holds this track.
@@ -2720,5 +2803,115 @@ mod fade_bus_tests {
         track.looped = false;
         track.position = 8;
         assert_eq!(track.fill_from_source(&mut dst), 2, "stops at the end");
+    }
+
+    // --- leftovers: resume cancels a pause fade-out, NaN/inf safety -----------
+
+    #[test]
+    fn resume_cancels_a_pending_pause_fade_out() {
+        let mixer = AudioMixer::new();
+        let id = constant(&mixer, 0.5, 10 * SR, true);
+        mixer.play_track(id).unwrap();
+        mix(&mixer, 2400);
+        mixer
+            .pause_track_with_fade_out(id, 100, FadeCurve::Linear)
+            .unwrap();
+        // Halfway through the 100 ms fade-out ...
+        mix(&mixer, 2400);
+        let mid = mixer.track_gain(id).unwrap();
+        assert!(mid > 0.1 && mid < 0.9, "mid-fade gain {mid}");
+        mixer.resume_track(id).unwrap();
+        // ... the old fade must not keep running down to silence.
+        let after = left(&mix(&mixer, 9600));
+        let floor = after.iter().copied().fold(f32::MAX, f32::min);
+        assert!(
+            floor >= 0.5 * mid - 0.01,
+            "dipped to {floor}, gain was {mid} at resume"
+        );
+        assert!(sounding(&mixer, id));
+        assert!((after.last().unwrap() - 0.5).abs() < 1e-4);
+        assert!(!mixer.is_track_fading(id).unwrap());
+    }
+
+    #[test]
+    fn resume_without_a_pending_halt_keeps_a_running_fade() {
+        let mixer = AudioMixer::new();
+        let id = constant(&mixer, 0.5, 10 * SR, true);
+        mixer.play_track(id).unwrap();
+        mixer
+            .fade_track_to(id, 0.2, 1000, FadeCurve::Linear)
+            .unwrap();
+        mix(&mixer, 480);
+        mixer.resume_track(id).unwrap();
+        assert!(mixer.is_track_fading(id).unwrap());
+    }
+
+    #[test]
+    fn limiter_turns_nan_and_inf_into_silence() {
+        let mixer = AudioMixer::new();
+        let bad = mixer.add_track(
+            Arc::new(DecodedAudio::new(
+                vec![f32::INFINITY, f32::NAN, f32::NEG_INFINITY, f32::NAN],
+                48_000,
+                2,
+            )),
+            true,
+        );
+        mixer.play_track(bad).unwrap();
+        let out = mix(&mixer, 480);
+        assert!(
+            out.iter().all(|s| s.is_finite()),
+            "non-finite sample leaked"
+        );
+        assert!(out.iter().all(|s| *s == 0.0));
+        assert_eq!(
+            mixer.core.limiter.lock().gain,
+            1.0,
+            "an inf peak must not pin the limiter"
+        );
+        // Once the broken track is gone a good one plays at full level: the
+        // limiter was not left damaged.
+        mixer.remove_track(bad).unwrap();
+        let good = constant(&mixer, 0.25, SR, true);
+        mixer.play_track(good).unwrap();
+        mix(&mixer, 960);
+        let out = left(&mix(&mixer, 480));
+        assert!((out[479] - 0.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn limiter_process_sanitises_before_the_gain() {
+        let mut limiter = Limiter::new();
+        limiter.gain = 0.0; // inf * 0.0 is NaN, and a clamp passes NaN
+        let mut out = [f32::INFINITY, f32::NAN, 0.5, f32::NEG_INFINITY];
+        limiter.process(&mut out);
+        assert!(out.iter().all(|s| s.is_finite()));
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[3], 0.0);
+    }
+
+    #[test]
+    fn scaling_the_volume_keeps_a_fade_running_and_continuous() {
+        let mixer = AudioMixer::new();
+        let id = constant(&mixer, 0.5, 10 * SR, true);
+        mixer.play_track(id).unwrap();
+        mixer
+            .fade_track_to(id, 0.0, 1000, FadeCurve::Linear)
+            .unwrap();
+        mix(&mixer, 24_000);
+        let before = mixer.track_gain(id).unwrap();
+        mixer.scale_track_volume(id, 0.5).unwrap();
+        assert!(mixer.is_track_fading(id).unwrap(), "fade must survive");
+        let out = left(&mix(&mixer, 480));
+        assert!((out[0] - 0.5 * before).abs() < 0.01, "no jump");
+        // A plain volume change, in contrast, drops the fade.
+        let other = constant(&mixer, 0.5, 10 * SR, true);
+        mixer.play_track(other).unwrap();
+        mixer
+            .fade_track_to(other, 0.0, 1000, FadeCurve::Linear)
+            .unwrap();
+        mixer.set_track_volume(other, 0.3).unwrap();
+        assert!(!mixer.is_track_fading(other).unwrap());
+        assert!(mixer.scale_track_volume(id, f32::NAN).is_err());
     }
 }

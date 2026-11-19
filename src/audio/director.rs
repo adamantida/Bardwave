@@ -115,6 +115,14 @@ pub trait Playback {
     fn is_looped(&self, sound: SoundId) -> bool;
     /// Set the level at once (a short ramp, no long fade).
     fn set_volume(&self, sound: SoundId, volume: f32) -> PlaybackResult;
+    /// Multiply the level by `ratio` without cutting a fade in progress short.
+    /// Default: `set_volume` of the scaled level (mocks).
+    fn scale_volume(&self, sound: SoundId, ratio: f32) -> PlaybackResult {
+        match self.volume(sound) {
+            Some(current) => self.set_volume(sound, (current * ratio).clamp(0.0, 1.0)),
+            None => Ok(()),
+        }
+    }
     /// Turn repeating on or off (live for a playing sound).
     fn set_looped(&self, sound: SoundId, looped: bool) -> PlaybackResult;
     /// Pan, `-1.0..=1.0`.
@@ -201,6 +209,10 @@ impl Playback for AudioEngine {
 
     fn set_volume(&self, sound: SoundId, volume: f32) -> PlaybackResult {
         self.set_sound_volume(sound, volume)
+    }
+
+    fn scale_volume(&self, sound: SoundId, ratio: f32) -> PlaybackResult {
+        self.scale_sound_volume(sound, ratio)
     }
 
     fn set_looped(&self, sound: SoundId, looped: bool) -> PlaybackResult {

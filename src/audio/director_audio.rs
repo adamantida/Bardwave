@@ -673,15 +673,15 @@ impl Director {
         let old = entry.gain_db;
         entry.gain_db = gain_db;
         let (sound, level_now) = (entry.sound, entry.level(entry.volume));
-        let level = if pb.is_playing(sound) {
+        let result = if pb.is_playing(sound) && pb.volume(sound).is_some() {
+            // Scale in place: setting the level would drop the fade the sound
+            // is in the middle of (a scene crossfade, a fade-in).
             let ratio = 10f32.powf((gain_db - old) / 20.0);
-            pb.volume(sound)
-                .map(|current| (current * ratio).clamp(0.0, 1.0))
-                .unwrap_or(level_now)
+            pb.scale_volume(sound, ratio)
         } else {
-            level_now
+            pb.set_volume(sound, level_now)
         };
-        if let Err(e) = pb.set_volume(sound, level) {
+        if let Err(e) = result {
             tracing::warn!("Could not apply the gain of {library_id}: {e}");
         }
         true

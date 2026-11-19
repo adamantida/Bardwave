@@ -16,6 +16,15 @@
 //! bindings fire (those with Ctrl / Alt / Cmd, and F-keys). A plain `1`,
 //! `Space`, `Shift+A` or `Escape` stays with the text field.
 //!
+//! # A held `DuckHold` key
+//!
+//! The key-up of a `DuckHold` binding can be lost: the window loses focus
+//! while the key is down, or a text field takes the keyboard and the release
+//! goes to it. The held bindings are remembered (in the egui context, so
+//! [`poll_local`] keeps its signature) and released by force in both cases:
+//! a [`KeyPhase::Released`] is reported and the ducking ends instead of
+//! sticking.
+//!
 //! # What egui cannot see
 //!
 //! * The numeric keypad: egui reports keypad keys as the main-row digits, so
@@ -242,6 +251,23 @@ pub fn released_egui(input: &mut InputState, binding: &Binding) -> bool {
     }
 }
 
+/// Entries (by `[[hotkeys]]` index) whose `DuckHold` key is down locally.
+#[derive(Debug, Clone, Default)]
+struct HeldDucks(Vec<usize>);
+
+fn held_id() -> egui::Id {
+    egui::Id::new("bardwave-local-duck-holds")
+}
+
+/// The window lost the keyboard focus (or is about to, this frame).
+fn focus_lost(input: &InputState) -> bool {
+    !input.focused
+        || input
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::WindowFocused(false)))
+}
+
 /// Collect this frame's local hotkeys and consume their key events. See the
 /// module docs. `global`: skip bindings the system-wide service owns.
 pub fn poll_local(
@@ -259,12 +285,38 @@ pub fn poll_local_for(
     global: Option<&HotkeyService>,
     platform: Platform,
 ) -> Vec<HotkeyEvent> {
-    if map.is_empty() {
+    let mut held: HeldDucks = ctx
+        .data_mut(|d| d.get_temp::<HeldDucks>(held_id()))
+        .unwrap_or_default();
+    if map.is_empty() && held.0.is_empty() {
         return Vec::new();
     }
     let typing = ctx.wants_keyboard_input();
     let mut fired = Vec::new();
     ctx.input_mut(|input| {
+        // A key that can no longer be released the normal way: the window is
+        // not focused, or a text field has the keyboard and the key is one it
+        // would type (a text-safe, Ctrl/F-key binding still sees its key-up).
+        let lost_focus = focus_lost(input);
+        for entry in map.entries() {
+            if !held.0.contains(&entry.index) {
+                continue;
+            }
+            if lost_focus || (typing && !entry.binding.is_text_safe()) {
+                held.0.retain(|i| *i != entry.index);
+                fired.push(HotkeyEvent {
+                    index: entry.index,
+                    action: entry.action.clone(),
+                    phase: KeyPhase::Released,
+                    source: Source::Local,
+                });
+            }
+        }
+        // A held entry that left the map (a rebuilt map) cannot be released
+        // by key any more.
+        held.0
+            .retain(|index| map.entries().iter().any(|e| e.index == *index));
+
         for entry in map.entries() {
             if typing && !entry.binding.is_text_safe() {
                 continue;
@@ -272,11 +324,14 @@ pub fn poll_local_for(
             if global.is_some_and(|service| service.covers(&entry.binding)) {
                 continue;
             }
+            let is_hold = matches!(entry.action, crate::config::HotkeyAction::DuckHold);
             let phase = if consume_egui_for(input, &entry.binding, platform) {
+                if is_hold && !held.0.contains(&entry.index) {
+                    held.0.push(entry.index);
+                }
                 KeyPhase::Pressed
-            } else if matches!(entry.action, crate::config::HotkeyAction::DuckHold)
-                && released_egui(input, &entry.binding)
-            {
+            } else if is_hold && released_egui(input, &entry.binding) {
+                held.0.retain(|i| *i != entry.index);
                 KeyPhase::Released
             } else {
                 continue;
@@ -289,6 +344,7 @@ pub fn poll_local_for(
             });
         }
     });
+    ctx.data_mut(|d| d.insert_temp(held_id(), held));
     fired
 }
 
@@ -596,5 +652,102 @@ mod tests {
         assert_eq!(Key::Letter('K').to_egui(), Some(EKey::K));
         assert_eq!(Key::Function(5).to_egui(), Some(EKey::F5));
         assert_eq!(Key::Digit(0).to_egui(), Some(EKey::Num0));
+    }
+
+    /// One frame with the window focus given explicitly.
+    fn frame_focused(
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        focused: bool,
+        map: &HotkeyMap,
+    ) -> Vec<HotkeyEvent> {
+        let raw = RawInput {
+            events,
+            focused,
+            ..RawInput::default()
+        };
+        let mut fired = Vec::new();
+        let _ = ctx.run(raw, |ctx| fired = poll_local_for(ctx, map, None, OTHER));
+        fired
+    }
+
+    #[test]
+    fn losing_the_window_focus_releases_a_held_duck() {
+        let ctx = egui::Context::default();
+        let map = map_of(&[("Ctrl+D", HotkeyAction::DuckHold)], OTHER);
+        let press = vec![key_event(EKey::D, true, mods(true, false, false, false))];
+        let fired = frame_focused(&ctx, press, true, &map);
+        assert_eq!(fired[0].phase, KeyPhase::Pressed);
+        // Alt+Tab away with the key down: no key-up will ever arrive.
+        let fired = frame_focused(&ctx, vec![Event::WindowFocused(false)], false, &map);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].phase, KeyPhase::Released);
+        assert_eq!(fired[0].action, HotkeyAction::DuckHold);
+        // Released once, not on every unfocused frame.
+        assert!(frame_focused(&ctx, vec![], false, &map).is_empty());
+    }
+
+    #[test]
+    fn a_text_field_taking_the_keyboard_releases_a_plain_duck_key() {
+        let ctx = egui::Context::default();
+        // A plain key is not text-safe: with a field focused it never fires,
+        // so its release must not depend on seeing the key-up.
+        let map = map_of(&[("Shift+D", HotkeyAction::DuckHold)], OTHER);
+        let press = vec![key_event(EKey::D, true, mods(false, true, false, false))];
+        let fired = frame_focused(&ctx, press, true, &map);
+        assert_eq!(fired[0].phase, KeyPhase::Pressed);
+
+        let mut text = String::new();
+        let mut typing_fired = Vec::new();
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut text).id(egui::Id::new("note")));
+                r.request_focus();
+            });
+        });
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            assert!(ctx.wants_keyboard_input());
+            typing_fired = poll_local_for(ctx, &map, None, OTHER);
+        });
+        assert_eq!(typing_fired.len(), 1);
+        assert_eq!(typing_fired[0].phase, KeyPhase::Released);
+    }
+
+    #[test]
+    fn a_text_safe_duck_key_keeps_working_while_typing() {
+        let ctx = egui::Context::default();
+        let map = map_of(&[("Ctrl+D", HotkeyAction::DuckHold)], OTHER);
+        let press = vec![key_event(EKey::D, true, mods(true, false, false, false))];
+        assert_eq!(frame_focused(&ctx, press, true, &map).len(), 1);
+        let mut text = String::new();
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut text).id(egui::Id::new("note")));
+                r.request_focus();
+            });
+        });
+        let mut fired = Vec::new();
+        let release = vec![key_event(EKey::D, false, Modifiers::NONE)];
+        let _ = ctx.run(
+            RawInput {
+                events: release,
+                ..RawInput::default()
+            },
+            |ctx| fired = poll_local_for(ctx, &map, None, OTHER),
+        );
+        // Exactly one release: the key-up, not a forced one on top of it.
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].phase, KeyPhase::Released);
+    }
+
+    #[test]
+    fn a_duck_key_released_normally_is_not_released_again_on_focus_loss() {
+        let ctx = egui::Context::default();
+        let map = map_of(&[("Ctrl+D", HotkeyAction::DuckHold)], OTHER);
+        let press = vec![key_event(EKey::D, true, mods(true, false, false, false))];
+        frame_focused(&ctx, press, true, &map);
+        let release = vec![key_event(EKey::D, false, Modifiers::NONE)];
+        assert_eq!(frame_focused(&ctx, release, true, &map).len(), 1);
+        assert!(frame_focused(&ctx, vec![Event::WindowFocused(false)], false, &map).is_empty());
     }
 }
