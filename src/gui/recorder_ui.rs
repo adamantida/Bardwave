@@ -255,17 +255,29 @@ pub fn readout_text(stats: &RecorderStats) -> String {
     )
 }
 
-/// Draw the REC controls into the top bar row.
-pub fn top_bar_controls(ui: &mut Ui, state: &mut SoundSharedApp) {
+/// Width of the REC button in the roomy bar.
+pub const REC_BTN_W: f32 = 92.0;
+/// Width of the REC button when the bar is tight.
+pub const REC_BTN_W_COMPACT: f32 = 60.0;
+/// Side of the recordings-folder button.
+pub const REC_FOLDER_W: f32 = 26.0;
+
+/// Draw the REC button and the recordings-folder button into the top bar row.
+/// `compact` narrows the button, `folder` shows the folder button (the bar drops
+/// it first when it runs out of room).
+pub fn top_bar_controls(ui: &mut Ui, state: &mut SoundSharedApp, compact: bool, folder: bool) {
     let config = state.app_state.config.clone();
-    let reduced = state.reduced_motion();
     let rec = &mut state.recorder;
 
     let recording = rec.active.is_some();
     let busy = rec.starting.is_some() || rec.stopping.is_some();
 
     let (label, kind, tooltip) = if recording {
-        ("Stop rec", BtnKind::Armed, "Stop and save the recording")
+        (
+            if compact { "Stop" } else { "Stop rec" },
+            BtnKind::Armed,
+            "Stop and save the recording",
+        )
     } else {
         (
             "Rec",
@@ -275,7 +287,11 @@ pub fn top_bar_controls(ui: &mut Ui, state: &mut SoundSharedApp) {
     };
     let button = ConsoleButton::new(label)
         .kind(kind)
-        .width(92.0)
+        .width(if compact {
+            REC_BTN_W_COMPACT
+        } else {
+            REC_BTN_W
+        })
         .height(26.0)
         .enabled(!busy)
         .tooltip(tooltip)
@@ -284,71 +300,103 @@ pub fn top_bar_controls(ui: &mut Ui, state: &mut SoundSharedApp) {
         rec.toggle(&config);
     }
 
-    if let Some(stats) = rec
+    if folder {
+        ui.add_space(Metrics::SM);
+        let dir = recordings_dir(&config.lock().unwrap());
+        let pick = IconButton::new(glyph::FOLDER)
+            .size(REC_FOLDER_W)
+            .font_size(11.0)
+            .tooltip(format!(
+                "Recordings folder: {}\nClick to change (applies to the next recording)",
+                dir.display()
+            ))
+            .id_salt("top_rec_folder")
+            .show(ui);
+        if pick.clicked() && !recording {
+            rec.choose_folder(&config);
+        }
+    }
+}
+
+/// The live readout (time, size, losses) or the last notice, drawn after the
+/// bar's fixed controls into at most `max_w` points. The bar offers only what
+/// is left of its row, so the text is truncated, never pushed into the status.
+pub fn top_bar_readout(ui: &mut Ui, state: &mut SoundSharedApp, max_w: f32) {
+    // Below this there is nothing useful to read; the armed REC button already
+    // says a recording runs.
+    const MIN_W: f32 = 90.0;
+    if max_w < MIN_W {
+        return;
+    }
+    let reduced = state.reduced_motion();
+    let rec = &state.recorder;
+    let recording = rec.active.is_some();
+    let stats = rec
         .stats
         .clone()
-        .filter(|_| recording || rec.stopping.is_some())
-    {
-        ui.add_space(Metrics::SM);
-        signal_dot(ui, Palette::ROSE_500, 7.0, !reduced);
-        ui.add_space(Metrics::XS);
-        ui.label(
-            egui::RichText::new(readout_text(&stats))
-                .font(mono_font(11.0))
-                .color(Palette::WHITE),
-        );
-        if stats.dropped_frames > 0 {
-            ui.label(
-                egui::RichText::new(format!("{} lost", stats.dropped_frames))
-                    .font(mono_font(10.0))
-                    .color(Palette::AMBER_400),
-            );
-        }
-        if let Some(warning) = &stats.warning {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(warning)
-                        .font(mono_font(10.0))
-                        .color(Palette::AMBER_400),
+        .filter(|_| recording || rec.stopping.is_some());
+    let notice = rec.notice.clone();
+    ui.allocate_ui_with_layout(
+        egui::vec2(max_w, ui.available_height()),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_max_width(max_w);
+            if let Some(stats) = stats {
+                ui.add_space(Metrics::SM);
+                signal_dot(ui, Palette::ROSE_500, 7.0, !reduced);
+                ui.add_space(Metrics::XS);
+                let text = readout_text(&stats);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&text)
+                            .font(mono_font(11.0))
+                            .color(Palette::WHITE),
+                    )
+                    .truncate(),
                 )
-                .truncate(),
-            )
-            .on_hover_text(warning);
-        }
-    } else if let Some(notice) = rec.notice.clone() {
-        ui.add_space(Metrics::SM);
-        let color = if notice.is_error {
-            Palette::ROSE_400
-        } else {
-            Palette::ZINC_400
-        };
-        ui.allocate_ui(egui::vec2(260.0, ui.available_height()), |ui| {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(&notice.text)
-                        .font(mono_font(10.0))
-                        .color(color),
+                .on_hover_text(text);
+                if stats.dropped_frames > 0 {
+                    ui.add_space(Metrics::SM);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{} lost", stats.dropped_frames))
+                                .font(mono_font(10.0))
+                                .color(Palette::AMBER_400),
+                        )
+                        .truncate(),
+                    );
+                }
+                if let Some(warning) = &stats.warning {
+                    ui.add_space(Metrics::SM);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(warning)
+                                .font(mono_font(10.0))
+                                .color(Palette::AMBER_400),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(warning);
+                }
+            } else if let Some(notice) = notice {
+                ui.add_space(Metrics::SM);
+                let color = if notice.is_error {
+                    Palette::ROSE_400
+                } else {
+                    Palette::ZINC_400
+                };
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&notice.text)
+                            .font(mono_font(10.0))
+                            .color(color),
+                    )
+                    .truncate(),
                 )
-                .truncate(),
-            )
-            .on_hover_text(&notice.text);
-        });
-    }
-
-    ui.add_space(Metrics::SM);
-    let dir = recordings_dir(&config.lock().unwrap());
-    let pick = IconButton::new(glyph::FOLDER)
-        .size(26.0)
-        .font_size(11.0)
-        .tooltip(format!(
-            "Recordings folder: {}\nClick to change (applies to the next recording)",
-            dir.display()
-        ))
-        .id_salt("top_rec_folder")
-        .show(ui);
-    if pick.clicked() && !recording {
-        rec.choose_folder(&config);
-    }
+                .on_hover_text(&notice.text);
+            }
+        },
+    );
 }
 
 #[cfg(test)]

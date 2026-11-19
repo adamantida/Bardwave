@@ -580,3 +580,149 @@ fn emitters_dialog_for_an_unknown_scene_draws_nothing() {
         assert!(draw_emitters(ui, &env, &mut st, uuid::Uuid::new_v4(), 700.0).is_empty());
     });
 }
+
+// ------------------------------------------------- transport bar layout ----
+
+/// Inner width of the card for a window of `w` points.
+fn inner_of(window: f32) -> f32 {
+    window - 2.0 * Metrics::APP_PAD - 2.0 * PLAYER_PAD
+}
+
+#[test]
+fn player_items_fit_the_card_at_any_width() {
+    for window in 640..=1600 {
+        let inner = inner_of(window as f32);
+        let layout = player_layout(inner);
+        assert!(
+            layout.width() <= inner + 0.001,
+            "{window}: {layout:?} needs {} of {inner}",
+            layout.width()
+        );
+        assert!(layout.seek_w >= SEEK_MIN_W, "{window}: {layout:?}");
+        assert!(layout.now_playing_w >= NOW_PLAYING_MIN_W, "{window}");
+        assert!(layout.now_playing_w <= NOW_PLAYING_W, "{window}");
+    }
+}
+
+#[test]
+fn player_gives_up_in_the_agreed_order() {
+    let roomy = player_layout(inner_of(1600.0));
+    assert!(roomy.mode_labels && roomy.clocks);
+    assert_eq!(roomy.now_playing_w, NOW_PLAYING_W);
+    assert!(roomy.seek_w > SEEK_MIN_W);
+
+    let mut previous = roomy;
+    for window in (640..=1600).rev() {
+        let l = player_layout(inner_of(window as f32));
+        // The seek bar shrinks first: the block only gets narrower once the
+        // bar sits at its minimum.
+        if l.now_playing_w < NOW_PLAYING_W && l.mode_labels == previous.mode_labels {
+            assert_eq!(l.seek_w, SEEK_MIN_W, "{window}: {l:?}");
+        }
+        // Labels become icons before the clocks go.
+        if !l.clocks {
+            assert!(!l.mode_labels, "{window}: {l:?}");
+        }
+        // Nothing that was given up comes back as the window narrows.
+        assert!(l.clocks <= previous.clocks && l.mode_labels <= previous.mode_labels);
+        previous = l;
+    }
+}
+
+#[test]
+fn player_at_900_keeps_its_labels_and_a_usable_seek_bar() {
+    let l = player_layout(inner_of(900.0));
+    assert!(l.mode_labels && l.clocks, "{l:?}");
+    assert!(l.seek_w >= SEEK_MIN_W);
+    // 640 is tight enough for the icon form.
+    assert!(!player_layout(inner_of(640.0)).mode_labels);
+}
+
+#[test]
+fn card_sits_between_equal_gaps() {
+    let panel = Rect::from_min_size(pos2(0.0, 500.0), vec2(1000.0, Metrics::PLAYER_BAR_H));
+    let card = player_card_rect(panel);
+    assert_eq!(card.top() - panel.top(), Metrics::PLAYER_GAP_TOP);
+    assert_eq!(panel.bottom() - card.bottom(), Metrics::PLAYER_GAP_BOTTOM);
+    assert_eq!(card.height(), Metrics::PLAYER_CARD_H);
+    assert_eq!(card.left(), Metrics::APP_PAD);
+}
+
+fn draw_player_at(
+    window: f32,
+    st: &mut MusicUi,
+    library: &Library,
+) -> Vec<crate::gui::layout_probe::TextBox> {
+    use crate::gui::layout_probe::{run_frames as probe_frames, text_boxes};
+    let ctx = egui::Context::default();
+    let out = probe_frames(&ctx, vec2(window, 300.0), 2, |ctx| {
+        egui::TopBottomPanel::bottom("music_bar")
+            .exact_height(Metrics::PLAYER_BAR_H)
+            .frame(egui::Frame::none())
+            .show(ctx, |ui| {
+                let env = env_for(library, st);
+                let _ = draw_bar(ui, &env, st);
+            });
+    });
+    text_boxes(&out)
+}
+
+#[test]
+fn painted_player_stays_inside_its_card_at_any_width() {
+    use crate::gui::layout_probe::assert_clean;
+    let (mut library, ids) = library_with_sounds(2);
+    let pl = library
+        .add_playlist("A playlist with a rather long name")
+        .unwrap();
+    library.set_playlist_items(pl, ids.clone());
+    let playing = |repeat: RepeatMode| MusicUi {
+        live: PlaylistState {
+            playlist: Some(pl.to_string()),
+            name: Some("A playlist with a rather long name".into()),
+            status: PlaylistStatus::Playing,
+            track_count: 2,
+            track_index: Some(1),
+            track: Some(ids[1].to_string()),
+            title: Some("A very long title that must be elided somewhere".into()),
+            artist: Some("Someone".into()),
+            position_ms: 42_000,
+            duration_ms: Some(180_000),
+            shuffle: true,
+            repeat,
+            ..Default::default()
+        },
+        message: Some("could not start the track because of something long".into()),
+        ..Default::default()
+    };
+    for window in (640..=1600).step_by(8).chain([900, 960]) {
+        let window = window as f32;
+        let card = player_card_rect(Rect::from_min_max(
+            pos2(0.0, 300.0 - Metrics::PLAYER_BAR_H),
+            pos2(window, 300.0),
+        ));
+        for (name, mut st) in [
+            ("idle", MusicUi::default()),
+            ("playing", playing(RepeatMode::One)),
+            ("repeat all", playing(RepeatMode::All)),
+        ] {
+            let boxes = draw_player_at(window, &mut st, &library);
+            assert!(!boxes.is_empty(), "{window} {name}: nothing painted");
+            assert_clean(&boxes, card, &format!("player ({name}) at {window}"));
+        }
+    }
+}
+
+#[test]
+fn narrow_player_shows_icons_with_the_same_tooltips_and_wide_one_shows_words() {
+    let library = Library::new();
+    let wide = draw_player_at(1280.0, &mut MusicUi::default(), &library);
+    assert!(wide.iter().any(|b| b.text == "SHUFFLE"), "{wide:?}");
+    assert!(
+        wide.iter().any(|b| b.text.starts_with("REPEAT")),
+        "{wide:?}"
+    );
+    let narrow = draw_player_at(640.0, &mut MusicUi::default(), &library);
+    assert!(!narrow.iter().any(|b| b.text == "SHUFFLE"), "{narrow:?}");
+    assert!(narrow.iter().any(|b| b.text == "NO MUSIC PLAYING"));
+    assert!(narrow.iter().any(|b| b.text == "MUSIC…"));
+}
