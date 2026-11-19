@@ -2,73 +2,161 @@
 
 > **Project:** Bardwave — free, open-source ambience, music and sound effects for tabletop RPG
 > **Repo:** https://github.com/adamantida/Bardwave
-> **Package:** `soundshared` v0.1.0
+> **Package:** `soundshared` (version in `Cargo.toml`, currently 1.4.0; the binary is shipped as `Bardwave`)
 > **License:** MIT © 2026 adamantida
+
+This file describes what the code **is**. User-facing documentation is `README.md`, the change history is `CHANGELOG.md`, the development plan (in Russian) is `PLAN.md`.
 
 ---
 
 ## 1. Project Overview
 
-Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' browsers over a local network (LAN). The Game Master runs the desktop app (egui console), loads sounds, mixes them live, and broadcasts over WebSocket. Players open one URL in any browser and hear the mix — no accounts, no subscriptions, no cloud.
+Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' browsers over the network. The Game Master runs the desktop app (egui console), builds scenes, plays music and effects, and the mix is broadcast over WebSocket as Opus. Players open one URL in any browser and hear the mix — no accounts, no subscriptions, no cloud.
 
-**Core architecture:**
 ```
-┌─────────────────────── Bardwave.exe ────────────────────────┐
-│   egui console ──AudioCommand──▶  audio engine              │
-│   (sounds, groups,     ◀─status─  ├─ decoder  (Symphonia)   │
-│    server panel)                  ├─ mixer    (48k/stereo)  │
-│                                   └─ cpal output ─▶ speakers │
-│                                          │                  │
-│                                          │ MixedOutput      │
-│                                          ▼                  │
-│                              broadcaster (tokio broadcast)  │
-│                                          │                  │
-│                              axum HTTP + WebSocket          │
-└──────────────────────────────────────────┼──────────────────┘
-                                           │ ws://<lan-ip>:8080/ws/audio?k=<key>
-                                  ┌────────┼────────┐
-                                  ▼        ▼        ▼
-                              🧝 browser  🧙 browser  🧟 browser
+┌─────────────────────────── Bardwave ───────────────────────────┐
+│  egui console ──AudioCommand──┐                                │
+│  hotkeys ─────────────────────┴▶ Director ──Playback──▶ AudioEngine
+│  /control (--server-only): ControlAction ─▶ Board ─▶ Director   │
+│                                   scenes, emitters,    ├─ decoder / stream_source
+│                                   playlists, ducking   ├─ mixer (tracks, buses, pan,
+│                                                        │   fades, duck, limiter)
+│                                                        └─ cpal ─▶ speakers
+│                                                        │ MixedOutput
+│                                                        ▼
+│                                     AudioProcessor ─▶ broadcaster (Opus)
+│                                                        │
+│                                           axum HTTP + WebSocket
+└────────────────────────────────────────────────────────┼───────┘
+                                       ws://<lan-ip>:8080/ws/audio?k=<key>
+                                    ┌───────────────┼───────────────┐
+                                    ▼               ▼               ▼
+                                 browser         browser         browser
                               (Web Audio API → speakers)
 ```
 
-**Crates/Modules:**
-| Module | Responsibility |
-|--------|---------------|
-| `src/audio` | Decoding (Symphonia), mixing, resampling (48k stereo f32), cpal output, YouTube import via yt-dlp (`youtube.rs`) |
-| `src/network` | axum HTTP/WebSocket server, broadcaster, embedded listener page, local-IP detection, access key (`access.rs`), UPnP port forwarding (`upnp.rs`), `--server-only` remote control (`control.rs`) |
-| `src/gui` | egui console: theme, widgets, sound list, groups, server panel, dialogs |
-| `src/config` | `config.toml` schema and persistence |
-| `src/error` | Typed error types (`SoundSharedError`) |
+**Key dependencies:** egui/eframe 0.30, rfd, cpal, symphonia (WAV/FLAC/MP3/OGG/AAC), rusty-opus (pure Rust Opus), tokio, axum (WebSocket), tokio-tungstenite, ebur128 (loudness), rtrb (lock-free ring buffer), zip (bundles), qrcode (GM link QR), global-hotkey, optional `midir` (feature `midi`), socket2 + roxmltree (UPnP), ureq (yt-dlp download), serde/toml/serde_json, tracing, anyhow, thiserror, uuid, crossbeam-channel, parking_lot.
 
-**Key dependencies:** egui, eframe, cpal, symphonia, tokio, axum, tokio-tungstenite, rusty-opus, serde, tracing, anyhow, thiserror, uuid, crossbeam-channel.
-
-**Build requirements:** Rust 1.85+. Windows 10/11 is the primary target; macOS and Linux build too (local-IP detection uses `GetAdaptersAddresses` on Windows and `getifaddrs` on unix; CI builds on ubuntu, windows and macOS). ffmpeg is auto-downloaded only on Windows; on macOS/Linux it must be installed (`brew install ffmpeg` / `apt install ffmpeg`).
+**Build requirements:** Rust 1.85+. Windows 10/11, macOS 11+ and Linux are built in CI (ubuntu, windows, macOS). Linux needs GTK 3, ALSA, xkbcommon development packages. ffmpeg (YouTube import only) is auto-downloaded on Windows; on macOS/Linux it must be installed.
 
 ---
 
-## 2. Agent Team Structure
+## 2. Modules and Architecture
 
-This project uses an **AgentTeams** system. Agents are assigned specific roles and tasks. The Team Lead ("lead") coordinates all work.
+### 2.1 Threads and ownership
 
-### Current Team Roles (from historical context)
+* The **audio engine is `!Send`** (its cpal stream). It lives on the thread that created it: the GUI thread in console mode, the main thread in `--server-only`. Everything that touches it runs there.
+* The **Director** does not own a thread and does not own the engine. Every operation takes `&impl Playback`; time-based work (delayed scene starts, emitters, playlist transitions, crossfade tails, loudness results) is driven by `Director::tick`, and `Director::next_deadline` tells the owner when to wake up.
+* The **network server** runs in its own thread with a tokio runtime. The GUI talks to it with `ServerCommand`s; HTTP handlers of the GM panel only queue `ControlCommand`s, which the main thread executes.
+* **Nothing blocks the render thread or the audio callback.** File dialogs, folder scans, bundle jobs and `stat` calls run on short-lived threads and answer through a channel drained once per frame; streamed files are decoded on a worker thread into an SPSC ring buffer; loudness is measured in a worker.
 
-| Role | Responsibility |
-|------|---------------|
-| **Software Architect** | Cross-crate integration, type definitions, error types, repository patterns |
-| **Frontend Engineer** | Tauri/frontend screens, HTML/JS connection to backend commands |
-| **UI Engineer** | TUI states, adaptive layout, widgets, screens, keyboard loop |
-| **Desktop App Engineer** | Dashboard implementation, Tauri command integration |
-| **Test Automation Engineer** | Test plans, quality gates, verification |
-| **Rust Engineer** | Splash screen, UI implementation, `cargo check` verification |
+### 2.2 `src/audio`
 
-> **Note:** This project was previously scoped as a multi-crate Mesh VoidLink/Tunnel project (with `crates/core`, `crates/app`, `crates/tui`, etc.). The current repository is a single-crate Bardwave/SoundShared project. Agent assignments should reflect the actual repo structure.
+| File | Responsibility |
+|------|----------------|
+| `engine.rs` | `AudioEngine`: sound catalog, cpal output (headless fallback when no device), master volume, previews (`play_preview`, local-only), `impl Playback` |
+| `decoder.rs` | Symphonia decoding to 48 kHz / stereo f32 (`DecodedAudio`), file probe, tags (`TrackMeta`) |
+| `stream_source.rs` | Streaming decoder for long files: worker thread + `rtrb` ring buffer, seek by generation counter, loop, `StreamEvent::TrackFinished`. Threshold `[audio] stream_threshold_secs` (default 60 s) |
+| `mixer.rs` | `AudioMixer`: pull-based mixing driven by the device callback; per-track gain with parametrised fades (equal-power or linear), pan, buses (music / ambience / sfx) with volume and ducking, master volume, limiter, local-only tracks (rendered after the broadcast copy is published) |
+| `director.rs` | `Director`: scenes (`ActivationPlan`: start / retune / stop with the scene's fades), snapshots to scene, stingers, delayed starts, state `watch` channel (`DirectorState`), the `Playback` trait and an in-memory `MockPlayback` for tests |
+| `director_audio.rs` | `impl Director`: bus volumes, ducking (latch / hold / toggle, `[audio] duck_*`), loudness normalization (`CatalogSound::gain_db`, background measurement, `GainUpdate`) |
+| `emitter.rs` | Random / periodic sounds of the active scene: pure `Scheduler` (seeded xorshift), `EmitterRunner`, `EmitterHost` embedded in the Director |
+| `playlist.rs` | `PlaylistPlayer` (shuffle without repeats, repeat off/all/one, crossfade, seek, pause), `MusicLayer`, `PlaylistCommand`, `PlaylistState` |
+| `loudness.rs` | EBU R128 integrated loudness (`ebur128`) and gain computation |
+| `youtube.rs` | YouTube import through yt-dlp (+ ffmpeg); self-downloading tools into `tools/`; library files in `bardwave-library/` |
+
+### 2.3 `src/network`
+
+| File | Responsibility |
+|------|----------------|
+| `server.rs` | axum router (`build_router`, `build_router_with_control`), `NetworkServer`, `ServerHandle`, `/api/status`, embedded static files and PWA assets, request log that keeps `?k=` / `?g=` out |
+| `broadcast.rs` | `AudioBroadcaster` / `BroadcasterHandle`: client registry, listener count, format announcement, 20 ms Opus frames with `seq_no` and `server_ms` |
+| `opus_wire.rs` | `WireEncoder`: re-blocks any device block size into whole 960-frame packets, 64 kbit/s VBR |
+| `websocket.rs` | `/ws/audio` session: welcome, format replay, heartbeat, key-revocation close (code 4001) |
+| `access.rs` | `AccessGuard` (player key `?k=`), `GmGuard` / `GmAuth` (GM token `?g=` / Bearer, loopback rule, proxy-header rule, rate limit: 10 failures per minute, close code 4003), `generate_key`, constant-time compare |
+| `control.rs` | Headless GM panel: `Board` (library loaded into a Director), `ControlAction` / `ControlCommand`, REST `/api/control/*`, `/ws/control` (snapshots with `rev`, commands with `req` acks), `ControlFeed`, `X-Bardwave-Control` and `Origin` checks |
+| `local_ip.rs` | LAN address choice: adapter table (`GetAdaptersAddresses` / `getifaddrs`) scored, VPN/TUN/benchmark/link-local ranges never win |
+| `upnp.rs` | Own UPnP IGD client: SSDP from every LAN address, renewal, `UpnpStatus` (incl. double NAT) |
+| `static/` | `index.html`, `app.js`, `style.css`, `opus-decoder.min.js` (listener page, reconnect back-off, link quality, Wake Lock, Media Session, per-player volume in `localStorage`, `now_playing` handler), `manifest.webmanifest` + icons (PWA), `control.html/js/css` (phone GM page) |
+
+### 2.4 `src/gui`
+
+| File | Responsibility |
+|------|----------------|
+| `mod.rs`, `app.rs` | `GuiApp`, `SoundSharedApp`: frame loop, dialogs, command execution against the engine and the Director, `sync_director` |
+| `types.rs` | `AppState`, `AudioCommand`, `ServerCommand`, `ServerStatus`, `SoundInfo` |
+| `groups.rs` | `Library` model (groups, sounds, tags, scenes, playlists, hotkeys, buses), `to_config` / from config, `GroupFilter` |
+| `sound_list.rs`, `top_bar.rs`, `dialog.rs`, `widgets.rs`, `theme.rs`, `motion.rs` | list, top bar, dialogs, widgets, theme, reduced motion |
+| `scenes.rs` | scene deck, editor, save-mix flow, stinger pads, transition control, Stop scene / Stop all |
+| `music.rs` | transport bar, playlist manager, "Emitters & music" dialog |
+| `hotkeys_ui.rs` | `poll_hotkeys` once per frame, Hotkeys dialog (capture, conflicts, global switch) |
+| `settings_extras.rs` | MIX section: bus faders, DUCK button, normalization, hotkey entry |
+| `server_panel.rs` | SERVER panel: addresses, UPnP status, access key, GM link, QR |
+| `library_ui.rs` + `library_ui/` | search / tag chips, folder import, missing-file repair, bundle dialogs, preview; `logic` (pure), `state`, `tasks` (background), `ops`, `toolbar`, `dialogs` |
+
+### 2.5 Other modules
+
+| Path | Responsibility |
+|------|----------------|
+| `src/main.rs` | entry point; `--server-only`; config load, key generation (`access_token`, `gm_token`), engine and server threads, `AudioProcessor` (engine output → broadcaster), headless loop (`Board`, `tick`, gain updates) |
+| `src/lib.rs` | library root, `VERSION` |
+| `src/config.rs` | `config.toml` schema and persistence, `ensure_ids`, `ensure_gm_token`, hotkey string normalization |
+| `src/paths.rs` | data directory: `choose_data_dir` (pure, per-OS), `data_dir()`, `config_path`, `library_dir`, `tools_dir`, `log_path` |
+| `src/hotkeys.rs`, `src/hotkeys/` | `Binding` parser, `map` (conflicts), `dispatch` (`HotkeyDispatcher` → Director), `local` (egui keys), `service` (system-wide through `global-hotkey`), `midi` (only with `--features midi`; not connected to the GUI, MIDI bindings are reported as unavailable) |
+| `src/library_scan.rs` | recursive folder scan, duplicate detection (path and content fingerprint) |
+| `src/library_query.rs` | composite search: group + tags + text |
+| `src/library_bundle.rs` | `.zip` bundles: `bundle.toml` + optional `audio/`, conflict policies (skip / rename / replace), dry run |
+| `src/error.rs` | `SoundSharedError` and friends |
+| `build.rs` | Windows icon resource (`assets/icon.rc`) |
+| `examples/` | `audio_probe.rs`, `yt_probe.rs` |
+| `tests/` | integration tests: scenes, emitters, playlists, ducking/loudness, hotkeys, library bundle / UI flow, GM auth and page, listener assets, WebSocket wire format, stream pipeline, config compatibility, docs (`docs_gm_token.rs`) |
+| `packaging/` | `README.txt`, example `config.toml`, `windows/bardwave.iss`, `linux/` (AppImage script, `.desktop`), `macos/` (app, dmg, signing scripts, README) |
+| `.github/workflows/` | `ci.yml` (fmt, clippy, tests on 3 OSes, clippy with `midi`), `release.yml`, `release-extras.yml`, `release-macos.yml` |
+
+### 2.6 Control flow
+
+* **One control core.** Console `AudioCommand`s, hotkeys and the headless `/control` panel all end in the same `Director` operations, so scenes behave identically everywhere. `Playback` is the narrow interface to the engine (and to a mock in tests).
+* **Scene activation:** `Director::activate_scene` diffs "playing now" against "scene wants" and executes start / retune / stop with the scene's `fade_in_ms` / `fade_out_ms` / `curve`; re-activating mid-transition continues from current gains. Emitters of the scene start; its playlist (music layer) starts.
+* **Ids, not paths:** scenes, playlists and hotkeys reference sound ids (UUID strings); the engine id of a loaded sound is separate (`SoundId`) and mapped in `sync_director`.
+* **Console vs headless:** the console syncs scenes **and playlists** into the Director (`sync_from_library`). The headless `Board` syncs scenes and the sound catalog only and does not call `set_playlists`, and `/ws/control` has no playlist commands, so playlists and scene music layers do not work in `--server-only`; the GM page's Music block is disabled for that reason. The GM panel is served **only** with `--server-only` (`AppState::gm_panel_served`).
+* **Stream:** the engine publishes the broadcast copy of the mix (before local-only previews), `AudioProcessor` forwards it to the broadcaster, which Opus-encodes and fans it out to `/ws/audio` sessions.
+
+### 2.7 Configuration
+
+`config.toml` lives in the data directory (see `paths.rs`). The full schema with examples is in `README.md` ("Configuration"); the source of truth is `src/config.rs`. Sections: `[server]` (`host`, `port`, `upnp`, `access_token`, `gm_token`), `[audio]` (`buffer_size` 960, `sample_rate`, `channels`, `master_volume`, `normalize`, `normalize_target_lufs`, `duck_amount`, `duck_attack_ms`, `duck_release_ms`, `duck_buses`, `stream_threshold_secs`), `[logging]`, `[gui]` (`reduce_motion`, `global_hotkeys`), `[library]` (`groups`, `sounds`, `scenes` with `items` and `emitters`, `playlists`), top-level `[[hotkeys]]`. Every new field has a serde default; `tests/config_compat.rs` keeps v1.4.0 configs loading. A config that fails to parse stops the app (it is never replaced by defaults).
+
+### 2.8 Audio pipeline
+
+* Decode: Symphonia (WAV, FLAC, MP3, OGG-Vorbis, AAC/MP4) → 48 kHz stereo f32, in memory for short files, streamed for long ones.
+* Mix: `source → track gain (fade) → pan → bus gain (volume × duck) → sum → master → limiter → broadcast copy`, then `+ local-only tracks → local limiter → device`.
+* Network encode: Opus, 20 ms frames (960 samples per channel), ~64 kbit/s VBR.
+
+### 2.9 WebSocket protocols
+
+**`/ws/audio?k=<key>`, binary frame:**
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 bytes | `seq_no` — u32 LE, monotonically increasing |
+| 4 | 4 bytes | `server_ms` — u32 LE, stream time since broadcaster start |
+| 8 | variable | Opus packet (one 20 ms frame) |
+
+Text messages: `{"type":"welcome",…}`, `{"type":"format","data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":960}}` (first frame, replayed to late joiners), `ping` / `pong`. The listener page also handles `{"type":"now_playing","scene":…,"track":…}`; **the server does not send it yet**. Clients ignore unknown types.
+
+**`/ws/control?g=<token>`:** JSON text frames ≤ 4096 bytes. Server → client: `snapshot{rev,state}`, `ack{req}`, `error{req,message}`, `pong`. Client → server: `ping`, `state`, `play`, `stop`, `volume`, `loop`, `master`, `stop_all{fade_ms?}`, `scene`, `stop_scene`, `stinger`, `duck`, `bus`. At most 16 clients, 100 commands per second each. Details: the module docs of `control.rs`.
+
+### 2.10 Inter-component commands
+
+* **`AudioCommand`** (GUI → engine/Director, each with a one-slot reply channel that is never awaited on the render thread): load / play / stop / volume / loop / master / remove sound, `StopAll`, `StopAllFade`, `ActivateScene`, `StopScene`, `SnapshotScene`, `PlayStinger`, `Playlist*` (next, prev, seek, pause, resume, shuffle, repeat…), `SetBusVolume`, `Duck`, `DuckRelease`, `DuckHold`, normalization switch.
+* **`ServerCommand`** (GUI → server thread): `Start`, `Stop`, `SetBind { host, port }`, `GetStatus`.
+* **`ControlAction`** (HTTP → main thread, headless): `List`, `Play`, `Stop`, `StopAll`, `StopAllFade`, `SetVolume`, `SetLoop`, `SetMaster`, `ActivateScene`, `StopScene`, `PlayStinger`, `Duck`, `Mix`.
+* **`ServerStatus`**: `running`, `address`, `listener_count`.
 
 ---
 
-## 3. Task Management Protocol
+## 3. Task Management Protocol (agent teams)
 
-All work flows through the **AgentTeams** task board. Follow this exact protocol:
+Work in this repository may be coordinated through an **AgentTeams** task board. When it is used, follow this protocol:
 
 ### 3.1 Claiming a Task
 
@@ -99,16 +187,11 @@ For **implementation/repair/verification/integration** tasks, include structured
 - `inScopeChangedPaths`: list of files modified (implementation/repair only)
 - `evidenceNote`: concise summary
 
-For **review/requirements** tasks:
-- `verdict: "pass"` to complete; `needs_revision` or `reject` must fail with findings.
+For **review/requirements** tasks: `verdict: "pass"` to complete; `needs_revision` or `reject` must fail with findings.
 
-### 3.4 Reporting
+### 3.4 Reporting and messaging
 
-After completion, send a message to your parent agent with:
-- `source_task_id` and `source_attempt_id`
-- A self-contained result summary
-
-The parent shares your workspace but does not automatically receive your transcript, tool output, or reasoning.
+After completion, send a message to your parent agent with `source_task_id`, `source_attempt_id` and a self-contained result summary; the parent shares your workspace but does not receive your transcript. Use `send_message({ target, message })` to message teammates and `list_agents({})` to find them.
 
 ---
 
@@ -116,78 +199,30 @@ The parent shares your workspace but does not automatically receive your transcr
 
 ### 4.1 Code Style
 
-- **Typed commands over shared mutable state** — no shared mutable soup between GUI, audio engine, and network.
-- **No blocking work on the render thread** — audio and network run on dedicated threads.
-- **Error handling:** Use `anyhow::Result` and `thiserror` for typed errors. Panics should be caught by the global panic hook in `main.rs`.
-- **Logging:** Use `tracing` with `tracing-subscriber`. Log levels: trace, debug, info, warn, error. `RUST_LOG` env var overrides `config.toml` logging level.
-- **Formatting:** Run `cargo fmt --check` before submitting. All code must be `rustfmt`-clean.
+- **Typed commands over shared mutable state** — no shared mutable soup between GUI, audio engine and network.
+- **No blocking work on the render thread, none in the audio callback beyond mixing** (no locks on the streaming read path, no allocation, no I/O).
+- **Back-compatible config:** new `config.toml` fields get `#[serde(default)]`; a change of the schema needs a test in `tests/config_compat.rs`.
+- **Ids, not paths,** in anything that refers to a sound.
+- **Errors:** `anyhow::Result` and `thiserror`. Panics go through the hook in `main.rs`.
+- **Logging:** `tracing`; `RUST_LOG` overrides `[logging] level`. Never log `?k=` / `?g=` or token values.
+- **Formatting:** `cargo fmt` clean.
+- **Docs that tests read:** `tests/docs_gm_token.rs` reads `README.md`, `packaging/README.txt` and `packaging/config.toml`; keep the `gm_token` / `?g=` / `gm_token = ""` wording true when editing them.
 
 ### 4.2 Build & Test Commands
 
 ```bash
-# Full test suite (150+ tests)
-cargo test --all-targets
-
-# Lint
-cargo clippy --all-targets
-
-# Format check
-cargo fmt --check
-
-# Release build
+cargo test --all-targets --locked     # ~780 tests
+cargo clippy --all-targets --locked
+cargo clippy --all-targets --locked --features midi   # optional MIDI module must keep compiling
+cargo fmt --all --check
 cargo build --release
-
-# Run the app
-cargo run --release
+cargo run --release                   # console
+cargo run --release -- --server-only  # headless, serves /control
 ```
 
-### 4.3 Configuration
+### 4.3 Releases
 
-`config.toml` lives next to the executable:
-
-```toml
-[server]
-host = "0.0.0.0"
-port = 8080
-upnp = true
-access_token = "..."   # key listeners need in the link (/?k=...); "" = open
-
-[audio]
-buffer_size = 480
-sample_rate = 48000
-channels = 2
-master_volume = 0.8
-
-[logging]
-level = "info"
-file_logging = false
-
-[gui]
-reduce_motion = false
-
-[library]
-```
-
-### 4.4 Audio Pipeline
-
-- Decode: Symphonia (WAV, FLAC, MP3, OGG-Vorbis, AAC/MP4)
-- Mix: 48 kHz / stereo f32
-- Output: cpal (local speakers) + WebSocket broadcast
-- Network encode: Opus (~64 kbit/s VBR), 10 ms frames (480 samples/channel)
-
-### 4.5 WebSocket Wire Format
-
-**Binary frame:**
-| Offset | Size | Field |
-|--------|------|-------|
-| 0 | 4 bytes | `seq_no` — u32 LE, monotonically increasing |
-| 4 | 4 bytes | `server_ms` — u32 LE, stream time since broadcaster start |
-| 8 | variable | Opus packet (one 10 ms frame) |
-
-**Format announcement (text message on first frame):**
-```json
-{"type":"format","data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":480}}
-```
+The **Release** workflow publishes a release for the version in `Cargo.toml` on every push to `main` when the tag does not exist yet. **Do not bump `version` as part of unrelated work:** that is the owner's decision. `release-extras.yml` and `release-macos.yml` attach installers; see `README.md` ("Packaging", "Releasing") and `packaging/`.
 
 ---
 
@@ -195,121 +230,58 @@ reduce_motion = false
 
 ```
 Bardwave/
-├── Agent.md                          # This file — agent team documentation
-├── Cargo.toml                        # Workspace + package manifest
-├── README.md                         # User-facing documentation
-├── OPUS_MIGRATION.md                 # Opus migration notes
-├── LICENSE                           # MIT license
-├── assets/
-│   └── README.md
-├── src/
-│   ├── main.rs                       # Entry point: audio engine, network server, GUI
-│   ├── lib.rs                        # Library root, VERSION constant
-│   ├── config.rs                     # config.toml schema & persistence
-│   ├── error.rs                      # SoundSharedError types
-│   ├── audio/
-│   │   ├── mod.rs
-│   │   ├── engine.rs                 # AudioEngine: decode, mix, output
-│   │   ├── decoder.rs                # Symphonia decoding
-│   │   ├── mixer.rs                  # 48k stereo mixing
-│   │   └── youtube.rs                # YouTube import (yt-dlp / ffmpeg)
-│   ├── network/
-│   │   ├── mod.rs
-│   │   ├── server.rs                 # axum router, ServerHandle, ServerState
-│   │   ├── broadcast.rs              # tokio broadcast, AudioBroadcaster
-│   │   ├── websocket.rs              # WebSocket session handling
-│   │   ├── local_ip.rs               # LAN IP detection (Windows: GetAdaptersAddresses, unix: getifaddrs)
-│   │   ├── opus_wire.rs              # Opus wire format
-│   │   ├── access.rs                 # Access key (?k=) for the stream
-│   │   ├── upnp.rs                   # Router port forwarding (UPnP IGD)
-│   │   ├── control.rs                # --server-only remote control page/API
-│   │   └── static/
-│   │       ├── index.html            # Embedded listener page
-│   │       ├── app.js                # WebSocket client + Web Audio API
-│   │       ├── style.css
-│   │       └── opus-decoder.min.js
-│   ├── gui/
-│   │   ├── mod.rs
-│   │   ├── app.rs                    # egui App implementation
-│   │   ├── types.rs                  # AppState, AudioCommand, ServerCommand, ServerStatus
-│   │   ├── theme.rs                  # egui theme
-│   │   ├── widgets.rs                # Custom egui widgets
-│   │   ├── sound_list.rs             # Sound list widget
-│   │   ├── groups.rs                 # Group management
-│   │   ├── server_panel.rs           # Server control panel
-│   │   ├── top_bar.rs                # Top status bar
-│   │   ├── dialog.rs                 # Dialogs (new/rename/delete group)
-│   │   └── motion.rs                 # Reduced-motion support
-│   └── ...
-└── target/                           # Build output (gitignored)
+├── Agent.md                     # this file
+├── README.md                    # user-facing documentation
+├── CHANGELOG.md                 # change history (Unreleased section)
+├── PLAN.md                      # development plan, in Russian
+├── OPUS_MIGRATION.md            # notes on the move from raw PCM to Opus (wire frames are 20 ms now)
+├── LICENSE, Cargo.toml, Cargo.lock, build.rs, build.bat
+├── assets/                      # icons, icon generator tools
+├── examples/                    # audio_probe.rs, yt_probe.rs
+├── packaging/                   # README.txt, config.toml, windows/, linux/, macos/
+├── .github/workflows/           # ci, release, release-extras, release-macos
+├── tests/                       # integration tests (see 2.5)
+└── src/
+    ├── main.rs, lib.rs, config.rs, error.rs, paths.rs
+    ├── hotkeys.rs, hotkeys/{dispatch,local,map,midi,service,testing}.rs
+    ├── library_scan.rs, library_query.rs, library_bundle.rs
+    ├── audio/{decoder,stream_source,engine,mixer,director,director_audio,emitter,playlist,loudness,youtube}.rs
+    ├── network/{server,broadcast,opus_wire,websocket,access,control,local_ip,upnp}.rs
+    │   └── static/              # index.html, app.js, style.css, opus-decoder.min.js, manifest.webmanifest,
+    │                            # icons, control.html/js/css
+    └── gui/{app,types,groups,sound_list,top_bar,dialog,widgets,theme,motion,scenes,music,
+             hotkeys_ui,settings_extras,server_panel,library_ui}.rs, gui/library_ui/{logic,state,tasks,ops,toolbar,dialogs}.rs
 ```
 
 ---
 
-## 6. Communication Protocols
-
-### 6.1 Inter-Component Commands
-
-**AudioCommand** (GUI → Audio Engine):
-- Play, stop, pause sounds
-- Set volume, loop, group assignment
-- Add/remove sounds and groups
-
-**ServerCommand** (GUI → Network Server):
-- `Start { response }` — start the listener server
-- `Stop { response }` — stop the listener server
-- `SetBind { host, port, response }` — change bind address/port
-- `GetStatus { response }` — query server status
-
-**ServerStatus:**
-```rust
-struct ServerStatus {
-    running: bool,
-    address: Option<String>,
-    listener_count: usize,
-}
-```
-
-### 6.2 Agent-Team Messaging
-
-- Use `send_message({ target: "<teammate name>", message: "..." })` to message teammates.
-- A running target receives it at the nearest step boundary; an inactive target starts/resumes a turn.
-- Use `list_agents({})` to find teammates and their availability.
-- Parent agent ID must receive results before finishing a task.
-
----
-
-## 7. Quality Gates
+## 6. Quality Gates
 
 | Check | Command | Required |
 |-------|---------|----------|
-| Format | `cargo fmt --check` | Must pass (0 diffs) |
-| Clippy | `cargo clippy --all-targets` | Must pass (0 warnings) |
-| Test | `cargo test --all-targets` | All tests must pass |
+| Format | `cargo fmt --all --check` | Must pass (0 diffs) |
+| Clippy | `cargo clippy --all-targets --locked` (CI builds with `-D warnings`) | Must pass (0 warnings) |
+| Clippy, MIDI | `cargo clippy --all-targets --locked --features midi` | Must pass |
+| Test | `cargo test --all-targets --locked` | All tests must pass |
 | Build | `cargo build --release` | Must compile cleanly |
 
-**Known pre-existing issues** (do not introduce new ones):
-1. `crates/storage` module path mismatch (`pub mod activity;` vs `repositories/activity.rs`) — blocks `cargo fmt --check --workspace`
-2. Windows schannel SSL `SEC_E_NO_CREDENTIALS` — blocks `crates.io` downloads for crates with external dependencies
+CI runs these on ubuntu, windows and macOS. **Not verified on real hardware:** the Windows and Linux installers, the macOS app and global hotkeys on macOS, MIDI (details in `README.md`).
 
 ---
 
-## 8. Onboarding for New Agents
+## 7. Onboarding for New Agents
 
-1. Read this `Agent.md` and `README.md` thoroughly.
-2. Build the project: `cargo build --release`.
-3. Run the tests: `cargo test --all-targets`.
-4. Run the app: `cargo run` — verify the GUI opens and the server panel works.
-5. Check available teammates: `list_agents({})`.
-6. Claim a task from the shared task board following the protocol in Section 3.
-7. On completion, update the task and notify the parent agent.
+1. Read this `Agent.md`, `README.md` and the module docs of `director.rs`, `control.rs`, `paths.rs`, `hotkeys.rs`.
+2. Build and test: `cargo build --release`, `cargo test --all-targets`.
+3. Run the app: `cargo run --release` — check that the console opens and the SERVER panel works.
+4. If a task board is used, claim a task as described in section 3.
+5. Keep the docs honest: if you add or remove a feature, update `README.md`, this file and `CHANGELOG.md` in the same change.
 
 ---
 
-## 9. Revision History
+## 8. Revision History
 
-| Version | Date | Changes | Author |
-|---------|------|---------|--------|
-| 1.0 | Initial | Agent team documentation for Bardwave | Lead |
-
----
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0 | Initial | Agent team documentation for Bardwave |
+| 2.0 | 2026-11 | Rewritten from the code: scenes, Director, buses, playlists and streaming, hotkeys, GM panel, library tools, data directory, packaging; removed stale team roles and pre-existing-issues list that belonged to another project |
