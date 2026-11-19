@@ -29,7 +29,9 @@ use soundshared::{
             AudioBroadcaster, AudioFrame, BroadcastError, BroadcasterConfig, BroadcasterHandle,
         },
         local_ip::detect_for_bind,
-        server::{build_router, listen_url, Router, ServerConfig, ServerHandle, ServerState},
+        server::{
+            build_router_with_control, listen_url, Router, ServerConfig, ServerHandle, ServerState,
+        },
         upnp::{self, PortMapping, UpnpStatus},
         websocket::WebSocketConfig,
     },
@@ -178,7 +180,7 @@ fn run_server_and_get_handle(
     server_handle_tx: Sender<ServerHandle>,
     upnp_status: Arc<Mutex<UpnpStatus>>,
     network_notes: Arc<Mutex<Vec<String>>>,
-    extra_routes: Option<Router>,
+    control: Option<soundshared::network::control::ControlContext>,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -214,10 +216,7 @@ fn run_server_and_get_handle(
             access: config.access.clone(),
         };
 
-        let app = match extra_routes {
-            Some(routes) => build_router(state).merge(routes),
-            None => build_router(state),
-        };
+        let app = build_router_with_control(state, control);
 
         // Create server handle (URL is None until Start command)
         let shutdown_tx_for_handle = shutdown_tx.clone();
@@ -603,7 +602,19 @@ fn main() -> Result<()> {
     // local control page instead (see network::control).
     let (control_tx, control_rx) =
         crossbeam_channel::unbounded::<soundshared::network::control::ControlCommand>();
-    let control_routes = server_only.then(|| soundshared::network::control::router(control_tx));
+    // Remote access to it needs the game-master token (`gm_token`); without
+    // one the panel answers this PC only.
+    let gm_auth = soundshared::network::GmAuth::new(soundshared::network::GmGuard::new(
+        config.server.gm_token.clone(),
+    ));
+    let control_feed = soundshared::network::control::ControlFeed::new();
+    let control_routes = server_only.then(|| {
+        soundshared::network::control::ControlContext::new(
+            control_tx,
+            gm_auth.clone(),
+            control_feed.clone(),
+        )
+    });
     thread::spawn(move || {
         if let Err(e) = run_server_and_get_handle(
             server_config_clone,
@@ -676,7 +687,9 @@ fn main() -> Result<()> {
         let mut board = {
             let guard = audio_engine_shared.lock().unwrap();
             let engine = guard.as_ref().expect("audio engine");
-            soundshared::network::control::Board::load(engine, &config.library)
+            let mut board = soundshared::network::control::Board::load(engine, &config.library);
+            board.attach_feed(engine, control_feed.clone());
+            board
         };
         info!("Library loaded: {} sound(s)", board.len());
 
@@ -692,6 +705,10 @@ fn main() -> Result<()> {
                     info!("Listener server available at {}", access.share_url(&url));
                     if let Some(local) = soundshared::network::loopback_url(&url) {
                         info!("Control page (this PC only): {local}/control");
+                    }
+                    if gm_auth.guard().remote_enabled() {
+                        // The token itself is never logged: it is `gm_token` in config.toml.
+                        info!("Remote control: {url}/control?g=<gm_token from config.toml>");
                     }
                 }
                 Ok(Err(e)) => error!("Failed to start listener server: {}", e),
