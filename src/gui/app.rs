@@ -17,6 +17,35 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+/// Slots of the audio command channel that library loads never use, so an
+/// operator command always finds room even in the middle of a library restore.
+const LOAD_HEADROOM: usize = 12;
+
+/// Library loads handed to the audio thread per frame.
+const LOAD_BATCH: usize = 8;
+
+/// Most operator commands parked while the audio command channel is full.
+const USER_QUEUE_LIMIT: usize = 256;
+
+/// Park `cmd` in the retry queue, evicting the oldest non-stop-all command
+/// when the queue is at its limit. A stop-all is never evicted; a non-stop-all
+/// newcomer is dropped if the queue holds nothing but stop-alls.
+fn push_user_command(queue: &mut VecDeque<AudioCommand>, cmd: AudioCommand) {
+    if queue.len() >= USER_QUEUE_LIMIT {
+        let evict = queue
+            .iter()
+            .position(|c| !matches!(c, AudioCommand::StopAll { .. }));
+        match evict {
+            Some(i) => {
+                queue.remove(i);
+            }
+            None if !matches!(cmd, AudioCommand::StopAll { .. }) => return,
+            None => {}
+        }
+    }
+    queue.push_back(cmd);
+}
+
 /// Sound entry in the library (for GUI display)
 #[derive(Debug, Clone)]
 pub struct SoundEntry {
@@ -174,6 +203,12 @@ pub struct SoundSharedApp {
     /// the excess (the old behaviour) silently lost part of the saved library on
     /// every start.
     pending_loads: VecDeque<PathBuf>,
+
+    /// Operator commands (play, stop, stop-all, volume...) that found the audio
+    /// command channel full. They are re-sent first on every frame, before any
+    /// library load, in the order they were issued. See
+    /// [`Self::send_user_command`].
+    pending_user: Mutex<VecDeque<AudioCommand>>,
 
     // Channel for receiving server status updates
     server_status_rx: Receiver<AppServerStatus>,
@@ -400,6 +435,7 @@ impl SoundSharedApp {
             copied_feedback: Arc::new(Mutex::new(false)),
             copied_feedback_timer: Arc::new(Mutex::new(None)),
             pending_loads: VecDeque::new(),
+            pending_user: Mutex::new(VecDeque::new()),
             server_status_rx,
             server_status_tx,
             library,
@@ -441,24 +477,93 @@ impl SoundSharedApp {
 
     /// Queue a sound file to be handed to the audio engine.
     ///
-    /// The command is dropped in immediately when the channel has room; a full
-    /// channel (the startup restore of a large library) parks the path in
-    /// [`Self::pending_loads`] and [`Self::pump_pending_loads`] feeds it as soon
-    /// as the main thread has drained a slot.
+    /// Loads are bulk traffic and must never crowd out operator commands, so
+    /// they are sent only while the channel keeps [`LOAD_HEADROOM`] free slots.
+    /// Otherwise (the startup restore of a large library, a big folder import)
+    /// the path waits in [`Self::pending_loads`] and
+    /// [`Self::pump_pending_loads`] feeds it in small batches, frame by frame.
     pub fn request_load_sound(&mut self, path: PathBuf) {
+        if !self.pending_loads.is_empty() || !self.load_has_room() {
+            self.pending_loads.push_back(path);
+            return;
+        }
+        if let Err(path) = self.try_send_load(path) {
+            self.pending_loads.push_back(path);
+        }
+    }
+
+    /// True while the audio command channel has room for a load and still
+    /// leaves [`LOAD_HEADROOM`] slots for operator commands.
+    fn load_has_room(&self) -> bool {
+        let tx = &self.app_state.audio_cmd_tx;
+        tx.capacity()
+            .is_none_or(|cap| tx.len() + LOAD_HEADROOM < cap)
+    }
+
+    /// Send one `LoadSound`; hands the path back when the channel is full.
+    fn try_send_load(&self, path: PathBuf) -> Result<(), PathBuf> {
         let (response_tx, response_rx) = bounded(1);
         let cmd = AudioCommand::LoadSound {
             path: path.to_string_lossy().to_string(),
             response: response_tx,
         };
-
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            debug!("Load channel full, queueing {}: {}", path.display(), e);
-            self.pending_loads.push_back(path);
-            return;
+        match self.app_state.audio_cmd_tx.try_send(cmd) {
+            Ok(()) => {
+                self.await_load_response(response_rx);
+                Ok(())
+            }
+            Err(e) => {
+                debug!("Load channel full, queueing {}: {}", path.display(), e);
+                Err(path)
+            }
         }
+    }
 
-        self.await_load_response(response_rx);
+    /// Send an operator command (play, stop, stop-all, volume...) to the audio
+    /// thread without ever blocking the GUI and without silently dropping it.
+    ///
+    /// A full channel parks the command in [`Self::pending_user`]; the queue is
+    /// drained at the start of every frame ([`Self::pump_user_commands`]). While
+    /// anything is parked, newer commands queue behind it so the order is kept.
+    /// The queue is bounded by [`USER_QUEUE_LIMIT`]; when it overflows the
+    /// oldest command that is not a stop-all goes first, and a stop-all is
+    /// never discarded. Returns false only when the receiver is gone.
+    fn send_user_command(&self, cmd: AudioCommand, what: &str) -> bool {
+        let mut queue = self.pending_user.lock().unwrap();
+        let cmd = if queue.is_empty() {
+            match self.app_state.audio_cmd_tx.try_send(cmd) {
+                Ok(()) => return true,
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    error!("Failed to send {what} command: audio thread is gone");
+                    return false;
+                }
+                Err(crossbeam_channel::TrySendError::Full(cmd)) => cmd,
+            }
+        } else {
+            cmd
+        };
+        debug!("Audio command channel full, queueing {what}");
+        push_user_command(&mut queue, cmd);
+        true
+    }
+
+    /// Re-send the parked operator commands, oldest first, while the channel
+    /// has room.
+    fn pump_user_commands(&self) {
+        let mut queue = self.pending_user.lock().unwrap();
+        while let Some(cmd) = queue.pop_front() {
+            match self.app_state.audio_cmd_tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(cmd)) => {
+                    queue.push_front(cmd);
+                    break;
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    queue.clear();
+                    break;
+                }
+            }
+        }
     }
 
     /// Report the outcome of one `LoadSound` command without blocking the GUI.
@@ -475,25 +580,22 @@ impl SoundSharedApp {
         });
     }
 
-    /// Feed queued library files to the engine while the channel has room.
+    /// Feed queued library files to the engine, at most [`LOAD_BATCH`] per
+    /// call and only while the channel keeps its headroom for operator
+    /// commands.
     fn pump_pending_loads(&mut self) {
-        while let Some(path) = self.pending_loads.pop_front() {
-            let (response_tx, response_rx) = bounded(1);
-            let cmd = AudioCommand::LoadSound {
-                path: path.to_string_lossy().to_string(),
-                response: response_tx,
+        for _ in 0..LOAD_BATCH {
+            if !self.load_has_room() {
+                break;
+            }
+            let Some(path) = self.pending_loads.pop_front() else {
+                break;
             };
-            if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
+            if let Err(path) = self.try_send_load(path) {
                 // Still full: put it back and try again on a later frame.
-                debug!(
-                    "Load channel still full, {} stays queued: {}",
-                    path.display(),
-                    e
-                );
                 self.pending_loads.push_front(path);
                 break;
             }
-            self.await_load_response(response_rx);
         }
     }
 
@@ -532,8 +634,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send play sound command (channel full): {}", e);
+        if !self.send_user_command(cmd, "play sound") {
             return;
         }
 
@@ -559,8 +660,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send stop sound command (channel full): {}", e);
+        if !self.send_user_command(cmd, "stop sound") {
             return;
         }
 
@@ -588,8 +688,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send set volume command (channel full): {}", e);
+        if !self.send_user_command(cmd, "set volume") {
             return;
         }
 
@@ -617,12 +716,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!(
-                "Failed to send set master volume command (channel full): {}",
-                e
-            );
-        }
+        self.send_user_command(cmd, "set master volume");
     }
 
     /// Get master volume
@@ -640,8 +734,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send remove sound command (channel full): {}", e);
+        if !self.send_user_command(cmd, "remove sound") {
             return;
         }
 
@@ -1345,10 +1438,9 @@ impl SoundSharedApp {
         let cmd = AudioCommand::StopAll {
             response: response_tx,
         };
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send stop all command (channel full): {}", e);
-            return;
-        }
+        // Never lost: a full channel parks the command and it is re-sent first
+        // thing next frame. The rows go dark either way.
+        self.send_user_command(cmd, "stop all");
         for entry in self.sounds.lock().unwrap().values_mut() {
             entry.playing = false;
         }
@@ -1381,9 +1473,7 @@ impl SoundSharedApp {
             looped,
             response: response_tx,
         };
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send set loop command (channel full): {}", e);
-        }
+        self.send_user_command(cmd, "set loop");
     }
 
     /// True while anything needs a repaint to animate (pulse, breathing dot).
@@ -1498,9 +1588,13 @@ impl SoundSharedApp {
         // Scene deck: replies to its commands, the active scene, its repaints.
         self.scene_frame(ctx);
 
-        // Feed the engine the library files that did not fit the channel on
-        // the previous pass.
+        // Operator commands first, then the library files that did not fit the
+        // channel on the previous pass (a few per frame).
+        self.pump_user_commands();
         self.pump_pending_loads();
+        if !self.pending_loads.is_empty() || !self.pending_user.lock().unwrap().is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
 
         // Poll server status
         self.poll_server_status();
@@ -1670,6 +1764,9 @@ impl SoundSharedApp {
                     let _ = response.send(Ok(info));
                 }
                 Err(e) => {
+                    // A file the decoder rejects frees its import slot at once,
+                    // so a few bad files cannot stall the rest of the queue.
+                    self.lib_ui.load_in_flight.remove(Path::new(&path));
                     let _ = response.send(Err(anyhow::anyhow!("{path}: {e}")));
                 }
             }
@@ -2068,5 +2165,154 @@ mod stream_load_tests {
         drop(guard);
         let _ = std::fs::remove_dir_all(long.parent().unwrap());
         let _ = std::fs::remove_dir_all(short.parent().unwrap());
+    }
+
+    fn filler() -> AudioCommand {
+        let (response, _rx) = bounded(1);
+        AudioCommand::SetMasterVolume {
+            volume: 0.5,
+            response,
+        }
+    }
+
+    fn stop_all_cmd() -> AudioCommand {
+        let (response, _rx) = bounded(1);
+        AudioCommand::StopAll { response }
+    }
+
+    fn drain(h: &crate::gui::hotkeys_ui::test_support::Harness) -> Vec<AudioCommand> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = h.audio_rx.try_recv() {
+            out.push(cmd);
+        }
+        out
+    }
+
+    #[test]
+    fn stop_all_survives_a_full_command_channel() {
+        let mut h = harness(Config::default(), false);
+        while h.app.app_state.audio_cmd_tx.try_send(filler()).is_ok() {}
+        h.app.stop_all_sounds();
+        h.app.set_master_volume(0.3);
+        assert_eq!(h.app.pending_user.lock().unwrap().len(), 2);
+
+        // Nothing is re-sent while the channel is still full.
+        h.app.pump_user_commands();
+        assert_eq!(h.app.pending_user.lock().unwrap().len(), 2);
+
+        // Once the audio side drains, the next frame delivers both, in order.
+        let _ = drain(&h);
+        h.app.pump_user_commands();
+        assert!(h.app.pending_user.lock().unwrap().is_empty());
+        let got = drain(&h);
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got[0], AudioCommand::StopAll { .. }));
+        assert!(matches!(got[1], AudioCommand::SetMasterVolume { .. }));
+    }
+
+    #[test]
+    fn commands_keep_their_order_behind_a_parked_one() {
+        let h = harness(Config::default(), false);
+        while h.app.app_state.audio_cmd_tx.try_send(filler()).is_ok() {}
+        h.app.send_user_command(stop_all_cmd(), "stop all");
+        // Room appears, but a parked command still goes first.
+        let _ = drain(&h);
+        h.app.send_user_command(filler(), "volume");
+        assert!(
+            drain(&h).is_empty(),
+            "must queue behind the parked stop-all"
+        );
+        h.app.pump_user_commands();
+        let got = drain(&h);
+        assert!(matches!(got[0], AudioCommand::StopAll { .. }));
+        assert!(matches!(got[1], AudioCommand::SetMasterVolume { .. }));
+    }
+
+    #[test]
+    fn the_retry_queue_is_bounded_but_never_drops_a_stop_all() {
+        let mut queue = VecDeque::new();
+        queue.push_back(stop_all_cmd());
+        for _ in 0..USER_QUEUE_LIMIT + 50 {
+            push_user_command(&mut queue, filler());
+        }
+        assert_eq!(queue.len(), USER_QUEUE_LIMIT);
+        assert!(matches!(queue[0], AudioCommand::StopAll { .. }));
+        push_user_command(&mut queue, stop_all_cmd());
+        assert_eq!(queue.len(), USER_QUEUE_LIMIT);
+        assert!(matches!(
+            queue.back().unwrap(),
+            AudioCommand::StopAll { .. }
+        ));
+
+        // A queue of nothing but stop-alls refuses a plain command and still
+        // takes another stop-all.
+        let mut only_stops: VecDeque<AudioCommand> =
+            (0..USER_QUEUE_LIMIT).map(|_| stop_all_cmd()).collect();
+        push_user_command(&mut only_stops, filler());
+        assert!(only_stops
+            .iter()
+            .all(|c| matches!(c, AudioCommand::StopAll { .. })));
+        push_user_command(&mut only_stops, stop_all_cmd());
+        assert_eq!(only_stops.len(), USER_QUEUE_LIMIT + 1);
+    }
+
+    #[test]
+    fn library_loads_leave_headroom_and_go_out_in_batches() {
+        let mut h = harness(Config::default(), false);
+        let cap = h.app.app_state.audio_cmd_tx.capacity().unwrap();
+        for i in 0..cap * 3 {
+            h.app
+                .request_load_sound(PathBuf::from(format!("/nowhere/{i}.wav")));
+        }
+        assert!(
+            h.audio_rx.len() + LOAD_HEADROOM <= cap,
+            "loads must keep the headroom free"
+        );
+        assert!(!h.app.pending_loads.is_empty());
+        // An operator command still finds room at once.
+        h.app.stop_all_sounds();
+        assert!(h.app.pending_user.lock().unwrap().is_empty());
+
+        // Each frame hands over at most one batch.
+        let _ = drain(&h);
+        let before = h.app.pending_loads.len();
+        h.app.pump_pending_loads();
+        assert_eq!(before - h.app.pending_loads.len(), LOAD_BATCH);
+        assert_eq!(h.audio_rx.len(), LOAD_BATCH);
+    }
+
+    #[test]
+    fn a_file_that_fails_to_decode_frees_its_load_slot_at_once() {
+        let dir = std::env::temp_dir().join(format!("bardwave-badload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("broken.wav");
+        std::fs::write(&bad, b"this is not audio").unwrap();
+        let mut h = harness(Config::default(), true);
+        h.app
+            .lib_ui
+            .load_in_flight
+            .insert(bad.clone(), Instant::now());
+        let (tx, rx) = bounded(1);
+        h.app
+            .app_state
+            .audio_cmd_tx
+            .send(AudioCommand::LoadSound {
+                path: bad.to_string_lossy().to_string(),
+                response: tx,
+            })
+            .unwrap();
+        h.app.process_audio_commands();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let result = loop {
+            h.app.finish_decoded();
+            if let Ok(result) = rx.try_recv() {
+                break result;
+            }
+            assert!(Instant::now() < deadline, "decoder never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(result.is_err());
+        assert!(h.app.lib_ui.load_in_flight.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

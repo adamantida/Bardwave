@@ -29,9 +29,11 @@ pub(crate) const RECHECK_EVERY: Duration = Duration::from_secs(20);
 /// folder does not start thousands of waiting threads.
 pub(crate) const LOAD_WINDOW: usize = 24;
 
-/// A load that has not finished after this long is forgotten (a file the
-/// decoder rejects never shows up as loaded).
-pub(crate) const LOAD_TIMEOUT: Duration = Duration::from_secs(90);
+/// A load that has not finished after this long stops holding its slot in the
+/// load window (a file the decoder rejects never shows up as loaded; the
+/// console also frees the slot at once on a decode error). Short on purpose:
+/// a slot freed early only means one more load runs alongside.
+pub(crate) const LOAD_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// A short message for the operator.
 #[derive(Debug, Clone)]

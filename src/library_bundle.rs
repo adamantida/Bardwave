@@ -102,6 +102,23 @@ pub const BUNDLE_VERSION: u32 = 1;
 /// Folder of the audio files inside the archive.
 pub const AUDIO_DIR: &str = "audio";
 
+/// Extensions (lower case, without the dot) of audio files an import may write
+/// to disk. Anything else the archive carries for a sound is skipped with a
+/// warning, so a bundle cannot drop scripts or executables into the library.
+pub const ALLOWED_AUDIO_EXTENSIONS: [&str; 6] = ["wav", "flac", "mp3", "ogg", "m4a", "aac"];
+
+/// Whether `rel` ends in one of [`ALLOWED_AUDIO_EXTENSIONS`] (case-insensitive).
+fn has_audio_extension(rel: &str) -> bool {
+    let name = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => {
+            let ext = ext.to_ascii_lowercase();
+            ALLOWED_AUDIO_EXTENSIONS.contains(&ext.as_str())
+        }
+        _ => false,
+    }
+}
+
 /// Longest accepted sound display name, in characters.
 const MAX_SOUND_NAME_LEN: usize = 256;
 /// Longest accepted component of a relative path, in bytes.
@@ -863,7 +880,13 @@ fn open_bundle(zip_path: &Path, limits: &ImportLimits) -> Result<Loaded, BundleE
     for (sound, id) in manifest.sounds.iter().zip(sound_ids) {
         validate_rel_path(&sound.rel_path)?;
         let mut entry = None;
-        if sound.audio {
+        if sound.audio && !has_audio_extension(&sound.rel_path) {
+            warnings.push(format!(
+                "{:?} was not extracted: only audio files ({}) are imported; the sound is imported without it",
+                sound.rel_path,
+                ALLOWED_AUDIO_EXTENSIONS.join(", ")
+            ));
+        } else if sound.audio {
             match index_of.get(&format!("{AUDIO_DIR}/{}", sound.rel_path)) {
                 Some(&i) => {
                     let size = sizes[i];
@@ -1899,5 +1922,70 @@ mod tests {
         assert_eq!(parts.len(), 4);
         assert_eq!(parts[0], Part::Anchor("C:".into()));
         assert_eq!(parts[3], Part::Name("a.wav".into()));
+    }
+
+    #[test]
+    fn only_audio_extensions_pass_the_whitelist() {
+        for ok in ["a.wav", "x/b.FLAC", "c.Mp3", "d.ogg", "e.m4a", "f.aac"] {
+            assert!(has_audio_extension(ok), "{ok}");
+        }
+        for bad in [
+            "a.exe",
+            "b.sh",
+            "c",
+            "x/.wav",
+            "d.wav.bat",
+            "e.toml",
+            "f.",
+            "g\\h.dll",
+        ] {
+            assert!(!has_audio_extension(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn import_skips_non_audio_files_with_a_warning() {
+        let dir = std::env::temp_dir().join(format!(
+            "bardwave-bundle-ext-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("b.zip");
+        let manifest = format!(
+            "format = \"bardwave-bundle\"\nversion = 1\n\n\
+             [[sounds]]\nid = \"{}\"\nname = \"ok\"\nrel_path = \"ok.wav\"\naudio = true\n\n\
+             [[sounds]]\nid = \"{}\"\nname = \"bad\"\nrel_path = \"run.sh\"\naudio = true\n",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        {
+            let mut zip = ZipWriter::new(File::create(&zip_path).unwrap());
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            for (name, data) in [
+                ("bundle.toml", manifest.as_bytes()),
+                ("audio/ok.wav", b"RIFF" as &[u8]),
+                ("audio/run.sh", b"#!/bin/sh" as &[u8]),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let target = dir.join("dest");
+        let mut library = Library::new();
+        let report = import_bundle(
+            &mut library,
+            &zip_path,
+            &ImportOptions::new(&target, ConflictPolicy::Skip),
+        )
+        .unwrap();
+        assert!(target.join("ok.wav").is_file());
+        assert!(!target.join("run.sh").exists());
+        assert_eq!(library.len(), 2);
+        assert_eq!(report.files_written, 1);
+        assert!(report.warnings.iter().any(|w| w.contains("run.sh")));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

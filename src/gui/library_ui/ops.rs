@@ -738,7 +738,10 @@ impl SoundSharedApp {
         &mut self,
         token: u64,
         result: Result<
-            (crate::library_bundle::ImportReport, Box<LibraryConfig>),
+            (
+                crate::library_bundle::ImportReport,
+                Box<super::tasks::ImportedConfig>,
+            ),
             crate::library_bundle::BundleError,
         >,
     ) {
@@ -749,9 +752,13 @@ impl SoundSharedApp {
             return;
         }
         match result {
-            Ok((report, config)) => {
+            Ok((report, outcome)) => {
                 d.phase = ImportPhase::Done(Box::new(report));
-                self.replace_library(&config);
+                // Merge by id into what the library is now, not what it was
+                // when the import started: edits made meanwhile are kept.
+                let merged =
+                    merge_import(&outcome.base, &outcome.imported, &self.library.to_config());
+                self.replace_library(&merged);
                 self.lib_ui.notify("Bundle imported");
             }
             Err(crate::library_bundle::BundleError::Cancelled) => {
@@ -955,5 +962,132 @@ pub(crate) fn refresh_remap_preview(d: &mut Remap, library: &Library, missing: &
     if stale {
         let preview = preview_remap(library, missing, &d.old, &d.new, 3);
         d.preview = Some((d.old.clone(), d.new.clone(), preview));
+    }
+}
+
+// ----------------------------------------------------------- import merge --
+
+/// Merge the effect of a background import into the library as it is *now*.
+///
+/// The import worker runs on a copy of the library (`base`) and produces
+/// `imported`; the operator may keep editing the live library (`live`) while it
+/// runs. Replacing the live library with `imported` would silently undo those
+/// edits, so the import is applied as a three-way merge by id, per kind of
+/// entity (groups, sounds, playlists, scenes):
+///
+/// - an entity the import left alone (`imported == base`) keeps its live state,
+///   including a deletion made in the meantime;
+/// - an entity the import added is appended;
+/// - an entity the import changed (a `Replace` conflict) takes the imported
+///   version, unless the operator changed or deleted that same entity during the
+///   import, in which case the live edit wins;
+/// - everything else in `live` is kept as it is, in its order.
+///
+/// Limitation: ids are compared as written, so the merge relies on the id
+/// strings the library itself writes (`Library::to_config`).
+pub(super) fn merge_import(
+    base: &LibraryConfig,
+    imported: &LibraryConfig,
+    live: &LibraryConfig,
+) -> LibraryConfig {
+    LibraryConfig {
+        groups: merge_list(&base.groups, &imported.groups, &live.groups, |g| &g.id),
+        sounds: merge_list(&base.sounds, &imported.sounds, &live.sounds, |s| &s.id),
+        scenes: merge_list(&base.scenes, &imported.scenes, &live.scenes, |s| &s.id),
+        playlists: merge_list(&base.playlists, &imported.playlists, &live.playlists, |p| {
+            &p.id
+        }),
+    }
+}
+
+fn merge_list<T: Clone + PartialEq>(
+    base: &[T],
+    imported: &[T],
+    live: &[T],
+    id: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    let mut out: Vec<T> = live.to_vec();
+    for item in imported {
+        let key = id(item);
+        let before = base.iter().find(|b| id(b) == key);
+        if before == Some(item) {
+            continue; // untouched by the import
+        }
+        match out.iter().position(|o| id(o) == key) {
+            Some(at) => {
+                // Changed by the import; keep a live edit made meanwhile.
+                if before == Some(&out[at]) {
+                    out[at] = item.clone();
+                }
+            }
+            None if before.is_none() => out.push(item.clone()),
+            None => {} // deleted by the operator during the import
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use crate::config::{GroupConfig, SoundConfigEntry};
+
+    fn sound(id: &str, name: &str) -> SoundConfigEntry {
+        SoundConfigEntry {
+            id: id.into(),
+            path: format!("/s/{id}.wav"),
+            name: name.into(),
+            volume: 1.0,
+            looped: false,
+            group: None,
+            tags: Vec::new(),
+            gain_db: 0.0,
+            bus: Default::default(),
+            oneshot_stinger: false,
+        }
+    }
+
+    fn cfg(sounds: Vec<SoundConfigEntry>) -> LibraryConfig {
+        LibraryConfig {
+            sounds,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn edits_made_during_the_import_survive() {
+        let base = cfg(vec![sound("a", "A"), sound("b", "B")]);
+        let mut imported = base.clone();
+        imported.sounds.push(sound("c", "C"));
+        // The operator renamed A, deleted B and added D while the import ran.
+        let live = cfg(vec![sound("a", "A renamed"), sound("d", "D")]);
+        let merged = merge_import(&base, &imported, &live);
+        let names: Vec<&str> = merged.sounds.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["A renamed", "D", "C"]);
+    }
+
+    #[test]
+    fn a_replaced_entity_takes_the_import_unless_edited_meanwhile() {
+        let base = cfg(vec![sound("a", "A"), sound("b", "B")]);
+        let imported = cfg(vec![
+            sound("a", "A from bundle"),
+            sound("b", "B from bundle"),
+        ]);
+        let live = cfg(vec![sound("a", "A"), sound("b", "B edited")]);
+        let merged = merge_import(&base, &imported, &live);
+        assert_eq!(merged.sounds[0].name, "A from bundle");
+        assert_eq!(merged.sounds[1].name, "B edited");
+    }
+
+    #[test]
+    fn an_idle_import_equals_the_imported_library() {
+        let base = cfg(vec![sound("a", "A")]);
+        let mut imported = base.clone();
+        imported.sounds.push(sound("b", "B"));
+        imported.groups.push(GroupConfig {
+            id: "g".into(),
+            name: "G".into(),
+        });
+        assert_eq!(merge_import(&base, &imported, &base), imported);
     }
 }
