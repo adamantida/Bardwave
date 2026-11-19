@@ -35,15 +35,15 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 **Crates/Modules:**
 | Module | Responsibility |
 |--------|---------------|
-| `src/audio` | Decoding (Symphonia), mixing, resampling (48k stereo f32), cpal output |
-| `src/network` | axum HTTP/WebSocket server, broadcaster, embedded listener page, local-IP detection |
+| `src/audio` | Decoding (Symphonia), mixing, resampling (48k stereo f32), cpal output, YouTube import via yt-dlp (`youtube.rs`) |
+| `src/network` | axum HTTP/WebSocket server, broadcaster, embedded listener page, local-IP detection, access key (`access.rs`), UPnP port forwarding (`upnp.rs`), `--server-only` remote control (`control.rs`) |
 | `src/gui` | egui console: theme, widgets, sound list, groups, server panel, dialogs |
 | `src/config` | `config.toml` schema and persistence |
 | `src/error` | Typed error types (`SoundSharedError`) |
 
 **Key dependencies:** egui, eframe, cpal, symphonia, tokio, axum, tokio-tungstenite, rusty-opus, serde, tracing, anyhow, thiserror, uuid, crossbeam-channel.
 
-**Build requirements:** Rust 1.85+, Windows 10/11 (primary target; local-IP detection is Windows-specific today).
+**Build requirements:** Rust 1.85+. Windows 10/11 is the primary target; macOS and Linux build too (local-IP detection uses `GetAdaptersAddresses` on Windows and `getifaddrs` on unix; CI builds on ubuntu, windows and macOS). ffmpeg is auto-downloaded only on Windows; on macOS/Linux it must be installed (`brew install ffmpeg` / `apt install ffmpeg`).
 
 ---
 
@@ -212,14 +212,17 @@ Bardwave/
 │   │   ├── engine.rs                 # AudioEngine: decode, mix, output
 │   │   ├── decoder.rs                # Symphonia decoding
 │   │   ├── mixer.rs                  # 48k stereo mixing
-│   │   └── ...
+│   │   └── youtube.rs                # YouTube import (yt-dlp / ffmpeg)
 │   ├── network/
 │   │   ├── mod.rs
 │   │   ├── server.rs                 # axum router, ServerHandle, ServerState
 │   │   ├── broadcast.rs              # tokio broadcast, AudioBroadcaster
 │   │   ├── websocket.rs              # WebSocket session handling
-│   │   ├── local_ip.rs               # LAN IP detection (Windows-specific)
+│   │   ├── local_ip.rs               # LAN IP detection (Windows: GetAdaptersAddresses, unix: getifaddrs)
 │   │   ├── opus_wire.rs              # Opus wire format
+│   │   ├── access.rs                 # Access key (?k=) for the stream
+│   │   ├── upnp.rs                   # Router port forwarding (UPnP IGD)
+│   │   ├── control.rs                # --server-only remote control page/API
 │   │   └── static/
 │   │       ├── index.html            # Embedded listener page
 │   │       ├── app.js                # WebSocket client + Web Audio API
