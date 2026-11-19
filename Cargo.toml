@@ -85,6 +85,8 @@ socket2 = { workspace = true }
 roxmltree = { workspace = true }
 # EBU R128 loudness measurement (pure Rust) for track normalization
 ebur128 = "0.1.11"
+# Library bundles (.zip export/import); deflate only, via flate2 (pure Rust)
+zip = { version = "=2.6.1", default-features = false, features = ["deflate-flate2", "flate2"] }
 
 # getifaddrs for LAN address detection on Linux / macOS
 [target.'cfg(unix)'.dependencies]
