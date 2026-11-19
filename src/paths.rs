@@ -9,7 +9,7 @@
 //!
 //! | situation                                                         | directory                                   |
 //! |-------------------------------------------------------------------|---------------------------------------------|
-//! | `config.toml` already next to the executable                      | the executable's directory (v1.4.0 layout)  |
+//! | `config.toml` already next to the executable (on Windows only if that folder is writable) | the executable's directory (v1.4.0 layout)  |
 //! | a `portable.flag` file next to the executable                     | the executable's directory                  |
 //! | executable directory is writable and not inside a macOS `.app`    | the executable's directory                  |
 //! | otherwise, macOS                                                  | `~/Library/Application Support/Bardwave`    |
@@ -128,7 +128,12 @@ pub fn system_data_dir(os: Os, env: &Env) -> Option<PathBuf> {
 /// Falls back to the executable directory when no system location can be
 /// derived (no `HOME`/`APPDATA`), since that at least is a place we know.
 pub fn choose_data_dir(os: Os, exe_dir: &Path, env: &Env, probe: ExeDirProbe) -> PathBuf {
-    let keep_next_to_exe = probe.has_config
+    // On Windows a `config.toml` in a folder this user cannot write to is not a
+    // portable install: it is what an elevated first run (the firewall-rule
+    // step) leaves in `Program Files`, and pinning the data there would stop
+    // a normal user from saving anything. Only `portable.flag` opts in then.
+    let config_pins_exe_dir = probe.has_config && (os != Os::Windows || probe.writable);
+    let keep_next_to_exe = config_pins_exe_dir
         || probe.has_portable_flag
         || (probe.writable && !(os == Os::MacOs && inside_app_bundle(exe_dir)));
 
@@ -256,9 +261,43 @@ mod tests {
             ..READ_ONLY
         };
         let exe = Path::new("/Applications/Bardwave.app/Contents/MacOS");
-        for os in [Os::Windows, Os::MacOs, Os::Unix] {
+        for os in [Os::MacOs, Os::Unix] {
             assert_eq!(choose_data_dir(os, exe, &env_all(), probe), exe);
         }
+    }
+
+    #[test]
+    fn windows_config_left_by_an_elevated_run_does_not_pin_program_files() {
+        let exe = Path::new("C:/Program Files/Bardwave");
+        let appdata = PathBuf::from("C:/Users/u/AppData/Roaming").join("Bardwave");
+        // Elevated first run: the folder is writable, so data goes there and
+        // config.toml gets created.
+        assert_eq!(choose_data_dir(Os::Windows, exe, &env_all(), WRITABLE), exe);
+        // Later normal run: the config exists but the folder is read-only.
+        let normal = ExeDirProbe {
+            has_config: true,
+            ..READ_ONLY
+        };
+        assert_eq!(
+            choose_data_dir(Os::Windows, exe, &env_all(), normal),
+            appdata
+        );
+        // A writable portable folder with a config keeps the v1.4.0 layout,
+        // and portable.flag still forces it.
+        let portable_cfg = ExeDirProbe {
+            has_config: true,
+            ..WRITABLE
+        };
+        assert_eq!(
+            choose_data_dir(Os::Windows, exe, &env_all(), portable_cfg),
+            exe
+        );
+        let flagged = ExeDirProbe {
+            has_config: true,
+            has_portable_flag: true,
+            writable: false,
+        };
+        assert_eq!(choose_data_dir(Os::Windows, exe, &env_all(), flagged), exe);
     }
 
     #[test]
