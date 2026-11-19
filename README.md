@@ -163,7 +163,9 @@ Runs without the console window, for a spare PC next to the router or a session 
 - the **player link** (with the access key) to share, as in the console;
 - a **control page**, `http://127.0.0.1:<port>/control`: play/stop, repeat and volume for every sound, master volume and *Stop all*.
 
-The control page only answers on the machine that runs Bardwave (players reach the same port over the network and must not get the GM's buttons). Started from Explorer or a shortcut, the server opens a console window with its log; close it or press Ctrl+C to stop.
+On the machine that runs Bardwave the control page opens without a key. From another device (a phone, a laptop) it needs the **GM key**: open `http://<address>:<port>/control?g=<gm_token>`. The key is generated on first start and kept in `config.toml` (`[server] gm_token`); the log only says `Remote control: …/control?g=<gm_token from config.toml>`, and the console's *GM panel link* shows the full link. It is separate from the player key: the player link (`?k=`) never opens the control page. The ⟳ button next to the GM link in the console issues a new key. **Remote control is therefore on by default**: anyone who has the `?g=` link can press the GM's buttons. `gm_token = ""` turns remote access off, and the page then answers on this PC only.
+
+Started from Explorer or a shortcut, the server opens a console window with its log; close it or press Ctrl+C to stop.
 
 ## Configuration
 
@@ -175,6 +177,7 @@ host = "0.0.0.0"   # bind address; "0.0.0.0" = all IPv4 interfaces
 port = 8080
 upnp = true        # ask the router to forward the port for players outside the LAN
 access_token = "…" # key players need in the link (/?k=…); generated on first start, "" = open
+gm_token = "…"     # key for the control page from another device (/control?g=…); generated on first start, "" = this PC only
 
 [audio]
 buffer_size = 480  # device buffer in frames (480 = 10 ms); 0 = driver default

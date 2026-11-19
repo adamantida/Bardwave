@@ -7,6 +7,9 @@ port = 8080
 upnp = true        # ask the router to open the port for players outside the LAN
 # access_token is generated on the first start: players need it in the link
 # (http://<address>:8080/?k=<key>). Set it to "" to let anyone listen.
+# gm_token is generated on the first start too: it opens the control page
+# (--server-only) from another device (http://<address>:8080/control?g=<key>),
+# so remote control is on by default. Set it to "" to keep the page on this PC.
 
 [audio]
 buffer_size = 960  # sound-card buffer in frames (960 = 20 ms); 0 = driver default
