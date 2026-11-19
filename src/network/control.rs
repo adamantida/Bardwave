@@ -546,6 +546,7 @@ mod tests {
                     volume: 0.5,
                     looped: true,
                     group: Some("g".into()),
+                    ..Default::default()
                 },
                 SoundConfigEntry {
                     path: dir.join("missing.wav").to_string_lossy().into_owned(),
@@ -553,8 +554,10 @@ mod tests {
                     volume: 1.0,
                     looped: false,
                     group: None,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
 
         let engine = AudioEngine::new().unwrap();

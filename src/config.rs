@@ -27,6 +27,14 @@ pub struct Config {
     /// Desktop GUI options
     #[serde(default)]
     pub gui: GuiConfig,
+
+    /// Keyboard bindings (`[[hotkeys]]`), in the order the operator made them.
+    ///
+    /// Top-level (not inside `[library]`) because a binding is a console
+    /// setting, not part of a shareable sound set. Targets are ids of sounds,
+    /// scenes or playlists from `[library]`. See [`HotkeyConfig`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hotkeys: Vec<HotkeyConfig>,
 }
 
 /// Network server configuration
@@ -51,6 +59,16 @@ pub struct ServerConfig {
     /// who can reach the port listen (not recommended with UPnP on).
     #[serde(default)]
     pub access_token: Option<String>,
+
+    /// Key of the remote game-master panel (`/control` from another device).
+    ///
+    /// Separate from [`ServerConfig::access_token`]: the listener key never
+    /// opens the panel. `None` means "not generated yet"; the application
+    /// creates one on first start (see [`ServerConfig::ensure_gm_token`]).
+    /// `Some("")` is NOT "open to everyone" (unlike `access_token`): the panel
+    /// stays reachable from this computer only.
+    #[serde(default)]
+    pub gm_token: Option<String>,
 }
 
 /// Audio engine configuration
@@ -71,6 +89,35 @@ pub struct AudioConfig {
     /// Master volume (0.0 to 1.0)
     #[serde(default = "default_master_volume")]
     pub master_volume: f32,
+
+    /// Measure the integrated loudness (EBU R128) of newly added sounds and
+    /// store the correction in [`SoundConfigEntry::gain_db`]. Off by default so
+    /// existing libraries keep sounding the same.
+    #[serde(default)]
+    pub normalize: bool,
+
+    /// Loudness the normalizer aims for, in LUFS (default -18.0).
+    #[serde(default = "default_normalize_target_lufs")]
+    pub normalize_target_lufs: f32,
+
+    /// Ducking depth: the LEVEL (linear gain multiplier, `0.0..=1.0`) the
+    /// ducked buses are lowered to while ducking is active. `0.3` is about
+    /// -10 dB; `1.0` disables the effect, `0.0` mutes them.
+    #[serde(default = "default_duck_amount")]
+    pub duck_amount: f32,
+
+    /// Time to go from full level to `duck_amount`, in milliseconds.
+    #[serde(default = "default_duck_attack_ms")]
+    pub duck_attack_ms: u32,
+
+    /// Time to return from `duck_amount` to full level, in milliseconds.
+    #[serde(default = "default_duck_release_ms")]
+    pub duck_release_ms: u32,
+
+    /// Buses that are lowered while ducking is active (default: music and
+    /// ambience; sound effects and stingers stay at full level).
+    #[serde(default = "default_duck_buses")]
+    pub duck_buses: Vec<Bus>,
 }
 
 /// Logging configuration
@@ -99,6 +146,12 @@ pub struct GuiConfig {
     /// State changes stay instant; only the two decorative motions stop.
     #[serde(default)]
     pub reduce_motion: bool,
+
+    /// Let `[[hotkeys]]` fire while the console window is not focused
+    /// (system-wide shortcuts). Off by default: it needs extra permissions on
+    /// macOS and can steal keys from other programs.
+    #[serde(default)]
+    pub global_hotkeys: bool,
 }
 
 /// Persistent library + groups configuration
@@ -107,6 +160,10 @@ pub struct GuiConfig {
 /// so a user's groups, sound paths, per-sound volumes and group membership
 /// survive restarts. Everything is optional in the file so configs written by
 /// older versions (which had no `[library]` section) still load.
+///
+/// Identifiers: every sound, scene and playlist has a UUID string `id`.
+/// Scenes, playlists and hotkeys refer to sounds by that id (never by path), so
+/// a sound can be re-located on disk without breaking them.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct LibraryConfig {
     /// Sound groups, in insertion order
@@ -116,6 +173,49 @@ pub struct LibraryConfig {
     /// Registered sounds, in insertion order
     #[serde(default)]
     pub sounds: Vec<SoundConfigEntry>,
+
+    /// Scenes (`[[library.scenes]]`): named sets of sounds started together.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scenes: Vec<SceneConfig>,
+
+    /// Music playlists (`[[library.playlists]]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub playlists: Vec<PlaylistConfig>,
+}
+
+impl LibraryConfig {
+    /// Give every sound, scene and playlist a valid, unique `id`.
+    ///
+    /// This is the v1.4.0 migration: those configs have no sound ids, so each
+    /// sound gets a fresh random UUID. The ids are not derived from the path
+    /// (they only need to stay stable from now on, and they do because they are
+    /// written back on the next save). An id that is empty, not a UUID, or that
+    /// repeats an earlier one in the same list is replaced too.
+    ///
+    /// Returns `true` when anything was changed, i.e. when the config should be
+    /// saved to make the new ids permanent. [`Config::load_from`] calls this.
+    pub fn ensure_ids(&mut self) -> bool {
+        fn fix<'a>(ids: impl Iterator<Item = &'a mut String>) -> bool {
+            let mut seen = std::collections::HashSet::new();
+            let mut changed = false;
+            for id in ids {
+                match uuid::Uuid::parse_str(id.trim()) {
+                    Ok(parsed) if seen.insert(parsed) => {}
+                    _ => {
+                        let fresh = uuid::Uuid::new_v4();
+                        seen.insert(fresh);
+                        *id = fresh.to_string();
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        }
+        let sounds = fix(self.sounds.iter_mut().map(|s| &mut s.id));
+        let scenes = fix(self.scenes.iter_mut().map(|s| &mut s.id));
+        let playlists = fix(self.playlists.iter_mut().map(|p| &mut p.id));
+        sounds | scenes | playlists
+    }
 }
 
 /// A single sound group (persisted form)
@@ -128,9 +228,67 @@ pub struct GroupConfig {
     pub name: String,
 }
 
+/// Mixer bus a sound or playlist is routed to.
+///
+/// Buses carry their own level and take part in ducking
+/// ([`AudioConfig::duck_buses`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Bus {
+    /// Background music and playlists.
+    Music,
+    /// Looped atmosphere (default for sounds, so old libraries behave as before).
+    #[default]
+    Ambience,
+    /// Short effects and stingers.
+    Sfx,
+}
+
+/// Shape of a scene fade.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FadeCurve {
+    /// sin/cos pair: constant summed power across a crossfade (default).
+    #[default]
+    EqualPower,
+    /// Straight line in gain; dips in the middle of a crossfade.
+    Linear,
+}
+
+/// When a scene item starts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SceneStart {
+    /// Automatically when the scene is activated (after `delay_ms`).
+    #[default]
+    OnEnter,
+    /// Only when the operator starts it; the scene just lists it.
+    Manual,
+}
+
+/// What a playlist does when it reaches the end.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatMode {
+    /// Stop after the last track.
+    Off,
+    /// Start over from the first track (default: background music keeps going).
+    #[default]
+    All,
+    /// Repeat the current track.
+    One,
+}
+
 /// A single registered sound (persisted form)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SoundConfigEntry {
+    /// Stable identifier (UUID string). Scenes, playlists and hotkeys refer to
+    /// the sound by it. Missing/empty in configs written before v1.5.0: a new
+    /// one is generated at load time ([`LibraryConfig::ensure_ids`]) and
+    /// persisted on the next save.
+    #[serde(default)]
+    pub id: String,
+
     /// Absolute or user-supplied path to the audio file
     pub path: String,
 
@@ -149,6 +307,411 @@ pub struct SoundConfigEntry {
     /// Group this sound belongs to, if any (UUID string)
     #[serde(default)]
     pub group: Option<String>,
+
+    /// Free-form labels for searching and filtering. Stored lower-case,
+    /// trimmed, without duplicates (the library model normalizes them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
+    /// Fixed correction in decibels applied on top of `volume` (loudness
+    /// normalization writes it; `0.0` = untouched).
+    #[serde(default)]
+    pub gain_db: f32,
+
+    /// Mixer bus the sound plays on.
+    #[serde(default)]
+    pub bus: Bus,
+
+    /// Treat the sound as a stinger: a one-shot played over everything, which
+    /// does not stop other sounds and does not depend on the active scene.
+    #[serde(default)]
+    pub oneshot_stinger: bool,
+}
+
+impl Default for SoundConfigEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            path: String::new(),
+            name: String::new(),
+            volume: default_sound_volume(),
+            looped: false,
+            group: None,
+            tags: Vec::new(),
+            gain_db: 0.0,
+            bus: Bus::default(),
+            oneshot_stinger: false,
+        }
+    }
+}
+
+/// A scene: a named set of sounds (plus random emitters and an optional
+/// music playlist) that starts with one action.
+///
+/// ```toml
+/// [[library.scenes]]
+/// id = "…"
+/// name = "Tavern"
+/// color = "#a04a4a"
+/// fade_in_ms = 2000
+/// fade_out_ms = 2000
+/// curve = "equal_power"
+/// stop_others = true
+/// playlist = "…"            # optional playlist id
+///
+/// [[library.scenes.items]]
+/// sound = "…"               # sound id
+/// volume = 0.4
+/// looped = true
+/// start = "on_enter"
+/// delay_ms = 0
+///
+/// [[library.scenes.emitters]]
+/// sounds = ["…", "…"]
+/// min_interval_ms = 20000
+/// max_interval_ms = 60000
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SceneConfig {
+    /// Scene identifier (UUID string); generated when missing.
+    #[serde(default)]
+    pub id: String,
+
+    /// Name shown on the scene button.
+    #[serde(default)]
+    pub name: String,
+
+    /// Button color as `#rrggbb` (or `#rgb`); `None` = theme default.
+    #[serde(default)]
+    pub color: Option<String>,
+
+    /// Fade-in time of the sounds this scene starts, in milliseconds.
+    #[serde(default = "default_scene_fade_ms")]
+    pub fade_in_ms: u32,
+
+    /// Fade-out time of the sounds this scene stops, in milliseconds.
+    #[serde(default = "default_scene_fade_ms")]
+    pub fade_out_ms: u32,
+
+    /// Fade shape used for both directions.
+    #[serde(default)]
+    pub curve: FadeCurve,
+
+    /// Fade out (and stop) playing sounds that are not part of this scene.
+    #[serde(default = "default_true")]
+    pub stop_others: bool,
+
+    /// The scene's sounds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<SceneItemConfig>,
+
+    /// Random / periodic sound sources that run while the scene is active.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emitters: Vec<EmitterConfig>,
+
+    /// Playlist (id) played as the scene's music layer.
+    #[serde(default)]
+    pub playlist: Option<String>,
+}
+
+impl Default for SceneConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            color: None,
+            fade_in_ms: default_scene_fade_ms(),
+            fade_out_ms: default_scene_fade_ms(),
+            curve: FadeCurve::default(),
+            stop_others: true,
+            items: Vec::new(),
+            emitters: Vec::new(),
+            playlist: None,
+        }
+    }
+}
+
+/// One sound inside a scene (`[[library.scenes.items]]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SceneItemConfig {
+    /// Id of the sound ([`SoundConfigEntry::id`]).
+    pub sound: String,
+
+    /// Level inside this scene, `0.0..=1.0` (replaces the sound's own volume).
+    #[serde(default = "default_sound_volume")]
+    pub volume: f32,
+
+    /// Repeat the sound while the scene is active.
+    #[serde(default)]
+    pub looped: bool,
+
+    /// Automatic or manual start.
+    #[serde(default)]
+    pub start: SceneStart,
+
+    /// Delay after activation before the sound starts, in milliseconds.
+    #[serde(default)]
+    pub delay_ms: u32,
+}
+
+/// A random/periodic sound source of a scene (`[[library.scenes.emitters]]`):
+/// "crows every 20-60 seconds". Each time it fires, one of `sounds` is chosen
+/// at random.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EmitterConfig {
+    /// Ids of the candidate sounds.
+    #[serde(default)]
+    pub sounds: Vec<String>,
+
+    /// Shortest pause between two plays, in milliseconds.
+    #[serde(default = "default_emitter_min_ms")]
+    pub min_interval_ms: u32,
+
+    /// Longest pause between two plays, in milliseconds (`>= min_interval_ms`).
+    #[serde(default = "default_emitter_max_ms")]
+    pub max_interval_ms: u32,
+
+    /// Base level, `0.0..=1.0`.
+    #[serde(default = "default_sound_volume")]
+    pub volume: f32,
+
+    /// Random level spread, `0.0..=1.0` (fraction of `volume`).
+    #[serde(default)]
+    pub volume_jitter: f32,
+
+    /// Random stereo position spread, `0.0..=1.0` (0 = centre, 1 = anywhere).
+    #[serde(default)]
+    pub pan_jitter: f32,
+
+    /// Never play more than this many instances at once (at least 1).
+    #[serde(default = "default_emitter_max_overlap")]
+    pub max_overlap: u32,
+}
+
+impl Default for EmitterConfig {
+    fn default() -> Self {
+        Self {
+            sounds: Vec::new(),
+            min_interval_ms: default_emitter_min_ms(),
+            max_interval_ms: default_emitter_max_ms(),
+            volume: default_sound_volume(),
+            volume_jitter: 0.0,
+            pan_jitter: 0.0,
+            max_overlap: default_emitter_max_overlap(),
+        }
+    }
+}
+
+/// A music playlist (`[[library.playlists]]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlaylistConfig {
+    /// Playlist identifier (UUID string); generated when missing.
+    #[serde(default)]
+    pub id: String,
+
+    /// Display name.
+    #[serde(default)]
+    pub name: String,
+
+    /// Ids of the tracks, in play order.
+    #[serde(default)]
+    pub items: Vec<String>,
+
+    /// Play in random order without repeating a track until all were played.
+    #[serde(default)]
+    pub shuffle: bool,
+
+    /// End-of-list behaviour.
+    #[serde(default)]
+    pub repeat: RepeatMode,
+
+    /// Crossfade between tracks, in milliseconds (0 = gapless cut).
+    #[serde(default = "default_playlist_crossfade_ms")]
+    pub crossfade_ms: u32,
+
+    /// Bus the playlist plays on (default `music`).
+    #[serde(default = "default_playlist_bus")]
+    pub bus: Bus,
+}
+
+impl Default for PlaylistConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            items: Vec::new(),
+            shuffle: false,
+            repeat: RepeatMode::default(),
+            crossfade_ms: default_playlist_crossfade_ms(),
+            bus: default_playlist_bus(),
+        }
+    }
+}
+
+/// A keyboard binding (`[[hotkeys]]`).
+///
+/// ```toml
+/// [[hotkeys]]
+/// key = "Ctrl+1"
+/// [hotkeys.action]
+/// kind = "scene"
+/// target = "…"            # scene id
+///
+/// [[hotkeys]]
+/// key = "F5"
+/// [hotkeys.action]
+/// kind = "stop_all"
+/// ```
+///
+/// `key` is modifiers and one key joined by `+`: `Ctrl`, `Alt`, `Shift`,
+/// `Cmd` (macOS Command / Windows key), then a letter, digit, `F1`..`F24`, or a
+/// named key (`Space`, `Enter`, `Escape`, `Up`…). Matching is case-insensitive
+/// and modifier order does not matter; see
+/// [`HotkeyConfig::canonical_key`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotkeyConfig {
+    /// Key combination, e.g. `"Ctrl+1"`, `"Cmd+K"`, `"F5"`.
+    pub key: String,
+
+    /// What the combination does.
+    pub action: HotkeyAction,
+}
+
+/// What a hotkey does. Serialized as `{ kind = "<snake_case name>", target = … }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HotkeyAction {
+    /// Play the sound (stingers fire one-shot; others toggle). `target` = sound id.
+    Sound {
+        /// Sound id.
+        target: String,
+    },
+    /// Activate the scene. `target` = scene id.
+    Scene {
+        /// Scene id.
+        target: String,
+    },
+    /// Start (or restart) the playlist. `target` = playlist id.
+    Playlist {
+        /// Playlist id.
+        target: String,
+    },
+    /// Stop every sound (with the scene fade-out when one is active).
+    StopAll,
+    /// Stop the active scene.
+    StopScene,
+    /// Raise the master volume by one step.
+    MasterUp,
+    /// Lower the master volume by one step.
+    MasterDown,
+    /// Mute / unmute the master output.
+    MasterMute,
+    /// Press once to duck the background buses, again to release.
+    DuckToggle,
+    /// Duck while the key is held down, release on key-up.
+    DuckHold,
+    /// Skip to the next playlist track.
+    NextTrack,
+    /// Go back to the previous playlist track.
+    PrevTrack,
+    /// Pause / resume the music playlist.
+    PauseMusic,
+}
+
+impl HotkeyAction {
+    /// Id the action points at, for the three actions that have a target.
+    pub fn target(&self) -> Option<&str> {
+        match self {
+            Self::Sound { target } | Self::Scene { target } | Self::Playlist { target } => {
+                Some(target)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl HotkeyConfig {
+    /// Canonical spelling of [`HotkeyConfig::key`] for comparing bindings
+    /// (`"ctrl+shift+a"` and `"Shift+Ctrl+A"` both become `"Ctrl+Shift+A"`).
+    /// See [`canonical_hotkey`].
+    pub fn canonical_key(&self) -> Option<String> {
+        canonical_hotkey(&self.key)
+    }
+}
+
+/// Normalize a key-combination string, or `None` when it is not one.
+///
+/// Rules: parts are split on `+` and trimmed; modifiers (case-insensitive,
+/// aliases `control`->`Ctrl`, `option`/`opt`->`Alt`, `command`/`super`/`meta`/
+/// `win`->`Cmd`) are de-duplicated and written in the order `Ctrl+Alt+Shift+Cmd`;
+/// exactly one non-modifier key must remain. A single character is upper-cased
+/// (`a` -> `A`), `f5` -> `F5`, other names get a capital first letter
+/// (`space` -> `Space`) with a few aliases (`esc` -> `Escape`, `return` ->
+/// `Enter`, `del` -> `Delete`). It does not check that the key exists on any
+/// keyboard: that is the input layer's job.
+pub fn canonical_hotkey(text: &str) -> Option<String> {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut cmd = false;
+    let mut key: Option<String> = None;
+
+    for part in text.split('+') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        match part.to_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "option" | "opt" => alt = true,
+            "shift" => shift = true,
+            "cmd" | "command" | "super" | "meta" | "win" | "windows" => cmd = true,
+            other => {
+                if key.is_some() {
+                    return None;
+                }
+                key = Some(canonical_key_name(other));
+            }
+        }
+    }
+
+    let key = key?;
+    let mut out = String::new();
+    for (on, name) in [(ctrl, "Ctrl"), (alt, "Alt"), (shift, "Shift"), (cmd, "Cmd")] {
+        if on {
+            out.push_str(name);
+            out.push('+');
+        }
+    }
+    out.push_str(&key);
+    Some(out)
+}
+
+/// Capitalize a lower-cased key token (see [`canonical_hotkey`]).
+fn canonical_key_name(lower: &str) -> String {
+    let mut chars = lower.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let rest: String = chars.collect();
+    if rest.is_empty() {
+        return first.to_uppercase().collect();
+    }
+    match lower {
+        "esc" => return "Escape".to_string(),
+        "return" => return "Enter".to_string(),
+        "del" => return "Delete".to_string(),
+        "ins" => return "Insert".to_string(),
+        "pgup" => return "PageUp".to_string(),
+        "pgdn" => return "PageDown".to_string(),
+        _ => {}
+    }
+    if first == 'f' && rest.bytes().all(|b| b.is_ascii_digit()) {
+        return format!("F{rest}");
+    }
+    let mut out: String = first.to_uppercase().collect();
+    out.push_str(&rest);
+    out
 }
 
 fn default_port() -> u16 {
@@ -190,6 +753,54 @@ pub fn default_sound_volume() -> f32 {
     1.0
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_scene_fade_ms() -> u32 {
+    2000
+}
+
+fn default_emitter_min_ms() -> u32 {
+    20_000
+}
+
+fn default_emitter_max_ms() -> u32 {
+    60_000
+}
+
+fn default_emitter_max_overlap() -> u32 {
+    2
+}
+
+fn default_playlist_crossfade_ms() -> u32 {
+    2000
+}
+
+fn default_playlist_bus() -> Bus {
+    Bus::Music
+}
+
+fn default_normalize_target_lufs() -> f32 {
+    -18.0
+}
+
+fn default_duck_amount() -> f32 {
+    0.3
+}
+
+fn default_duck_attack_ms() -> u32 {
+    200
+}
+
+fn default_duck_release_ms() -> u32 {
+    800
+}
+
+fn default_duck_buses() -> Vec<Bus> {
+    vec![Bus::Music, Bus::Ambience]
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -197,7 +808,22 @@ impl Default for ServerConfig {
             host: default_host(),
             upnp: default_upnp(),
             access_token: None,
+            gm_token: None,
         }
+    }
+}
+
+impl ServerConfig {
+    /// Generate [`ServerConfig::gm_token`] when it is missing (`None`).
+    ///
+    /// An explicit `Some("")` is kept: it means "panel is local-only". Returns
+    /// `true` when a token was created and the config should be saved.
+    pub fn ensure_gm_token(&mut self) -> bool {
+        if self.gm_token.is_none() {
+            self.gm_token = Some(crate::network::generate_key());
+            return true;
+        }
+        false
     }
 }
 
@@ -208,6 +834,12 @@ impl Default for AudioConfig {
             sample_rate: default_sample_rate(),
             channels: default_channels(),
             master_volume: default_master_volume(),
+            normalize: false,
+            normalize_target_lufs: default_normalize_target_lufs(),
+            duck_amount: default_duck_amount(),
+            duck_attack_ms: default_duck_attack_ms(),
+            duck_release_ms: default_duck_release_ms(),
+            duck_buses: default_duck_buses(),
         }
     }
 }
@@ -267,8 +899,14 @@ impl Config {
         let content = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::NotFound(format!("{:?}: {}", path, e)))?;
 
-        let config: Config = toml::from_str(&content)
+        let mut config: Config = toml::from_str(&content)
             .map_err(|e| ConfigError::Parse(format!("{:?}: {}", path, e)))?;
+
+        // v1.4.0 files have no sound ids: mint them now, they are written out
+        // by the next save.
+        if config.library.ensure_ids() {
+            tracing::info!("Assigned ids to library entries of {:?}", path);
+        }
 
         tracing::info!("Loaded configuration from {:?}", path);
         Ok(config)
@@ -430,6 +1068,7 @@ name = "Combat"
                         volume: 0.75,
                         looped: true,
                         group: Some("6f1e1b0e-0f8e-4a8e-9a2c-2b2a0e9d1f22".to_string()),
+                        ..SoundConfigEntry::default()
                     },
                     SoundConfigEntry {
                         path: r"C:\fake\wind.ogg".to_string(),
@@ -437,8 +1076,10 @@ name = "Combat"
                         volume: 1.0,
                         looped: false,
                         group: None,
+                        ..SoundConfigEntry::default()
                     },
                 ],
+                ..LibraryConfig::default()
             },
             ..Config::default()
         };
@@ -479,6 +1120,45 @@ name = "Combat"
         assert_eq!(entry.group, None);
         // Configs written before the repeat toggle existed must load as "off".
         assert!(!entry.looped);
+    }
+
+    /// A scene / playlist written with only the essentials takes the documented
+    /// defaults for everything else.
+    #[test]
+    fn scene_and_playlist_defaults_apply_when_fields_are_omitted() {
+        let text = r#"
+[[library.scenes]]
+name = "Tavern"
+
+[[library.scenes.items]]
+sound = "11111111-1111-4111-8111-111111111111"
+
+[[library.scenes.emitters]]
+sounds = ["11111111-1111-4111-8111-111111111111"]
+
+[[library.playlists]]
+name = "Music"
+"#;
+        let config: Config = toml::from_str(text).expect("parse");
+        let scene = &config.library.scenes[0];
+        assert_eq!(scene.id, "");
+        assert_eq!((scene.fade_in_ms, scene.fade_out_ms), (2000, 2000));
+        assert_eq!(scene.curve, FadeCurve::EqualPower);
+        assert!(scene.stop_others);
+        assert_eq!(scene.color, None);
+        assert_eq!(scene.playlist, None);
+        let item = &scene.items[0];
+        assert_eq!(item.volume, 1.0);
+        assert!(!item.looped);
+        assert_eq!(item.start, SceneStart::OnEnter);
+        assert_eq!(item.delay_ms, 0);
+        let emitter = &scene.emitters[0];
+        assert_eq!(emitter.max_overlap, 2);
+        assert!(emitter.min_interval_ms <= emitter.max_interval_ms);
+        let playlist = &config.library.playlists[0];
+        assert_eq!(playlist.repeat, RepeatMode::All);
+        assert_eq!(playlist.bus, Bus::Music);
+        assert!(!playlist.shuffle);
     }
 
     // ===== GUI options =====
