@@ -44,6 +44,9 @@ pub struct RecorderUi {
     picking_folder: bool,
     /// What happened last (a saved file, a warning, an error).
     notice: Option<Notice>,
+    /// Layout tests: pretend a recording runs with these numbers.
+    #[cfg(test)]
+    pub(crate) fake_recording: Option<RecorderStats>,
 }
 
 impl RecorderUi {
@@ -66,7 +69,36 @@ impl RecorderUi {
             folder_rx,
             picking_folder: false,
             notice: None,
+            #[cfg(test)]
+            fake_recording: None,
         }
+    }
+
+    /// Whether the bar shows the armed (recording) form of the REC button.
+    fn shows_recording(&self) -> bool {
+        #[cfg(test)]
+        if self.fake_recording.is_some() {
+            return true;
+        }
+        self.active.is_some()
+    }
+
+    /// Numbers for the readout while a recording runs or is being finalized.
+    fn readout_stats(&self) -> Option<RecorderStats> {
+        #[cfg(test)]
+        if self.fake_recording.is_some() {
+            return self.fake_recording.clone();
+        }
+        self.stats
+            .clone()
+            .filter(|_| self.active.is_some() || self.stopping.is_some())
+    }
+
+    /// Layout tests: show a recording with `stats` and/or the `notice` line.
+    #[cfg(test)]
+    pub(crate) fn fake_for_layout(&mut self, stats: Option<RecorderStats>, notice: Option<Notice>) {
+        self.fake_recording = stats;
+        self.notice = notice;
     }
 
     /// Whether a recording is running (or starting).
@@ -269,7 +301,7 @@ pub fn top_bar_controls(ui: &mut Ui, state: &mut SoundSharedApp, compact: bool, 
     let config = state.app_state.config.clone();
     let rec = &mut state.recorder;
 
-    let recording = rec.active.is_some();
+    let recording = rec.shows_recording();
     let busy = rec.starting.is_some() || rec.stopping.is_some();
 
     let (label, kind, tooltip) = if recording {
@@ -320,80 +352,89 @@ pub fn top_bar_controls(ui: &mut Ui, state: &mut SoundSharedApp, compact: bool, 
 
 /// The live readout (time, size, losses) or the last notice, drawn after the
 /// bar's fixed controls into at most `max_w` points. The bar offers only what
-/// is left of its row, so the text is truncated, never pushed into the status.
+/// is left of its row. Every piece is measured and fitted to what remains
+/// after the pieces before it: the time and size are cut with an ellipsis, the
+/// loss count and the warning are dropped when they do not fit, so the whole
+/// readout stays inside `max_w` and never reaches the status cluster.
 pub fn top_bar_readout(ui: &mut Ui, state: &mut SoundSharedApp, max_w: f32) {
     // Below this there is nothing useful to read; the armed REC button already
     // says a recording runs.
     const MIN_W: f32 = 90.0;
+    /// Least width worth drawing a cut text at (a few characters and `…`).
+    const MIN_TEXT_W: f32 = 36.0;
     if max_w < MIN_W {
         return;
     }
     let reduced = state.reduced_motion();
     let rec = &state.recorder;
-    let recording = rec.active.is_some();
-    let stats = rec
-        .stats
-        .clone()
-        .filter(|_| recording || rec.stopping.is_some());
+    let stats = rec.readout_stats();
     let notice = rec.notice.clone();
     ui.allocate_ui_with_layout(
         egui::vec2(max_w, ui.available_height()),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.set_max_width(max_w);
+            ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+            let text_w = |ui: &Ui, text: &str, font: egui::FontId| -> f32 {
+                ui.fonts(|f| {
+                    f.layout_no_wrap(text.to_string(), font, Palette::WHITE)
+                        .size()
+                        .x
+                })
+                .ceil()
+            };
+            // What is left of the row after what has been drawn.
+            let left = |ui: &Ui| ui.max_rect().right() - ui.min_rect().right();
+            // Draw `text` cut to the room that is left, or nothing when the
+            // room is too small to show a recognisable piece.
+            let piece = |ui: &mut Ui, text: &str, font: egui::FontId, color: egui::Color32| {
+                let room = left(ui);
+                if room < MIN_TEXT_W {
+                    return;
+                }
+                let shown = crate::gui::profiles_ui::fit_text(ui, text, font.clone(), room.floor());
+                let resp = ui.add(
+                    egui::Label::new(egui::RichText::new(&shown).font(font).color(color)).extend(),
+                );
+                if shown != text {
+                    resp.on_hover_text(text);
+                }
+            };
             if let Some(stats) = stats {
+                let lead = Metrics::SM + 7.0 + Metrics::XS;
+                if left(ui) < lead + MIN_TEXT_W {
+                    return;
+                }
                 ui.add_space(Metrics::SM);
                 signal_dot(ui, Palette::ROSE_500, 7.0, !reduced);
                 ui.add_space(Metrics::XS);
-                let text = readout_text(&stats);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&text)
-                            .font(mono_font(11.0))
-                            .color(Palette::WHITE),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(text);
+                piece(ui, &readout_text(&stats), mono_font(11.0), Palette::WHITE);
                 if stats.dropped_frames > 0 {
-                    ui.add_space(Metrics::SM);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!("{} lost", stats.dropped_frames))
-                                .font(mono_font(10.0))
-                                .color(Palette::AMBER_400),
-                        )
-                        .truncate(),
-                    );
+                    let lost = format!("{} lost", stats.dropped_frames);
+                    let font = mono_font(10.0);
+                    // Whole or not at all: half a count would mislead.
+                    if text_w(ui, &lost, font.clone()) + Metrics::SM <= left(ui) {
+                        ui.add_space(Metrics::SM);
+                        piece(ui, &lost, font, Palette::AMBER_400);
+                    }
                 }
                 if let Some(warning) = &stats.warning {
-                    ui.add_space(Metrics::SM);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(warning)
-                                .font(mono_font(10.0))
-                                .color(Palette::AMBER_400),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(warning);
+                    if left(ui) >= Metrics::SM + MIN_TEXT_W {
+                        ui.add_space(Metrics::SM);
+                        piece(ui, warning, mono_font(10.0), Palette::AMBER_400);
+                    }
                 }
             } else if let Some(notice) = notice {
+                if left(ui) < Metrics::SM + MIN_TEXT_W {
+                    return;
+                }
                 ui.add_space(Metrics::SM);
                 let color = if notice.is_error {
                     Palette::ROSE_400
                 } else {
                     Palette::ZINC_400
                 };
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&notice.text)
-                            .font(mono_font(10.0))
-                            .color(color),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&notice.text);
+                piece(ui, &notice.text, mono_font(10.0), color);
             }
         },
     );

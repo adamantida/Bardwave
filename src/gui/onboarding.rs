@@ -350,20 +350,35 @@ pub fn show(ctx: &egui::Context, state: &mut SoundSharedApp) {
     }
 }
 
+/// Text of the Help button.
+fn help_text() -> egui::RichText {
+    egui::RichText::new("Help")
+        .font(glyph_font(11.0))
+        .color(Palette::WHITE)
+}
+
+/// Width of the Help button in `ui`'s style: its text and the button padding.
+pub fn help_button_width(ui: &Ui) -> f32 {
+    let text = egui::WidgetText::from(help_text()).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    (text.size().x + 2.0 * ui.spacing().button_padding.x)
+        .max(ui.spacing().interact_size.x)
+        .ceil()
+}
+
 /// Entry for the top bar: a Help menu with "Getting started".
 pub fn help_menu(ui: &mut Ui, state: &mut SoundSharedApp) {
-    let menu = ui.menu_button(
-        egui::RichText::new("Help")
-            .font(glyph_font(11.0))
-            .color(Palette::WHITE),
-        |ui| {
-            if ui.button("Getting started").clicked() {
-                let progress = state.onboarding_progress();
-                state.onboarding.open(progress);
-                ui.close_menu();
-            }
-        },
-    );
+    let menu = ui.menu_button(help_text(), |ui| {
+        if ui.button("Getting started").clicked() {
+            let progress = state.onboarding_progress();
+            state.onboarding.open(progress);
+            ui.close_menu();
+        }
+    });
     menu.response.on_hover_text("Open the first-run guide");
 }
 
