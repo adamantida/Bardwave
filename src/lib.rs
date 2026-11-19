@@ -7,6 +7,7 @@ pub mod audio;
 pub mod config;
 pub mod error;
 pub mod gui;
+pub mod hotkeys;
 pub mod library_bundle;
 pub mod library_query;
 pub mod library_scan;
