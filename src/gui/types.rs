@@ -1,7 +1,8 @@
 //! Shared types for GUI integration
 //! These types are used by both the GUI and main.rs for communication
 
-use crate::audio::SoundId;
+use crate::audio::{DuckTarget, SoundId};
+use crate::config::Bus;
 use crossbeam_channel::Sender;
 use std::fmt::Debug;
 
@@ -104,6 +105,43 @@ pub enum AudioCommand {
     /// Music playlist: end-of-list behaviour.
     PlaylistSetRepeat {
         repeat: crate::config::RepeatMode,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Volume of a mixer bus (`0.0..=1.0`).
+    SetBusVolume {
+        bus: Bus,
+        volume: f32,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Duck buses until `DuckRelease`; `None` parameters use `[audio] duck_*`.
+    Duck {
+        target: DuckTarget,
+        amount: Option<f32>,
+        attack_ms: Option<u32>,
+        release_ms: Option<u32>,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Release a latched duck.
+    DuckRelease {
+        target: DuckTarget,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Hold mode: duck while a key is held (`active`), release on key-up.
+    DuckHold {
+        target: DuckTarget,
+        active: bool,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Duck when not ducked, release when ducked.
+    DuckToggle {
+        target: DuckTarget,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Switch loudness normalization on or off (and set its target, LUFS).
+    /// Turning it on measures the loaded sounds that have no gain yet.
+    SetNormalize {
+        enabled: bool,
+        target_lufs: Option<f32>,
         response: Sender<anyhow::Result<()>>,
     },
 }

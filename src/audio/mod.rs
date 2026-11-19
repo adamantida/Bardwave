@@ -3,6 +3,7 @@
 
 pub mod decoder;
 pub mod director;
+pub mod director_audio;
 pub mod emitter;
 pub mod engine;
 pub mod loudness;
@@ -19,6 +20,7 @@ pub use director::{
     ActivationPlan, CatalogSound, Director, DirectorCommand, DirectorError, DirectorOutcome,
     DirectorState, FadeSpec, Playback, SceneReport,
 };
+pub use director_audio::{DuckMode, DuckTarget, GainUpdate, MixControl, NormalizeSettings};
 pub use emitter::{
     EmitterEvent, EmitterHost, EmitterRunner, EmitterSnapshot, EmitterSound, EmitterSpec, Scheduler,
 };

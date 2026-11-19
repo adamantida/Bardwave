@@ -1061,6 +1061,13 @@ impl AudioEngine {
         Ok(sound_id)
     }
 
+    /// The decoded PCM of a sound held in memory (`None` for a streamed or
+    /// unknown sound). Shared, not copied: loudness measurement reads it from a
+    /// background thread.
+    pub fn sound_audio(&self, sound_id: SoundId) -> Option<Arc<DecodedAudio>> {
+        self.inner.sounds.read().get(&sound_id).cloned()
+    }
+
     /// Load a sound from raw decoded audio data
     pub fn load_sound_from_data(&self, audio: DecodedAudio) -> SoundId {
         let sound_id = SoundId::new();

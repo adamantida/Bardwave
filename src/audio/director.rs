@@ -61,6 +61,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
 
+use crate::audio::director_audio::AudioControl;
 use crate::audio::engine::{AudioEngine, EngineError, SoundId};
 use crate::audio::mixer::{Bus as MixerBus, DuckSettings, FadeCurve as MixerCurve};
 use crate::audio::playlist::{MusicLayer, MusicPlayback, PlaylistCommand};
@@ -495,6 +496,8 @@ pub struct Director {
     pub(crate) emitters: crate::audio::emitter::EmitterHost,
     /// Playlists and the music player (see `audio::playlist`).
     pub(crate) music: MusicLayer,
+    /// Buses, ducking and normalization (see `director_audio.rs`).
+    pub(crate) audio_ctl: AudioControl,
 }
 
 impl Default for Director {
@@ -517,6 +520,7 @@ impl Director {
             last_refresh: None,
             emitters: crate::audio::emitter::EmitterHost::new(),
             music: MusicLayer::default(),
+            audio_ctl: AudioControl::default(),
         }
     }
 
@@ -1015,6 +1019,7 @@ impl Director {
     /// [`tick`](Self::tick) with an explicit clock, for tests.
     pub fn tick_at<P: Playback + ?Sized>(&mut self, pb: &P, now: Instant) {
         let mut ran = self.music_tick(pb, now);
+        self.poll_normalization(pb);
         if self.pending.iter().any(|p| p.due <= now) {
             let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
                 .into_iter()

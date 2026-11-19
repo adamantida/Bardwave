@@ -43,7 +43,7 @@
 //! Client to server, one object per frame with a `cmd` and an optional `req`:
 //! `ping`, `state`, `play{id}`, `stop{id}`, `volume{id,value}`,
 //! `loop{id,on}`, `master{value}`, `stop_all{fade_ms?}`, `scene{id}`,
-//! `stop_scene`, `stinger{id}`, `duck{on}`. Anything else is answered with an
+//! `stop_scene`, `stinger{id}`, `duck{on}`, `bus{bus,value}`. Anything else is answered with an
 //! `error`; the connection stays open.
 //!
 //! The audio engine lives on the main thread (its CPAL stream is `!Send`), so
@@ -69,9 +69,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot, watch};
 
 use crate::audio::director::{Director, DirectorState, Playback};
-use crate::audio::mixer::DuckSettings;
+use crate::audio::director_audio::{
+    bus_name, parse_bus, DuckMode, DuckTarget, GainUpdate, MixControl,
+};
 use crate::audio::{AudioEngine, CatalogSound, SoundId};
-use crate::config::{Bus, LibraryConfig};
+use crate::config::{AudioConfig, Bus, LibraryConfig};
 use crate::network::access::{
     GmAccess, GmAuth, GmDenied, GmGuard, CLOSE_GM_TOKEN_REVOKED, GM_PARAM,
 };
@@ -237,8 +239,10 @@ pub enum ControlAction {
     StopScene,
     /// Play the sound once over everything (a stinger).
     PlayStinger(usize),
-    /// Duck (`true`) or release (`false`) the background buses.
+    /// Duck (`true`) or release (`false`) the configured background buses.
     Duck(bool),
+    /// A bus volume or ducking request.
+    Mix(MixControl),
 }
 
 /// One queued action plus where to send the resulting board state.
@@ -258,10 +262,6 @@ pub struct Board {
     playlists: Vec<ControlPlaylist>,
     /// Where state changes are published (see [`Board::attach_feed`]).
     feed: Option<ControlFeed>,
-    /// Buses the `duck` command turns down, and how.
-    duck_buses: Vec<Bus>,
-    duck_settings: DuckSettings,
-    ducked: bool,
 }
 
 struct BoardSound {
@@ -371,9 +371,6 @@ impl Board {
             director,
             playlists,
             feed: None,
-            duck_buses: vec![Bus::Music, Bus::Ambience],
-            duck_settings: DuckSettings::default(),
-            ducked: false,
         }
     }
 
@@ -384,19 +381,31 @@ impl Board {
         self.feed = Some(feed);
     }
 
-    /// Which buses the `duck` command lowers, and how (defaults: music and
-    /// ambience, [`DuckSettings::default`]).
-    pub fn set_duck(&mut self, buses: Vec<Bus>, settings: DuckSettings) {
-        self.duck_buses = buses;
-        self.duck_settings = settings;
-    }
-
     fn publish<P: Playback + ?Sized>(&self, pb: &P) -> BoardState {
         let state = self.state(pb);
         if let Some(feed) = &self.feed {
             feed.publish(state.clone());
         }
         state
+    }
+
+    /// Take the ducking defaults and the normalization switch from `[audio]`.
+    pub fn configure_audio(&mut self, audio: &AudioConfig) {
+        self.director.configure_audio(audio);
+    }
+
+    /// Start measuring the loudness of every loaded sound that has no gain yet
+    /// (a no-op unless `audio.normalize` is on). Returns how many
+    /// measurements were started; the results arrive through
+    /// [`tick`](Self::tick) and [`take_gain_updates`](Self::take_gain_updates).
+    pub fn normalize_missing(&mut self, engine: &AudioEngine) -> usize {
+        self.director.normalize_catalog(engine)
+    }
+
+    /// Gains measured since the last call, for the caller to store in the
+    /// config (see `audio::director_audio::apply_gain_updates`).
+    pub fn take_gain_updates(&mut self) -> Vec<GainUpdate> {
+        self.director.take_gain_updates()
     }
 
     /// Number of playable sounds.
@@ -512,15 +521,24 @@ impl Board {
                     .map_err(|e| e.to_string())?;
             }
             ControlAction::Duck(on) => {
-                for bus in &self.duck_buses {
-                    if on {
-                        pb.duck_bus(*bus, self.duck_settings);
-                    } else {
-                        pb.release_duck(*bus);
-                    }
-                }
-                self.ducked = on;
+                let mode = if on { DuckMode::On } else { DuckMode::Off };
+                self.director
+                    .run_mix_control(
+                        pb,
+                        MixControl::Duck {
+                            target: DuckTarget::Configured,
+                            mode,
+                            amount: None,
+                            attack_ms: None,
+                            release_ms: None,
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
             }
+            ControlAction::Mix(control) => self
+                .director
+                .run_mix_control(pb, control)
+                .map_err(|e| e.to_string())?,
         }
         Ok(self.publish(pb))
     }
@@ -566,7 +584,9 @@ impl Board {
             scenes,
             active_scene,
             playlists: self.playlists.clone(),
-            ducked: self.ducked,
+            ducked: [Bus::Music, Bus::Ambience, Bus::Sfx]
+                .into_iter()
+                .any(|bus| self.director.is_ducked(bus)),
         }
     }
 }
@@ -684,6 +704,7 @@ pub fn routes(ctx: ControlContext) -> Router {
         .route("/api/control/master", post(control_master))
         .route("/api/control/stinger", post(control_stinger))
         .route("/api/control/duck", post(control_duck))
+        .route("/api/control/bus", post(control_bus))
         .route_layer(middleware::from_fn_with_state(ctx.clone(), gm_gate))
         // The token can sit in the URL: keep it out of caches and Referer.
         .layer(middleware::map_response(private_headers))
@@ -861,11 +882,6 @@ struct IdOnQuery {
 #[derive(Deserialize)]
 struct ValueQuery {
     value: f32,
-}
-
-#[derive(Deserialize)]
-struct OnQuery {
-    on: bool,
 }
 
 #[derive(Deserialize)]
@@ -1066,15 +1082,6 @@ async fn control_stinger(
     run(&ctx, access, &headers, ControlAction::PlayStinger(q.id)).await
 }
 
-async fn control_duck(
-    State(ctx): State<ControlContext>,
-    Extension(access): Extension<GmAccess>,
-    headers: HeaderMap,
-    Query(q): Query<OnQuery>,
-) -> Response {
-    run(&ctx, access, &headers, ControlAction::Duck(q.on)).await
-}
-
 // -------------------------------------------------------------- WebSocket ---
 
 /// A command from a `/ws/control` client (the `cmd` field names it).
@@ -1114,6 +1121,10 @@ enum WsCommand {
     Duck {
         on: bool,
     },
+    Bus {
+        bus: Bus,
+        value: f32,
+    },
 }
 
 impl WsCommand {
@@ -1132,6 +1143,9 @@ impl WsCommand {
             WsCommand::StopScene => ControlAction::StopScene,
             WsCommand::Stinger { id } => ControlAction::PlayStinger(id),
             WsCommand::Duck { on } => ControlAction::Duck(on),
+            WsCommand::Bus { bus, value } => {
+                ControlAction::Mix(MixControl::SetBusVolume(bus, value))
+            }
         })
     }
 }
@@ -1402,6 +1416,81 @@ async fn ws_session(
             }
         }
     }
+}
+
+#[derive(Deserialize)]
+struct DuckQuery {
+    /// Shorthand for `mode=on` / `mode=off` (used when `mode` is absent).
+    on: Option<bool>,
+    /// `on`, `off`, `toggle`, `start` (hold) or `end`; default `toggle`.
+    mode: Option<String>,
+    /// `music`, `ambience`, `sfx`, `all` or `default` (the configured buses).
+    bus: Option<String>,
+    /// Level the buses are lowered to, `0.0..=1.0` (`on` only).
+    amount: Option<f32>,
+    attack_ms: Option<u32>,
+    release_ms: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct BusQuery {
+    bus: String,
+    value: f32,
+}
+
+fn bad_request(message: String) -> Response {
+    (StatusCode::BAD_REQUEST, message).into_response()
+}
+
+/// `POST /api/control/duck?mode=on|off|toggle|start|end&bus=...&amount=...`
+/// (or `?on=true|false`).
+async fn control_duck(
+    State(ctx): State<ControlContext>,
+    Extension(access): Extension<GmAccess>,
+    headers: HeaderMap,
+    Query(q): Query<DuckQuery>,
+) -> Response {
+    let default_mode = match q.on {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "toggle",
+    };
+    let mode_text = q.mode.as_deref().unwrap_or(default_mode);
+    let Some(mode) = DuckMode::parse(mode_text) else {
+        return bad_request(format!("unknown duck mode \"{mode_text}\""));
+    };
+    let bus_text = q.bus.as_deref().unwrap_or("default");
+    let Some(target) = DuckTarget::parse(bus_text) else {
+        return bad_request(format!("unknown bus \"{bus_text}\""));
+    };
+    let action = ControlAction::Mix(MixControl::Duck {
+        target,
+        mode,
+        amount: q.amount,
+        attack_ms: q.attack_ms,
+        release_ms: q.release_ms,
+    });
+    run(&ctx, access, &headers, action).await
+}
+
+/// `POST /api/control/bus?bus=music|ambience|sfx&value=0.0..1.0`
+async fn control_bus(
+    State(ctx): State<ControlContext>,
+    Extension(access): Extension<GmAccess>,
+    headers: HeaderMap,
+    Query(q): Query<BusQuery>,
+) -> Response {
+    let Some(bus) = parse_bus(&q.bus) else {
+        return bad_request(format!(
+            "unknown bus \"{}\" (try {}, {} or {})",
+            q.bus,
+            bus_name(Bus::Music),
+            bus_name(Bus::Ambience),
+            bus_name(Bus::Sfx)
+        ));
+    };
+    let action = ControlAction::Mix(MixControl::SetBusVolume(bus, q.value));
+    run(&ctx, access, &headers, action).await
 }
 
 /// The control page: a plain list of the library with play/stop, repeat and
