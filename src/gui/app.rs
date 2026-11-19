@@ -284,6 +284,8 @@ pub struct SoundSharedApp {
     pub(crate) gm: Option<crate::gui::gm_bridge::GmBridge>,
     /// REC button of the top bar (session recording).
     pub(crate) recorder: crate::gui::recorder_ui::RecorderUi,
+    /// First-run wizard card.
+    pub(crate) onboarding: crate::gui::onboarding::OnboardingUi,
 }
 
 /// Hand the Director the current scenes and the loaded library sounds.
@@ -475,6 +477,7 @@ impl SoundSharedApp {
             extras,
             gm: gm_link.map(|link| crate::gui::gm_bridge::GmBridge::attach(ctx, link)),
             recorder: crate::gui::recorder_ui::RecorderUi::new(ctx.clone()),
+            onboarding: Default::default(),
         };
 
         // Request initial server status

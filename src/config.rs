@@ -217,6 +217,11 @@ pub struct GuiConfig {
     /// [`GuiConfig::scale`], which also repairs hand-edited nonsense.
     #[serde(default = "default_ui_scale", skip_serializing_if = "is_default_scale")]
     pub ui_scale: f32,
+
+    /// The first-run wizard ("Getting started") was finished or dismissed for
+    /// good, or the config already had a library when the wizard was added.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub onboarding_done: bool,
 }
 
 /// Smallest interface scale the console offers.
@@ -252,6 +257,7 @@ impl Default for GuiConfig {
             check_updates: false,
             last_update_check: 0,
             ui_scale: default_ui_scale(),
+            onboarding_done: false,
         }
     }
 }

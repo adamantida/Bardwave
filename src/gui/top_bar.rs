@@ -86,6 +86,10 @@ pub fn top_bar(ui: &mut Ui, state: &mut SoundSharedApp) {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(Metrics::PANEL_PAD);
                 live_status(ui, state, density);
+                ui.add_space(Metrics::XL);
+                vertical_divider(ui);
+                ui.add_space(Metrics::XL);
+                crate::gui::onboarding::help_menu(ui, state);
             });
         },
     );
