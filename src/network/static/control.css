@@ -191,6 +191,13 @@ body:not([data-conn="online"]) main { opacity: 0.6; }
 .now-sub { font-size: 13px; color: var(--muted); min-height: 1.4em; }
 .transport { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--gap); }
 
+.progress { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.time { width: 3.2em; font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; flex: none; }
+.time:last-child { text-align: right; }
+.modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--gap); margin-top: var(--gap); }
+.duck-state { font-size: 13px; font-weight: 600; color: var(--warn); }
+.duck-state[hidden] { display: none; }
+
 /* ---- sliders ---- */
 .slider-row { display: flex; align-items: center; gap: 10px; }
 .pct {
@@ -247,6 +254,9 @@ input[type="range"]::-moz-range-thumb {
 .buses { display: grid; gap: 4px; }
 .bus { display: grid; grid-template-columns: 5.5em minmax(0, 1fr) auto; align-items: center; gap: 10px; }
 .bus label { font-size: 14px; font-weight: 600; }
+.bus[data-ducked="true"] label::after { content: " (ducked)"; color: var(--warn); font-weight: 500; font-size: 12px; }
+.bus[data-ducked="true"] input[type="range"]::-webkit-slider-runnable-track { background: var(--warn); opacity: 0.6; }
+.bus[data-ducked="true"] input[type="range"]::-moz-range-track { background: var(--warn); opacity: 0.6; }
 
 /* ---- sound list ---- */
 .sounds { display: grid; gap: var(--gap); }

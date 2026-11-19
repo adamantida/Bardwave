@@ -56,18 +56,30 @@
       <p class="now-title" id="nowTitle">Nothing playing</p>
       <p class="now-sub" id="nowSub"></p>
     </div>
+    <div class="progress">
+      <output class="time" id="plPos" for="plSeek">0:00</output>
+      <input type="range" min="0" max="1000" step="1" value="0" id="plSeek" aria-label="Track position" disabled>
+      <output class="time" id="plDur" for="plSeek">0:00</output>
+    </div>
     <div class="transport" role="group" aria-label="Playlist transport">
       <button type="button" class="btn" id="plPrev" aria-label="Previous track">Prev</button>
       <button type="button" class="btn primary" id="plToggle">Play</button>
       <button type="button" class="btn" id="plNext" aria-label="Next track">Next</button>
       <button type="button" class="btn" id="plStop">Stop</button>
     </div>
+    <div class="modes" role="group" aria-label="Playlist modes">
+      <button type="button" class="btn small" id="plShuffle" aria-pressed="false">Shuffle</button>
+      <button type="button" class="btn small" id="plRepeat" aria-label="Repeat mode">Repeat: all</button>
+    </div>
     <div class="grid lists" id="playlists"></div>
     <p class="note" id="plNote" hidden>Playlist control is not available on this server version.</p>
   </section>
 
   <section class="card" aria-labelledby="hBuses">
-    <h2 id="hBuses">Mixer</h2>
+    <div class="card-head">
+      <h2 id="hBuses">Mixer</h2>
+      <p class="duck-state" id="duckState" hidden></p>
+    </div>
     <div class="buses" id="buses"></div>
   </section>
 

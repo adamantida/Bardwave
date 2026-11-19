@@ -48,8 +48,24 @@
 //! Client to server, one object per frame with a `cmd` and an optional `req`:
 //! `ping`, `state`, `play{id}`, `stop{id}`, `volume{id,value}`,
 //! `loop{id,on}`, `master{value}`, `stop_all{fade_ms?}`, `scene{id}`,
-//! `stop_scene`, `stinger{id}`, `duck{on}`, `bus{bus,value}`. Anything else is answered with an
-//! `error`; the connection stays open.
+//! `stop_scene`, `stinger{id}`, `duck{on}`, `bus{bus,value}` and the music
+//! layer: `playlist_start{id}` (alias `playlist_play`), `playlist_stop`,
+//! `playlist_pause`, `playlist_resume`, `playlist_toggle`, `playlist_next`,
+//! `playlist_prev`, `playlist_seek{ms}`, `playlist_shuffle{on}`,
+//! `playlist_repeat{mode}` (`off`, `all`, `one`). Anything else is answered
+//! with an `error`; the connection stays open.
+//!
+//! The same playlist commands exist over REST as
+//! `POST /api/control/playlist/<start|stop|pause|resume|toggle|next|prev|seek|shuffle|repeat>`
+//! (`?id=`, `?ms=`, `?on=`, `?mode=` as the command needs).
+//!
+//! # The page and its data
+//!
+//! The page shell (`/control`, `/control.js`, `/control.css`) is static code
+//! with no secret in it and is served to anyone, so a reload of the page on a
+//! phone (whose address no longer carries the token) still opens. Everything
+//! that reads or changes the board (`/api/control/*`, `/ws/control`) needs
+//! the game-master token (or a local peer), as described above.
 //!
 //! The audio engine lives on the main thread (its CPAL stream is `!Send`), so
 //! the HTTP handlers only queue [`ControlCommand`]s and the main thread runs
@@ -77,8 +93,9 @@ use crate::audio::director::{Director, DirectorState, Playback};
 use crate::audio::director_audio::{
     bus_name, parse_bus, DuckMode, DuckTarget, GainUpdate, MixControl,
 };
+use crate::audio::playlist::{PlaylistCommand, PlaylistState};
 use crate::audio::{AudioEngine, CatalogSound, SoundId};
-use crate::config::{AudioConfig, Bus, LibraryConfig};
+use crate::config::{AudioConfig, Bus, LibraryConfig, RepeatMode};
 use crate::network::access::{
     GmAccess, GmAuth, GmDenied, GmGuard, CLOSE_GM_TOKEN_REVOKED, GM_PARAM,
 };
@@ -148,6 +165,36 @@ pub struct ControlScene {
     pub active: bool,
 }
 
+/// Volume of every bus, as last set (`bus` command), `0.0..=1.0`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ControlBuses {
+    pub music: f32,
+    pub ambience: f32,
+    pub sfx: f32,
+}
+
+impl Default for ControlBuses {
+    fn default() -> Self {
+        Self {
+            music: 1.0,
+            ambience: 1.0,
+            sfx: 1.0,
+        }
+    }
+}
+
+/// The music layer as the control page sees it: the playlist player's state
+/// plus a label for the current track.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlPlaylistState {
+    /// Status, current track (`title` / `artist` tags), position and length
+    /// (in milliseconds, position rounded down to a second), shuffle, repeat.
+    #[serde(flatten)]
+    pub state: PlaylistState,
+    /// "Artist - Title" from the tags, the sound's name when it has none.
+    pub label: Option<String>,
+}
+
 /// Board snapshot returned by every call.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct BoardState {
@@ -165,6 +212,16 @@ pub struct BoardState {
     /// Whether the background buses are ducked right now (`duck` command).
     #[serde(default)]
     pub ducked: bool,
+    /// Names (`music`, `ambience`, `sfx`) of the buses that are ducked now.
+    #[serde(default)]
+    pub ducked_buses: Vec<String>,
+    /// Volume of every bus.
+    #[serde(default)]
+    pub buses: ControlBuses,
+    /// The music layer (always present from a board; absent from an older
+    /// server, which is how the page tells the two apart).
+    #[serde(default)]
+    pub playlist: Option<ControlPlaylistState>,
 }
 
 /// A state together with its revision, as the feed carries it.
@@ -248,6 +305,8 @@ pub enum ControlAction {
     Duck(bool),
     /// A bus volume or ducking request.
     Mix(MixControl),
+    /// A command for the music layer (start, pause, seek, ...).
+    Playlist(PlaylistCommand),
 }
 
 /// One queued action plus where to send the resulting board state.
@@ -270,6 +329,8 @@ pub struct Board {
 }
 
 struct BoardSound {
+    /// Library id (what playlists list their tracks by).
+    library_id: String,
     name: String,
     group: Option<String>,
     sound_id: SoundId,
@@ -337,13 +398,14 @@ impl Board {
                     .find(|g| &g.id == id)
                     .map(|g| g.name.clone())
             });
+            // An entry from a hand-built config may have no id yet.
+            let library_id = if entry.id.is_empty() {
+                format!("sound-{index}")
+            } else {
+                entry.id.clone()
+            };
             catalog.push(CatalogSound {
-                // An entry from a hand-built config may have no id yet.
-                id: if entry.id.is_empty() {
-                    format!("sound-{index}")
-                } else {
-                    entry.id.clone()
-                },
+                id: library_id.clone(),
                 sound: sound_id,
                 volume,
                 looped: entry.looped,
@@ -352,6 +414,7 @@ impl Board {
                 stinger: entry.oneshot_stinger,
             });
             sounds.push(BoardSound {
+                library_id,
                 name: display_name(entry),
                 group,
                 sound_id,
@@ -362,6 +425,7 @@ impl Board {
         }
         let mut director = Director::new();
         director.sync_library(library.scenes.clone(), catalog);
+        director.set_playlists(library.playlists.clone());
         let playlists = library
             .playlists
             .iter()
@@ -544,6 +608,10 @@ impl Board {
                 .director
                 .run_mix_control(pb, control)
                 .map_err(|e| e.to_string())?,
+            ControlAction::Playlist(command) => self
+                .director
+                .playlist_command(pb, command)
+                .map_err(|e| e.to_string())?,
         }
         Ok(self.publish(pb))
     }
@@ -570,6 +638,11 @@ impl Board {
 
     fn state<P: Playback + ?Sized>(&self, pb: &P) -> BoardState {
         let (scenes, active_scene) = self.scenes_view();
+        let ducked_buses: Vec<String> = [Bus::Music, Bus::Ambience, Bus::Sfx]
+            .into_iter()
+            .filter(|bus| self.director.is_ducked(*bus))
+            .map(|bus| bus_name(bus).to_string())
+            .collect();
         BoardState {
             sounds: self
                 .sounds
@@ -589,10 +662,36 @@ impl Board {
             scenes,
             active_scene,
             playlists: self.playlists.clone(),
-            ducked: [Bus::Music, Bus::Ambience, Bus::Sfx]
-                .into_iter()
-                .any(|bus| self.director.is_ducked(bus)),
+            ducked: !ducked_buses.is_empty(),
+            ducked_buses,
+            buses: ControlBuses {
+                music: self.director.bus_volume(Bus::Music),
+                ambience: self.director.bus_volume(Bus::Ambience),
+                sfx: self.director.bus_volume(Bus::Sfx),
+            },
+            playlist: Some(self.playlist_view()),
         }
+    }
+
+    /// The music layer for the page. The position is rounded down to a second
+    /// so a playing track publishes once a second, not on every tick.
+    fn playlist_view(&self) -> ControlPlaylistState {
+        let mut state = self.director.playlist_state();
+        state.position_ms -= state.position_ms % 1000;
+        if state.playlist.is_none() {
+            // The player's idle defaults settle after its first tick; do not
+            // let that read as a change of state.
+            state.crossfade_ms = 0;
+        }
+        let label = state.track.as_ref().map(|track| {
+            let fallback = self
+                .sounds
+                .iter()
+                .find(|s| &s.library_id == track)
+                .map_or(track.as_str(), |s| s.name.as_str());
+            state.label(fallback)
+        });
+        ControlPlaylistState { state, label }
     }
 }
 
@@ -699,7 +798,6 @@ pub fn router(commands: Sender<ControlCommand>) -> Router {
 /// server router.
 pub fn routes(ctx: ControlContext) -> Router {
     let guarded = Router::new()
-        .route("/control", get(control_page))
         .route("/ws/control", get(control_ws))
         .route("/api/control/state", get(control_state))
         .route("/api/control/play", post(control_play))
@@ -714,18 +812,22 @@ pub fn routes(ctx: ControlContext) -> Router {
         .route("/api/control/stinger", post(control_stinger))
         .route("/api/control/duck", post(control_duck))
         .route("/api/control/bus", post(control_bus))
+        .route("/api/control/playlist/:verb", post(control_playlist))
         .route_layer(middleware::from_fn_with_state(ctx.clone(), gm_gate))
         // The token can sit in the URL: keep it out of caches and Referer.
         .layer(middleware::map_response(private_headers))
         .with_state(ctx);
 
-    let mut assets = Router::new();
+    // The shell holds code only; the token never reaches it (see the module
+    // docs), so it needs no gate. Its data does.
+    let mut assets = Router::new().route("/control", get(control_page));
     for &(path, content_type, body) in PANEL_ASSETS {
         assets = assets.route(
             path,
             get(move || async move { ([(header::CONTENT_TYPE, content_type)], body) }),
         );
     }
+    let assets = assets.layer(middleware::map_response(private_headers));
     guarded.merge(assets)
 }
 
@@ -1165,6 +1267,25 @@ enum WsCommand {
         bus: Bus,
         value: f32,
     },
+    #[serde(alias = "playlist_play")]
+    PlaylistStart {
+        id: String,
+    },
+    PlaylistStop,
+    PlaylistPause,
+    PlaylistResume,
+    PlaylistToggle,
+    PlaylistNext,
+    PlaylistPrev,
+    PlaylistSeek {
+        ms: u64,
+    },
+    PlaylistShuffle {
+        on: bool,
+    },
+    PlaylistRepeat {
+        mode: RepeatMode,
+    },
 }
 
 impl WsCommand {
@@ -1183,11 +1304,29 @@ impl WsCommand {
             WsCommand::StopScene => ControlAction::StopScene,
             WsCommand::Stinger { id } => ControlAction::PlayStinger(id),
             WsCommand::Duck { on } => ControlAction::Duck(on),
-            WsCommand::Bus { bus, value } => {
-                ControlAction::Mix(MixControl::SetBusVolume(bus, value))
-            }
+            WsCommand::Bus { bus, value } => bus_action(bus, value),
+            WsCommand::PlaylistStart { id } => playlist_action(PlaylistCommand::Start(id)),
+            WsCommand::PlaylistStop => playlist_action(PlaylistCommand::Stop),
+            WsCommand::PlaylistPause => playlist_action(PlaylistCommand::Pause),
+            WsCommand::PlaylistResume => playlist_action(PlaylistCommand::Resume),
+            WsCommand::PlaylistToggle => playlist_action(PlaylistCommand::TogglePause),
+            WsCommand::PlaylistNext => playlist_action(PlaylistCommand::Next),
+            WsCommand::PlaylistPrev => playlist_action(PlaylistCommand::Prev),
+            WsCommand::PlaylistSeek { ms } => playlist_action(PlaylistCommand::Seek(ms)),
+            WsCommand::PlaylistShuffle { on } => playlist_action(PlaylistCommand::SetShuffle(on)),
+            WsCommand::PlaylistRepeat { mode } => playlist_action(PlaylistCommand::SetRepeat(mode)),
         })
     }
+}
+
+fn playlist_action(command: PlaylistCommand) -> ControlAction {
+    ControlAction::Playlist(command)
+}
+
+/// A bus volume request. A value outside `0..=1` is refused by the Director
+/// (and so answered with an error), not silently clamped.
+fn bus_action(bus: Bus, value: f32) -> ControlAction {
+    ControlAction::Mix(MixControl::SetBusVolume(bus, value))
 }
 
 /// One slot of the client budget, given back on drop.
@@ -1529,8 +1668,58 @@ async fn control_bus(
             bus_name(Bus::Sfx)
         ));
     };
-    let action = ControlAction::Mix(MixControl::SetBusVolume(bus, q.value));
-    run(&ctx, access, &headers, action).await
+    run(&ctx, access, &headers, bus_action(bus, q.value)).await
+}
+
+#[derive(Deserialize)]
+struct PlaylistQuery {
+    /// Playlist library id (`start`).
+    id: Option<String>,
+    /// Position in milliseconds (`seek`).
+    ms: Option<u64>,
+    /// Switch (`shuffle`).
+    on: Option<bool>,
+    /// `off`, `all` or `one` (`repeat`).
+    mode: Option<String>,
+}
+
+/// The playlist command a REST `verb` and its query stand for.
+fn playlist_from_rest(verb: &str, q: PlaylistQuery) -> Result<PlaylistCommand, String> {
+    let missing = |what: &str| format!("playlist/{verb} needs {what}");
+    Ok(match verb {
+        "start" | "play" => PlaylistCommand::Start(q.id.ok_or_else(|| missing("?id="))?),
+        "stop" => PlaylistCommand::Stop,
+        "pause" => PlaylistCommand::Pause,
+        "resume" => PlaylistCommand::Resume,
+        "toggle" => PlaylistCommand::TogglePause,
+        "next" => PlaylistCommand::Next,
+        "prev" => PlaylistCommand::Prev,
+        "seek" => PlaylistCommand::Seek(q.ms.ok_or_else(|| missing("?ms="))?),
+        "shuffle" => PlaylistCommand::SetShuffle(q.on.ok_or_else(|| missing("?on="))?),
+        "repeat" => {
+            let mode = q.mode.ok_or_else(|| missing("?mode="))?;
+            let parsed = serde_json::from_value::<RepeatMode>(serde_json::Value::String(
+                mode.to_ascii_lowercase(),
+            ))
+            .map_err(|_| format!("unknown repeat mode \"{mode}\" (try off, all or one)"))?;
+            PlaylistCommand::SetRepeat(parsed)
+        }
+        other => return Err(format!("unknown playlist command \"{other}\"")),
+    })
+}
+
+/// `POST /api/control/playlist/<verb>` (see the module docs).
+async fn control_playlist(
+    State(ctx): State<ControlContext>,
+    Extension(access): Extension<GmAccess>,
+    headers: HeaderMap,
+    axum::extract::Path(verb): axum::extract::Path<String>,
+    Query(q): Query<PlaylistQuery>,
+) -> Response {
+    match playlist_from_rest(&verb, q) {
+        Ok(command) => run(&ctx, access, &headers, playlist_action(command)).await,
+        Err(message) => bad_request(message),
+    }
 }
 
 #[cfg(test)]
