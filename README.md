@@ -566,6 +566,16 @@ Honest list of what is **not** done yet:
 
 Ideas, bug reports and pull requests are welcome.
 
+## Documentation
+
+Full guides live in [`docs/`](docs/README.md), which is the index of all documents:
+
+- [English](docs/README.md#english) (source of truth, checked against the code)
+- [Русский](docs/README.md#русский)
+- [简体中文](docs/README.md#简体中文) (checked by language models, not by a native speaker; corrections are welcome)
+
+Terminology for translators: [`docs/GLOSSARY.md`](docs/GLOSSARY.md).
+
 ## Contributing
 
 - Open an issue describing the bug or the feature before a large PR.
