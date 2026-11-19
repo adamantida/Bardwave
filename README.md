@@ -274,6 +274,7 @@ file_logging = false # true: also write bardwave.log into the data directory
 [gui]
 reduce_motion = false    # stop the pulsing dot and backdrop animation
 global_hotkeys = false   # let [[hotkeys]] fire while the window is not focused
+check_updates = false    # once a day at start, ask GitHub for a newer release (off = no network use)
 
 [library]              # managed by the app — your sounds, groups, scenes, playlists
 ```

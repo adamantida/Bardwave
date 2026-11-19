@@ -13,6 +13,7 @@ pub mod library_query;
 pub mod library_scan;
 pub mod network;
 pub mod paths;
+pub mod updates;
 
 /// SoundShared version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

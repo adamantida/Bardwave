@@ -46,6 +46,8 @@ pub struct ConsoleExtras {
     pub mix: MixUi,
     /// Game-master link (QR, confirmation).
     pub gm: GmLinkUi,
+    /// Update check (off by default, see `crate::updates`).
+    pub updates: crate::updates::UpdateChecker,
 }
 
 impl ConsoleExtras {
@@ -56,6 +58,7 @@ impl ConsoleExtras {
             hotkeys: HotkeyUi::start(ctx, app_state, library),
             mix: MixUi::default(),
             gm: GmLinkUi::default(),
+            updates: crate::updates::UpdateChecker::new(),
         }
     }
 }
