@@ -22,6 +22,9 @@ use self::device_adapter::{DeviceAdapter, StreamResampler};
 use crate::audio::decoder::{
     AudioDecoder, DecodedAudio, DecoderError, TrackMeta, TARGET_CHANNELS, TARGET_SAMPLE_RATE,
 };
+use crate::audio::devices::{
+    self, pick_output_device, plan_preview_route, DevicePick, OutputSelection, PreviewPlan,
+};
 use crate::audio::mixer::{AudioMixer, Bus, DuckSettings, FadeCurve, MixedOutput, MixerConfig};
 use crate::audio::stream_source::{
     should_stream, StreamEvent, StreamSource, DEFAULT_STREAM_THRESHOLD_SECS,
@@ -479,6 +482,12 @@ pub(crate) struct AudioEngineInner {
     next_track_id: AtomicU64,
     /// How `[audio]` wants the local device opened (read at `start_output`).
     device_prefs: parking_lot::Mutex<DevicePrefs>,
+    /// Which devices `[audio]` selects (read at `start_output`).
+    output_selection: parking_lot::Mutex<OutputSelection>,
+    /// Stream of the separate preview device (headphones), when one is open.
+    preview_stream: Mutex<Option<cpal::Stream>>,
+    /// State of the preview output; shared with its stream callbacks.
+    preview_output: Arc<parking_lot::RwLock<LocalOutputStatus>>,
 }
 
 // Manual Debug implementation since cpal::Stream doesn't implement Debug
@@ -564,6 +573,9 @@ impl AudioEngine {
             master_volume: Arc::new(parking_lot::Mutex::new(1.0)),
             next_track_id: AtomicU64::new(0),
             device_prefs: parking_lot::Mutex::new(DevicePrefs::default()),
+            output_selection: parking_lot::Mutex::new(OutputSelection::default()),
+            preview_stream: Mutex::new(None),
+            preview_output: Arc::new(parking_lot::RwLock::new(LocalOutputStatus::stopped())),
         });
 
         Ok(Self { inner })
@@ -572,6 +584,18 @@ impl AudioEngine {
     /// Choose how the local device is opened by the next `start_output`.
     pub fn set_device_prefs(&self, prefs: DevicePrefs) {
         *self.inner.device_prefs.lock() = prefs;
+    }
+
+    /// Choose the output and preview devices used by the next `start_output`
+    /// (or by [`apply_output_selection`](Self::apply_output_selection) on a
+    /// running engine).
+    pub fn set_output_selection(&self, selection: OutputSelection) {
+        *self.inner.output_selection.lock() = selection;
+    }
+
+    /// The device selection currently in force.
+    pub fn output_selection(&self) -> OutputSelection {
+        self.inner.output_selection.lock().clone()
     }
 
     /// Create a new audio engine with custom mixer config and broadcast channel
@@ -595,6 +619,9 @@ impl AudioEngine {
             master_volume: Arc::new(parking_lot::Mutex::new(1.0)),
             next_track_id: AtomicU64::new(0),
             device_prefs: parking_lot::Mutex::new(DevicePrefs::default()),
+            output_selection: parking_lot::Mutex::new(OutputSelection::default()),
+            preview_stream: Mutex::new(None),
+            preview_output: Arc::new(parking_lot::RwLock::new(LocalOutputStatus::stopped())),
         });
 
         Ok(Self { inner })
@@ -618,25 +645,217 @@ impl AudioEngine {
     /// device that merely lacks a 48 kHz mode used to fail here, which silently
     /// degraded the app to headless mode — the browser kept playing while the
     /// desktop stayed silent.
+    ///
+    /// The device comes from [`set_output_selection`](Self::set_output_selection):
+    /// `None` is the system default; a named device that is missing or cannot be
+    /// opened falls back to the default and the status `reason` says so. A
+    /// configured preview device is opened as a second stream (see
+    /// [`preview_output_status`](Self::preview_output_status)).
     pub fn start_output(&self) -> Result<(), EngineError> {
         if self.inner.running.load(Ordering::Acquire) {
             warn!("Audio engine already running");
             return Ok(());
         }
 
-        let host = cpal::default_host();
-        let device = match host.default_output_device() {
-            Some(device) => device,
-            None => {
-                self.record_local_output_failure(None, 0, 0, "none", "no default output device");
-                return Err(EngineError::NoDevice);
-            }
+        let selection = self.inner.output_selection.lock().clone();
+        let prefs = *self.inner.device_prefs.lock();
+
+        // Enumerating devices is only needed when a device is picked by name;
+        // the plain "system default" path stays as light as it always was.
+        let enumerated = (selection.output.is_some() || selection.preview.is_some())
+            .then(devices::output_devices_by_name);
+        let pick = match &enumerated {
+            Some((_, infos)) => pick_output_device(infos, selection.output.as_deref()),
+            None => DevicePick::Default,
         };
 
-        let device_name = device
-            .name()
-            .unwrap_or_else(|_| "<unknown device>".to_string());
-        info!("Using audio device: {device_name}");
+        // Attempts in order: the named device (when found), then the system
+        // default. A device that cannot be opened falls back like a missing one.
+        let mut fallback_note = pick.fallback_message();
+        let named_index = match pick {
+            DevicePick::Named(index) => Some(index),
+            _ => None,
+        };
+        let default_device = cpal::default_host().default_output_device();
+        let mut attempts: Vec<(&cpal::Device, bool)> = Vec::new();
+        if let (Some(index), Some((devices, _))) = (named_index, &enumerated) {
+            attempts.push((&devices[index], false));
+        }
+        if let Some(device) = default_device.as_ref() {
+            attempts.push((device, true));
+        }
+        if attempts.is_empty() {
+            self.record_local_output_failure(None, 0, 0, "none", "no default output device");
+            return Err(EngineError::NoDevice);
+        }
+
+        let mut opened = None;
+        let mut last_failure = None;
+        let attempt_count = attempts.len();
+        for (index, (device, is_default)) in attempts.into_iter().enumerate() {
+            match self.open_stream(device, &prefs, StreamRole::Main) {
+                Ok(stream) => {
+                    opened = Some(stream);
+                    break;
+                }
+                Err(failure) => {
+                    warn!(
+                        "Could not open output device {}: {}",
+                        failure.device_name, failure.error
+                    );
+                    if index + 1 < attempt_count && !is_default {
+                        fallback_note = Some(format!(
+                            "could not open \"{}\" ({}); using the system default",
+                            failure.device_name, failure.error
+                        ));
+                    }
+                    last_failure = Some(failure);
+                }
+            }
+        }
+        let Some(OpenedStream {
+            stream,
+            device_name,
+            adapter,
+            sample_format,
+            reason,
+        }) = opened
+        else {
+            let failure = last_failure.expect("at least one attempt was made");
+            self.record_local_output_failure(
+                Some(failure.device_name),
+                failure.sample_rate,
+                failure.channels,
+                &failure.sample_format,
+                failure.error.to_string(),
+            );
+            return Err(failure.error);
+        };
+
+        // Mark the engine running before starting the stream so the first
+        // callback already mixes instead of emitting one silent buffer.
+        self.inner.running.store(true, Ordering::Release);
+        if let Err(e) = stream.play() {
+            self.inner.running.store(false, Ordering::Release);
+            self.record_local_output_failure(
+                Some(device_name),
+                adapter.sample_rate,
+                adapter.channels,
+                &sample_format.to_string(),
+                format!("failed to start the output stream: {e}"),
+            );
+            return Err(e.into());
+        }
+
+        *self.inner.stream.lock().unwrap() = Some(stream);
+
+        *self.inner.local_output.write() = LocalOutputStatus {
+            state: LocalOutputState::Running,
+            device: Some(device_name.clone()),
+            sample_rate: adapter.sample_rate,
+            channels: adapter.channels,
+            sample_format: sample_format.to_string(),
+            reason: join_reasons(fallback_note, reason),
+        };
+
+        self.route_preview(&selection, enumerated.as_ref(), &device_name, &prefs);
+
+        info!("Audio engine started successfully (device-driven mixer)");
+        Ok(())
+    }
+
+    /// Open the preview device (headphones) when one is configured and differs
+    /// from the main output; otherwise previews stay on the main output.
+    ///
+    /// Never fails the engine: a missing or broken preview device is recorded in
+    /// [`preview_output_status`](Self::preview_output_status) and previews play
+    /// on the main output as before.
+    fn route_preview(
+        &self,
+        selection: &OutputSelection,
+        enumerated: Option<&EnumeratedDevices>,
+        main_name: &str,
+        prefs: &DevicePrefs,
+    ) {
+        self.inner.mixer.set_preview_external(false);
+        *self.inner.preview_output.write() = LocalOutputStatus::stopped();
+        let Some((devices, infos)) = enumerated else {
+            return;
+        };
+        if selection.preview.is_none() {
+            return;
+        }
+
+        let failed = |name: Option<String>, message: String| {
+            warn!("Preview output unavailable: {message}");
+            *self.inner.preview_output.write() = LocalOutputStatus {
+                state: LocalOutputState::Failed(message.clone()),
+                device: name,
+                reason: Some(message),
+                ..LocalOutputStatus::stopped()
+            };
+        };
+
+        let index = match plan_preview_route(infos, main_name, selection.preview.as_deref()) {
+            PreviewPlan::SharedWithMain => return,
+            PreviewPlan::Unavailable(message) => {
+                failed(selection.preview.clone(), message);
+                return;
+            }
+            PreviewPlan::Separate(index) => index,
+        };
+
+        match self.open_stream(&devices[index], prefs, StreamRole::Preview) {
+            Ok(opened) => {
+                // The main callback stops rendering previews before the second
+                // device starts doing it.
+                self.inner.mixer.set_preview_external(true);
+                if let Err(e) = opened.stream.play() {
+                    self.inner.mixer.set_preview_external(false);
+                    failed(
+                        Some(opened.device_name),
+                        format!(
+                            "could not start the preview stream: {e}; previews play on the main output"
+                        ),
+                    );
+                    return;
+                }
+                *self.inner.preview_stream.lock().unwrap() = Some(opened.stream);
+                *self.inner.preview_output.write() = LocalOutputStatus {
+                    state: LocalOutputState::Running,
+                    device: Some(opened.device_name),
+                    sample_rate: opened.adapter.sample_rate,
+                    channels: opened.adapter.channels,
+                    sample_format: opened.sample_format.to_string(),
+                    reason: opened.reason,
+                };
+            }
+            Err(failure) => failed(
+                Some(failure.device_name),
+                format!(
+                    "could not open the preview device: {}; previews play on the main output",
+                    failure.error
+                ),
+            ),
+        }
+    }
+
+    /// Plan and build a stream on `device` (not yet playing).
+    fn open_stream(
+        &self,
+        device: &cpal::Device,
+        prefs: &DevicePrefs,
+        role: StreamRole,
+    ) -> Result<OpenedStream, OpenFailure> {
+        let device_name = devices::name_of(device);
+        info!("Using audio device ({role:?}): {device_name}");
+        let fail = |sample_rate, channels, format: &str, error: EngineError| OpenFailure {
+            device_name: device_name.clone(),
+            sample_rate,
+            channels,
+            sample_format: format.to_string(),
+            error,
+        };
 
         // An enumeration failure is not fatal: the device default config below
         // is still usable, and the policy below handles an empty list.
@@ -648,14 +867,8 @@ impl AudioEngine {
             }
         };
 
-        let prefs = *self.inner.device_prefs.lock();
-        let (chosen, reason) = match Self::choose_output_config(&device, &supported, &prefs) {
-            Ok(chosen) => chosen,
-            Err(e) => {
-                self.record_local_output_failure(Some(device_name), 0, 0, "none", e.to_string());
-                return Err(e);
-            }
-        };
+        let (chosen, reason) = Self::choose_output_config(device, &supported, prefs)
+            .map_err(|e| fail(0, 0, "none", e))?;
 
         let sample_format = chosen.sample_format();
         let adapter = DeviceAdapter::new(chosen.sample_rate().0, chosen.channels());
@@ -684,128 +897,71 @@ impl AudioEngine {
         // stereo staging buffer, publishes that exact buffer to the network
         // forwarder and then converts it for the device. No intermediate 10 ms
         // channel and no `thread::sleep` timing, both of which caused underruns.
-        let mixer = Arc::clone(&self.inner.mixer);
-        let running = Arc::clone(&self.inner.running);
-        let status = Arc::clone(&self.inner.local_output);
-
-        let stream = match sample_format {
-            SampleFormat::F32 => build_adapted_stream::<f32>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::I16 => build_adapted_stream::<i16>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::U16 => build_adapted_stream::<u16>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::I32 => build_adapted_stream::<i32>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::I8 => {
-                build_adapted_stream::<i8>(&device, &stream_config, adapter, mixer, running, status)
-            }
-            SampleFormat::U8 => {
-                build_adapted_stream::<u8>(&device, &stream_config, adapter, mixer, running, status)
-            }
-            SampleFormat::I64 => build_adapted_stream::<i64>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::U64 => build_adapted_stream::<u64>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::U32 => build_adapted_stream::<u32>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::F64 => build_adapted_stream::<f64>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            other => Err(EngineError::UnsupportedFormat(format!(
-                "device sample format {other} is not supported by this build"
-            ))),
+        let status = match role {
+            StreamRole::Main => Arc::clone(&self.inner.local_output),
+            StreamRole::Preview => Arc::clone(&self.inner.preview_output),
         };
-
-        let stream = match stream {
-            Ok(stream) => stream,
-            Err(e) => {
-                self.record_local_output_failure(
-                    Some(device_name),
-                    adapter.sample_rate,
-                    adapter.channels,
-                    &sample_format.to_string(),
-                    e.to_string(),
-                );
-                return Err(e);
-            }
-        };
-
-        // Mark the engine running before starting the stream so the first
-        // callback already mixes instead of emitting one silent buffer.
-        self.inner.running.store(true, Ordering::Release);
-        if let Err(e) = stream.play() {
-            self.inner.running.store(false, Ordering::Release);
-            self.record_local_output_failure(
-                Some(device_name),
+        let stream = build_stream_for_format(
+            device,
+            &stream_config,
+            sample_format,
+            adapter,
+            Arc::clone(&self.inner.mixer),
+            Arc::clone(&self.inner.running),
+            status,
+            role,
+        )
+        .map_err(|e| {
+            fail(
                 adapter.sample_rate,
                 adapter.channels,
                 &sample_format.to_string(),
-                format!("failed to start the output stream: {e}"),
-            );
-            return Err(e.into());
+                e,
+            )
+        })?;
+
+        Ok(OpenedStream {
+            stream,
+            device_name,
+            adapter,
+            sample_format,
+            reason,
+        })
+    }
+
+    /// Switch the output (and preview) device of a running engine without
+    /// restarting the application.
+    ///
+    /// The streams are stopped and opened again on the new selection; tracks,
+    /// their positions and volumes live in the mixer and carry on. A device that
+    /// is gone falls back to the system default, and when no device opens at all
+    /// the engine continues headless (network only). The outcome is in the
+    /// returned status (its `reason` says what fell back); `Err` is returned only
+    /// when not even the headless loop can start.
+    ///
+    /// On an engine that has not been started this just stores the selection.
+    pub fn apply_output_selection(
+        &self,
+        selection: OutputSelection,
+    ) -> Result<LocalOutputStatus, EngineError> {
+        self.set_output_selection(selection);
+        if !self.is_running() {
+            return Ok(self.local_output_status());
         }
 
-        *self.inner.stream.lock().unwrap() = Some(stream);
+        self.stop_output()?;
+        if let Err(e) = self.start_output() {
+            let reason = format!("local output unavailable: {e}");
+            self.start_headless_output_with_reason(reason)?;
+        }
+        Ok(self.local_output_status())
+    }
 
-        *self.inner.local_output.write() = LocalOutputStatus {
-            state: LocalOutputState::Running,
-            device: Some(device_name),
-            sample_rate: adapter.sample_rate,
-            channels: adapter.channels,
-            sample_format: sample_format.to_string(),
-            reason,
-        };
-
-        info!("Audio engine started successfully (device-driven mixer)");
-        Ok(())
+    /// State of the separate preview output: `Running` on its own device,
+    /// `Failed` when the configured device could not be used (previews then play
+    /// on the main output), `Stopped` when previews share the main output.
+    pub fn preview_output_status(&self) -> LocalOutputStatus {
+        self.inner.preview_output.read().clone()
     }
 
     /// Ask the device what it offers, then apply the pure selection policy.
@@ -902,6 +1058,17 @@ impl AudioEngine {
             reason,
         };
 
+        // A preview device can still work without a main one.
+        let selection = self.inner.output_selection.lock().clone();
+        if selection.preview.is_some() {
+            let prefs = *self.inner.device_prefs.lock();
+            let enumerated = devices::output_devices_by_name();
+            self.route_preview(&selection, Some(&enumerated), "", &prefs);
+        } else {
+            self.inner.mixer.set_preview_external(false);
+            *self.inner.preview_output.write() = LocalOutputStatus::stopped();
+        }
+
         Ok(())
     }
 
@@ -920,8 +1087,11 @@ impl AudioEngine {
             // Drop the stream to stop it (pause() returns PauseStreamError not in EngineError)
             drop(stream);
         }
+        drop(self.inner.preview_stream.lock().unwrap().take());
+        self.inner.mixer.set_preview_external(false);
 
         *self.inner.local_output.write() = LocalOutputStatus::stopped();
+        *self.inner.preview_output.write() = LocalOutputStatus::stopped();
 
         info!("Audio engine stopped");
         Ok(())
@@ -1652,10 +1822,46 @@ impl AudioEngine {
     }
 }
 
-/// Rate to try first for a stereo f32 device that cannot run at 48 kHz.
-///
-/// The device's own default rate is preferred when the range allows it; the
-/// closest in-range rate to 48 kHz is the fallback.
+/// Which output a cpal stream feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamRole {
+    /// The main output: mixes, publishes to the network, plays previews unless a
+    /// second device has them.
+    Main,
+    /// The headphone device: plays only the previews.
+    Preview,
+}
+
+/// Devices of the host with their names (parallel lists).
+type EnumeratedDevices = (Vec<cpal::Device>, Vec<devices::OutputDeviceInfo>);
+
+/// A stream built on a device, not yet playing.
+struct OpenedStream {
+    stream: cpal::Stream,
+    device_name: String,
+    adapter: DeviceAdapter,
+    sample_format: SampleFormat,
+    /// Why the device format differs from the mix, when it does.
+    reason: Option<String>,
+}
+
+/// Why a stream could not be built, with what is known about the attempt.
+struct OpenFailure {
+    device_name: String,
+    sample_rate: u32,
+    channels: u16,
+    sample_format: String,
+    error: EngineError,
+}
+
+/// Join two optional status notes with `"; "`.
+fn join_reasons(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    }
+}
+
 /// What the `[audio]` section asks of the local output device.
 ///
 /// The mix and the network stream are always 48 kHz stereo (that is the wire
@@ -1733,6 +1939,10 @@ impl DevicePrefs {
     }
 }
 
+/// Rate to try first for a stereo f32 device that cannot run at 48 kHz.
+///
+/// The device's own default rate is preferred when the range allows it; the
+/// closest in-range rate to 48 kHz is the fallback.
 fn preferred_rate(
     range: &SupportedStreamConfigRange,
     device_default: Option<&SupportedStreamConfig>,
@@ -1853,6 +2063,17 @@ trait MixWriter: cpal::SizedSample + FromSample<f32> {
         data: &mut [Self],
         adapter: DeviceAdapter,
     ) -> bool;
+
+    /// Fill `data` with the previews alone, for the headphone device. Nothing is
+    /// published: players never hear previews.
+    fn mix_preview(
+        mixer: &AudioMixer,
+        resampler: &mut StreamResampler,
+        data: &mut [Self],
+        adapter: DeviceAdapter,
+    ) -> bool {
+        resampler.render(data, adapter, |fresh| mixer.mix_preview_into(fresh))
+    }
 }
 
 impl MixWriter for f32 {
@@ -1922,6 +2143,40 @@ where
     })
 }
 
+/// Build the stream for the sample format the device was opened with.
+#[allow(clippy::too_many_arguments)]
+fn build_stream_for_format(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    adapter: DeviceAdapter,
+    mixer: Arc<AudioMixer>,
+    running: Arc<AtomicBool>,
+    status: Arc<parking_lot::RwLock<LocalOutputStatus>>,
+    role: StreamRole,
+) -> Result<cpal::Stream, EngineError> {
+    macro_rules! build {
+        ($ty:ty) => {
+            build_adapted_stream::<$ty>(device, config, adapter, mixer, running, status, role)
+        };
+    }
+    match sample_format {
+        SampleFormat::F32 => build!(f32),
+        SampleFormat::I16 => build!(i16),
+        SampleFormat::U16 => build!(u16),
+        SampleFormat::I32 => build!(i32),
+        SampleFormat::I8 => build!(i8),
+        SampleFormat::U8 => build!(u8),
+        SampleFormat::I64 => build!(i64),
+        SampleFormat::U64 => build!(u64),
+        SampleFormat::U32 => build!(u32),
+        SampleFormat::F64 => build!(f64),
+        other => Err(EngineError::UnsupportedFormat(format!(
+            "device sample format {other} is not supported by this build"
+        ))),
+    }
+}
+
 /// Build the output stream for one device sample format.
 ///
 /// Tries the requested buffer size first and retries with the device default,
@@ -1934,12 +2189,14 @@ fn build_adapted_stream<T>(
     mixer: Arc<AudioMixer>,
     running: Arc<AtomicBool>,
     status: Arc<parking_lot::RwLock<LocalOutputStatus>>,
+    role: StreamRole,
 ) -> Result<cpal::Stream, EngineError>
 where
     T: MixWriter,
 {
     let build = |config: &StreamConfig| -> Result<cpal::Stream, cpal::BuildStreamError> {
         let mixer = Arc::clone(&mixer);
+        let error_mixer = Arc::clone(&mixer);
         let running = Arc::clone(&running);
         let status = Arc::clone(&status);
 
@@ -1957,13 +2214,26 @@ where
                     return;
                 }
 
-                T::mix_and_publish(&mixer, &mut resampler, data, adapter);
+                match role {
+                    StreamRole::Main => {
+                        T::mix_and_publish(&mixer, &mut resampler, data, adapter);
+                    }
+                    StreamRole::Preview => {
+                        T::mix_preview(&mixer, &mut resampler, data, adapter);
+                    }
+                }
             },
             move |err| {
                 // A stream error ends local audio for good: record it, so the UI
                 // can show it instead of the app going quietly mute.
-                let message = err.to_string();
-                error!("Audio stream error: {message}");
+                let mut message = err.to_string();
+                error!("Audio stream error ({role:?}): {message}");
+                if role == StreamRole::Preview {
+                    // The headphones went away: hand previews back to the main
+                    // output so they are not silently lost.
+                    error_mixer.set_preview_external(false);
+                    message = format!("{message}; previews play on the main output");
+                }
                 let mut guard = status.write();
                 guard.reason = Some(message.clone());
                 guard.state = LocalOutputState::Failed(message);

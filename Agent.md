@@ -55,9 +55,10 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 | File | Responsibility |
 |------|----------------|
 | `engine.rs` | `AudioEngine`: sound catalog, cpal output (headless fallback when no device), master volume, previews (`play_preview`, local-only), `impl Playback` |
+| `devices.rs` | Output device list (`OutputDeviceInfo`, `list_output_devices` for a worker thread), pure picking by name with fallback (`pick_output_device`, `DevicePick`), preview routing (`plan_preview_route`), `OutputSelection` read from `[audio] output_device` / `preview_device` |
 | `decoder.rs` | Symphonia decoding to 48 kHz / stereo f32 (`DecodedAudio`), file probe, tags (`TrackMeta`) |
 | `stream_source.rs` | Streaming decoder for long files: worker thread + `rtrb` ring buffer, seek by generation counter, loop, `StreamEvent::TrackFinished`. Threshold `[audio] stream_threshold_secs` (default 60 s) |
-| `mixer.rs` | `AudioMixer`: pull-based mixing driven by the device callback; per-track gain with parametrised fades (equal-power or linear), pan, buses (music / ambience / sfx) with volume and ducking, master volume, limiter, local-only tracks (rendered after the broadcast copy is published) |
+| `mixer.rs` | `AudioMixer`: pull-based mixing driven by the device callback; per-track gain with parametrised fades (equal-power or linear), pan, buses (music / ambience / sfx) with volume and ducking, master volume, limiter, local-only tracks (rendered after the broadcast copy is published, on a fixed-gain preview bus that no fader or ducking touches; a second device can render them alone via `mix_preview_into`) |
 | `director.rs` | `Director`: scenes (`ActivationPlan`: start / retune / stop with the scene's fades), snapshots to scene, stingers, delayed starts, state `watch` channel (`DirectorState`), the `Playback` trait and an in-memory `MockPlayback` for tests |
 | `director_audio.rs` | `impl Director`: bus volumes, ducking (latch / hold / toggle, `[audio] duck_*`), loudness normalization (`CatalogSound::gain_db`, background measurement, `GainUpdate`) |
 | `emitter.rs` | Random / periodic sounds of the active scene: pure `Scheduler` (seeded xorshift), `EmitterRunner`, `EmitterHost` embedded in the Director |
@@ -123,7 +124,7 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 
 ### 2.7 Configuration
 
-`config.toml` lives in the data directory (see `paths.rs`). The full schema with examples is in `README.md` ("Configuration"); the source of truth is `src/config.rs`. Sections: `[server]` (`host`, `port`, `upnp`, `access_token`, `gm_token`), `[audio]` (`buffer_size` 960, `sample_rate`, `channels`, `master_volume`, `normalize`, `normalize_target_lufs`, `duck_amount`, `duck_attack_ms`, `duck_release_ms`, `duck_buses`, `stream_threshold_secs`), `[logging]`, `[gui]` (`reduce_motion`, `global_hotkeys`), `[library]` (`groups`, `sounds`, `scenes` with `items` and `emitters`, `playlists`), top-level `[[hotkeys]]`. Every new field has a serde default; `tests/config_compat.rs` keeps v1.4.0 configs loading. A config that fails to parse stops the app (it is never replaced by defaults).
+`config.toml` lives in the data directory (see `paths.rs`). The full schema with examples is in `README.md` ("Configuration"); the source of truth is `src/config.rs`. Sections: `[server]` (`host`, `port`, `upnp`, `access_token`, `gm_token`), `[audio]` (`buffer_size` 960, `sample_rate`, `channels`, `master_volume`, `normalize`, `normalize_target_lufs`, `duck_amount`, `duck_attack_ms`, `duck_release_ms`, `duck_buses`, `stream_threshold_secs`, `output_device`, `preview_device`), `[logging]`, `[gui]` (`reduce_motion`, `global_hotkeys`), `[library]` (`groups`, `sounds`, `scenes` with `items` and `emitters`, `playlists`), top-level `[[hotkeys]]`. Every new field has a serde default; `tests/config_compat.rs` keeps v1.4.0 configs loading. A config that fails to parse stops the app (it is never replaced by defaults).
 
 ### 2.8 Audio pipeline
 

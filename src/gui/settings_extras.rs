@@ -46,6 +46,8 @@ pub struct ConsoleExtras {
     pub mix: MixUi,
     /// Game-master link (QR, confirmation).
     pub gm: GmLinkUi,
+    /// Output / preview device dropdowns (see `audio_settings`).
+    pub audio: crate::gui::audio_settings::AudioSettingsUi,
 }
 
 impl ConsoleExtras {
@@ -56,6 +58,7 @@ impl ConsoleExtras {
             hotkeys: HotkeyUi::start(ctx, app_state, library),
             mix: MixUi::default(),
             gm: GmLinkUi::default(),
+            audio: Default::default(),
         }
     }
 }

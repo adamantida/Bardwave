@@ -2,6 +2,7 @@
 //! Provides decoding, mixing, and playback functionality
 
 pub mod decoder;
+pub mod devices;
 pub mod director;
 pub mod director_audio;
 pub mod emitter;
@@ -15,6 +16,10 @@ pub mod youtube;
 pub use decoder::{
     AudioDecoder, DecodedAudio, DecoderError, FileProbe, TrackMeta, TARGET_CHANNELS,
     TARGET_SAMPLE_RATE,
+};
+pub use devices::{
+    list_output_devices, pick_output_device, plan_preview_route, DevicePick, OutputDeviceInfo,
+    OutputSelection, PreviewPlan,
 };
 pub use director::{
     ActivationPlan, CatalogSound, Director, DirectorCommand, DirectorError, DirectorOutcome,

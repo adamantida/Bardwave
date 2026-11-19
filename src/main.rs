@@ -557,6 +557,11 @@ fn main() -> Result<()> {
         &config.audio,
     ));
 
+    // `[audio] output_device` / `preview_device`: which sound cards play.
+    audio_engine.set_output_selection(soundshared::audio::OutputSelection::from_audio_config(
+        &config.audio,
+    ));
+
     // Long files are streamed from disk instead of held in memory.
     audio_engine.set_stream_threshold_secs(config.audio.stream_threshold_secs);
 

@@ -387,6 +387,13 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         hairline(ui);
         ui.add_space(Metrics::LG);
 
+        // ---- Audio output: sound card and headphone device ----
+        crate::gui::audio_settings::audio_section(ui, state);
+
+        ui.add_space(Metrics::LG);
+        hairline(ui);
+        ui.add_space(Metrics::LG);
+
         // ---- Configuration ----
         ui.label(micro_label("Configuration"));
         ui.add_space(Metrics::SM);

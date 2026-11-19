@@ -25,6 +25,11 @@ Read this before relying on the items below. They are implemented and covered by
 
 ### Added
 
+**Audio devices**
+- `[audio] output_device` and `preview_device` choose the sound card for the mix and a separate one (headphones) for previews; absent keeps the system default / the main output. The AUDIO OUTPUT section of the console switches them without restarting: the streams reopen, tracks keep playing, a missing device falls back to the default with a message. Previews still never reach the players' stream.
+- Previews have their own fixed-gain bus (the Ambience fader and ducking no longer affect them), and the local limiter now recovers gradually when the last preview ends instead of snapping back.
+- Not verified: device names and enumeration on Windows (WASAPI) and Linux (ALSA/JACK); a second output stream was run on macOS only.
+
 **Scenes and transitions**
 - Scenes (`[[library.scenes]]`): named sets of sounds with per-item volume, loop, automatic/manual start and start delay, a button colour, `fade_in_ms` / `fade_out_ms`, `stop_others`.
 - Crossfade between scenes with equal-power or linear curves; re-activating a scene mid-transition continues from the current levels. The mixer fades are now parametrised (previously a fixed 10 ms click guard).
