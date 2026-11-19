@@ -296,6 +296,8 @@ pub struct ItemForm {
     pub manual: bool,
     /// Start delay as typed (milliseconds or seconds, see [`parse_millis`]).
     pub delay: String,
+    /// Pan inside the scene, `-1.0..=1.0`; `0.0` uses the sound's own pan.
+    pub pan: f32,
 }
 
 impl ItemForm {
@@ -308,6 +310,7 @@ impl ItemForm {
             looped: sound.looped,
             manual: false,
             delay: format_millis(0),
+            pan: 0.0,
         }
     }
 
@@ -414,6 +417,7 @@ impl SceneForm {
                 looped: item.looped,
                 manual: item.start == SceneStart::Manual,
                 delay: format_millis(item.delay_ms),
+                pan: item.pan,
             })
             .collect();
         Self {
@@ -505,6 +509,7 @@ impl SceneForm {
                     SceneStart::OnEnter
                 },
                 delay_ms: item.delay_ms().unwrap_or(0),
+                pan: item.pan,
             })
             .collect();
         Ok(ValidScene {
@@ -1137,6 +1142,8 @@ impl SoundSharedApp {
             Ok(_) => {
                 self.dialog = Dialog::None;
                 self.library_changed();
+                // A pan edited on an item of the active scene is heard at once.
+                self.request_sync_pans();
             }
             Err(reason) => self.scenes.notify(
                 format!("Could not save the scene: {reason}"),
@@ -1824,7 +1831,7 @@ pub fn sound_context_menu(ui: &mut Ui, state: &mut SoundSharedApp, sound: &Sound
 // ============================================================================
 
 /// Width of the scene editor.
-const EDITOR_W: f32 = 600.0;
+const EDITOR_W: f32 = 690.0;
 /// Width of the small scene dialogs.
 const SMALL_W: f32 = 340.0;
 
@@ -2352,6 +2359,13 @@ fn item_row(ui: &mut Ui, index: usize, item: &mut ItemForm, delay_invalid: bool)
                 item.manual = !item.manual;
             }
 
+            crate::gui::pan_ui::pan_slider(
+                ui,
+                &mut item.pan,
+                64.0,
+                "Pan in this scene; centre uses the sound's own pan",
+            );
+
             ui.add_enabled_ui(!item.manual, |ui| {
                 ui.scope(|ui| {
                     if delay_invalid {
@@ -2578,6 +2592,7 @@ mod tests {
                 looped: true,
                 start: SceneStart::OnEnter,
                 delay_ms: 0,
+                pan: 0.0,
             },
         );
         lib.set_item(
@@ -2588,6 +2603,7 @@ mod tests {
                 looped: false,
                 start: SceneStart::Manual,
                 delay_ms: 2500,
+                pan: -0.5,
             },
         );
         let scene = lib.scene(id).unwrap().clone();
@@ -2599,6 +2615,7 @@ mod tests {
         assert_eq!(form.items[0].name, "Rain");
         assert!(form.items[1].manual);
         assert_eq!(form.items[1].delay, "2500");
+        assert_eq!((form.items[0].pan, form.items[1].pan), (0.0, -0.5));
 
         let valid = form.validate(&lib).expect("a scene's own form is valid");
         assert_eq!(valid.name, "Tavern");
@@ -3068,6 +3085,7 @@ mod tests {
             looped: false,
             manual: false,
             delay: "oops".into(),
+            pan: 0.0,
         };
         let mut text = String::from("#a04a4a");
         let mut removed = false;

@@ -199,6 +199,8 @@ struct BundleSound {
     bus: Bus,
     #[serde(default)]
     oneshot_stinger: bool,
+    #[serde(default)]
+    pan: f32,
 }
 
 // ------------------------------------------------------------ path hygiene --
@@ -595,6 +597,7 @@ fn bundle_sound(sound: &SoundConfigEntry, rel: &str, audio: bool) -> BundleSound
         gain_db: sound.gain_db,
         bus: sound.bus,
         oneshot_stinger: sound.oneshot_stinger,
+        pan: sound.pan,
     }
 }
 
@@ -1188,6 +1191,7 @@ impl<'a> Planner<'a> {
             gain_db: sound.gain_db,
             bus: sound.bus,
             oneshot_stinger: sound.oneshot_stinger,
+            pan: crate::gui::groups::clamp_pan(sound.pan),
         };
 
         let conflict = by_id.or(by_path);

@@ -126,6 +126,8 @@ pub struct LibrarySound {
     pub bus: Bus,
     /// One-shot "over everything" sound that ignores the active scene.
     pub oneshot_stinger: bool,
+    /// Stereo position, `-1.0` (left) ..= `1.0` (right), `0.0` = centre.
+    pub pan: f32,
 }
 
 /// A sound inside a scene.
@@ -141,6 +143,9 @@ pub struct SceneItem {
     pub start: SceneStart,
     /// Delay after activation, in milliseconds.
     pub delay_ms: u32,
+    /// Stereo position inside the scene, `-1.0..=1.0`. Non-zero replaces the
+    /// sound's own pan; `0.0` means "use the sound's pan".
+    pub pan: f32,
 }
 
 impl SceneItem {
@@ -153,6 +158,7 @@ impl SceneItem {
             looped: false,
             start: SceneStart::OnEnter,
             delay_ms: 0,
+            pan: 0.0,
         }
     }
 }
@@ -486,6 +492,7 @@ impl Library {
                 gain_db: clamp_gain_db(persisted.gain_db),
                 bus: persisted.bus,
                 oneshot_stinger: persisted.oneshot_stinger,
+                pan: clamp_pan(persisted.pan),
             });
         }
 
@@ -531,6 +538,7 @@ impl Library {
                             looped: item.looped,
                             start: item.start,
                             delay_ms: item.delay_ms,
+                            pan: clamp_pan(item.pan),
                         })
                     })
                     .collect(),
@@ -604,6 +612,7 @@ impl Library {
                     gain_db: sound.gain_db,
                     bus: sound.bus,
                     oneshot_stinger: sound.oneshot_stinger,
+                    pan: sound.pan,
                 })
                 .collect(),
             scenes: self
@@ -626,6 +635,7 @@ impl Library {
                             looped: item.looped,
                             start: item.start,
                             delay_ms: item.delay_ms,
+                            pan: item.pan,
                         })
                         .collect(),
                     emitters: scene
@@ -828,6 +838,7 @@ impl Library {
             gain_db: 0.0,
             bus: Bus::default(),
             oneshot_stinger: false,
+            pan: 0.0,
         });
         true
     }
@@ -883,6 +894,19 @@ impl Library {
         match self.sound_mut(path) {
             Some(sound) => {
                 sound.volume = volume;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set the sound's stereo position (clamped to `-1.0..=1.0`, NaN = centre).
+    /// Returns false if the sound is unknown.
+    pub fn set_pan(&mut self, path: &Path, pan: f32) -> bool {
+        let pan = clamp_pan(pan);
+        match self.sound_mut(path) {
+            Some(sound) => {
+                sound.pan = pan;
                 true
             }
             None => false,
@@ -1329,6 +1353,7 @@ impl Library {
         }
         let item = SceneItem {
             volume: clamp_volume(item.volume),
+            pan: clamp_pan(item.pan),
             ..item
         };
         let Some(scene) = self.scene_mut_internal(scene) else {
@@ -1969,6 +1994,15 @@ fn clamp_volume(volume: f32) -> f32 {
         0.0
     } else {
         volume.clamp(0.0, 1.0)
+    }
+}
+
+/// Clamp a pan into `-1.0..=1.0`, folding NaN to the centre.
+pub fn clamp_pan(pan: f32) -> f32 {
+    if pan.is_nan() {
+        0.0
+    } else {
+        pan.clamp(-1.0, 1.0)
     }
 }
 

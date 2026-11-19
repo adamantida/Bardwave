@@ -4,6 +4,7 @@
 pub mod decoder;
 pub mod director;
 pub mod director_audio;
+pub mod director_pan;
 pub mod emitter;
 pub mod engine;
 pub mod loudness;
