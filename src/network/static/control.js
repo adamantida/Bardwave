@@ -8,7 +8,9 @@
 // Security notes:
 //  * the game master token comes from ?g= in the page address, is moved to
 //    sessionStorage and removed from the address bar at once; it is only ever
-//    sent in the WebSocket address and never written to the page or the log;
+//    sent in the WebSocket address and never written to the page or the log.
+//    The page itself is served without it, so a reload (whose address no
+//    longer carries the token) finds it in sessionStorage again;
 //  * nothing from the server is put into the page as HTML: names are set with
 //    textContent only.
 (function () {
@@ -29,6 +31,7 @@
   const BACKOFF_MAX_MS = 10000;
   const PROBE_AFTER_FAILURES = 3;
   const CLOSE_TOKEN_REVOKED = 4003;
+  const NO_TOKEN_MESSAGE = 'Open the link from the console';
 
   // ---------------------------------------------------------------- state ---
   let server = null; // last BoardState from the server
@@ -42,6 +45,7 @@
   let stopped = false; // no more reconnects (denied / token replaced)
   let renderQueued = false;
   let toastTimer = 0;
+  let snapshotAt = 0; // when the last snapshot arrived (progress interpolation)
 
   const overrides = new Map(); // key -> { value, req, acked, at }
   const pending = new Map(); // req -> true
@@ -208,20 +212,41 @@
 
   // A refused WebSocket handshake gives the browser no status code: ask once
   // over plain HTTP whether the problem is the link (401) or the network.
+  // Resolves to the HTTP status, or 0 when the server could not be reached.
   async function probeAccess() {
     try {
       const headers = { 'X-Bardwave-Control': '1' };
       if (token) headers.Authorization = 'Bearer ' + token;
       const res = await fetch('/api/control/state', { headers, cache: 'no-store' });
       if (res.status === 401) {
-        deny('Access denied. Open the game master link from the server panel again.');
+        deny(token ? 'Access denied. Open the game master link from the console again.' : NO_TOKEN_MESSAGE);
       } else if (res.status === 429) {
         const wait = parseInt(res.headers.get('Retry-After') || '30', 10);
         toast('Too many attempts. Wait ' + (Number.isFinite(wait) ? wait : 30) + ' s.');
         failures = Math.max(failures, 6); // back off to the slowest pace
       }
+      return res.status;
     } catch (e) {
       /* offline: keep retrying */
+      return 0;
+    }
+  }
+
+  // The page shell is served to anyone; its data is not. Without a token the
+  // panel only works on the PC that runs the server, so ask before showing
+  // a dead panel: a 401 means "open the link from the console".
+  async function start() {
+    if (token) {
+      connect();
+      return;
+    }
+    setConn('connecting', 'Connecting…');
+    const status = await probeAccess();
+    if (stopped) return;
+    if (status === 200) connect();
+    else {
+      failures = Math.max(failures, 1);
+      scheduleReconnect();
     }
   }
 
@@ -292,6 +317,7 @@
       lastRev = msg.rev;
     }
     server = msg.state;
+    snapshotAt = Date.now();
     // The server has spoken: everything it confirmed is now true, and so is
     // everything it did not (rolled back). Unconfirmed taps stay for a moment.
     for (const [key, o] of overrides) {
@@ -471,10 +497,18 @@
     setSlider($('master'), $('masterPct'), 'master', value);
   }
 
+  function duckedBuses() {
+    return server && Array.isArray(server.ducked_buses) ? server.ducked_buses : [];
+  }
+
   function renderDuck() {
     const on = server ? Boolean(eff('duck', Boolean(server.ducked))) : false;
     setPressed($('duck'), on);
     $('duck').textContent = on ? 'Ducked' : 'Duck';
+    const names = duckedBuses();
+    const note = $('duckState');
+    note.hidden = names.length === 0;
+    note.textContent = names.length ? 'Ducking: ' + names.join(', ') : '';
   }
 
   function renderBuses() {
@@ -492,17 +526,20 @@
         });
         const pct = el('output', { class: 'pct', for: id, text: '100%' });
         const label = el('label', { for: id, text: title });
-        box.appendChild(el('div', { class: 'bus' }, [label, input, pct]));
+        const row = el('div', { class: 'bus', 'data-ducked': 'false' }, [label, input, pct]);
+        box.appendChild(row);
         const key = 'bus:' + name;
         bindSlider(input, pct, key, (value) => {
           busLocal[name] = value;
           send('bus', { bus: name, value: value }, { [key]: value });
         });
-        ui.buses.set(name, { input, pct, key });
+        ui.buses.set(name, { row, input, pct, key });
       }
     }
+    const ducked = duckedBuses();
     for (const [name] of BUSES) {
       const slot = ui.buses.get(name);
+      slot.row.dataset.ducked = ducked.includes(name) ? 'true' : 'false';
       setSlider(slot.input, slot.pct, slot.key, eff(slot.key, busLocal[name]));
     }
   }
@@ -564,6 +601,7 @@
   }
 
   function trackLabel(pl) {
+    if (typeof pl.label === 'string' && pl.label) return pl.label;
     const title = typeof pl.title === 'string' && pl.title ? pl.title : '';
     const artist = typeof pl.artist === 'string' && pl.artist ? pl.artist : '';
     if (title && artist) return artist + ' - ' + title;
@@ -617,6 +655,14 @@
     }
     $('nowSub').textContent = sub;
 
+    const shuffleOn = Boolean(eff('shuffle', Boolean(pl && pl.shuffle)));
+    setPressed($('plShuffle'), shuffleOn);
+    $('plShuffle').disabled = !supported;
+    const repeat = String(eff('repeat', pl && typeof pl.repeat === 'string' ? pl.repeat : 'all'));
+    $('plRepeat').textContent = 'Repeat: ' + repeat;
+    $('plRepeat').disabled = !supported;
+    renderProgress();
+
     const toggle = $('plToggle');
     toggle.textContent = status === 'playing' ? 'Pause' : 'Play';
     toggle.disabled = !supported || (!running && !pl.playlist);
@@ -624,6 +670,41 @@
     $('plNext').disabled = !supported || !running;
     $('plStop').disabled = !supported || !running;
   }
+
+  function fmtTime(ms) {
+    const total = Math.max(0, Math.floor((Number.isFinite(ms) ? ms : 0) / 1000));
+    const m = Math.floor(total / 60);
+    const sec = total % 60;
+    return m + ':' + (sec < 10 ? '0' : '') + sec;
+  }
+
+  // Track position: the server reports it about once a second, the bar
+  // advances in between on the phone's own clock.
+  function renderProgress() {
+    const pl = server && server.playlist && typeof server.playlist === 'object' ? server.playlist : null;
+    const seek = $('plSeek');
+    const running = pl !== null && (pl.status === 'playing' || pl.status === 'paused');
+    const duration = pl && Number.isFinite(pl.duration_ms) && pl.duration_ms > 0 ? pl.duration_ms : 0;
+    let position = pl && Number.isFinite(pl.position_ms) ? pl.position_ms : 0;
+    if (pl && pl.status === 'playing') {
+      position += Math.min(1000, Math.max(0, Date.now() - snapshotAt));
+    }
+    if (duration) position = Math.min(position, duration);
+    if (!running) position = 0;
+    const o = overrides.get('seek');
+    if (o) position = o.value;
+    $('plPos').textContent = fmtTime(position);
+    $('plDur').textContent = running && duration ? fmtTime(duration) : '0:00';
+    seek.disabled = !running || !duration;
+    if (!touching.has('seek')) {
+      seek.value = duration ? String(Math.round((position / duration) * 1000)) : '0';
+    }
+    seek.setAttribute('aria-valuetext', fmtTime(position) + (duration ? ' of ' + fmtTime(duration) : ''));
+  }
+
+  setInterval(() => {
+    if (server && server.playlist && server.playlist.status === 'playing') renderProgress();
+  }, 500);
 
   function renderSounds() {
     const sounds = soundList().filter((s) => !s.stinger);
@@ -714,10 +795,48 @@
     else if (pl.status === 'paused') send('playlist_resume');
     else if (pl.playlist) send('playlist_start', { id: pl.playlist });
   });
+  $('plShuffle').addEventListener('click', () => {
+    const pl = server && server.playlist;
+    if (!pl) return;
+    const next = !eff('shuffle', Boolean(pl.shuffle));
+    send('playlist_shuffle', { on: next }, { shuffle: next });
+  });
+  $('plRepeat').addEventListener('click', () => {
+    const pl = server && server.playlist;
+    if (!pl) return;
+    const order = ['off', 'all', 'one'];
+    const now = String(eff('repeat', typeof pl.repeat === 'string' ? pl.repeat : 'all'));
+    const next = order[(order.indexOf(now) + 1) % order.length];
+    send('playlist_repeat', { mode: next }, { repeat: next });
+  });
+  {
+    const seek = $('plSeek');
+    const seekTo = (final) => {
+      const pl = server && server.playlist;
+      const duration = pl && Number.isFinite(pl.duration_ms) ? pl.duration_ms : 0;
+      if (!duration) return;
+      const ms = Math.round((Number(seek.value) / 1000) * duration);
+      $('plPos').textContent = fmtTime(ms);
+      throttledSend('seek', () => send('playlist_seek', { ms: ms }, { seek: ms }), final);
+    };
+    seek.addEventListener('pointerdown', () => touching.add('seek'));
+    seek.addEventListener('input', () => {
+      touching.add('seek');
+      seekTo(false);
+    });
+    seek.addEventListener('change', () => {
+      seekTo(true);
+      touching.delete('seek');
+      queueRender();
+    });
+    seek.addEventListener('blur', () => touching.delete('seek'));
+    seek.addEventListener('pointerup', () => setTimeout(() => touching.delete('seek'), 0));
+    seek.addEventListener('pointercancel', () => touching.delete('seek'));
+  }
   $('plPrev').addEventListener('click', () => send('playlist_prev'));
   $('plNext').addEventListener('click', () => send('playlist_next'));
   $('plStop').addEventListener('click', () => send('playlist_stop'));
 
   render();
-  connect();
+  start();
 })();

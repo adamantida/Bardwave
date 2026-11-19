@@ -294,11 +294,10 @@ fn send_text(text: &str) -> Message {
 async fn the_players_key_does_not_open_the_control_panel() {
     let h = start(Options::default()).await;
     let bearer = format!("Bearer {PLAYER}");
-    let attempts: [(&str, &[(&str, &str)]); 4] = [
+    let attempts: [(&str, &[(&str, &str)]); 3] = [
         ("/api/control/state", &[("Authorization", &bearer), HDR]),
         ("/api/control/state?k=player-key", &[HDR]),
         ("/api/control/state?g=player-key", &[HDR]),
-        ("/control?k=player-key", &[]),
     ];
     for (path, headers) in attempts {
         let reply = http(h.addr, "GET", path, headers).await;
@@ -422,8 +421,9 @@ async fn a_remote_client_without_a_token_gets_401_and_a_local_one_works() {
     assert_eq!(none.status, 401);
     assert_eq!(wrong.status, 401);
     assert_eq!(none.body, wrong.body, "must not reveal which one it was");
+    // The page shell is only code: it opens without a token, its data does not.
     let reply = http(h.addr, "GET", "/control", &[]).await;
-    assert_eq!(reply.status, 401);
+    assert_eq!(reply.status, 200);
 
     // The same machine, as a local peer: no token needed...
     h.remote.store(false, Ordering::Relaxed);

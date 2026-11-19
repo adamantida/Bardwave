@@ -295,13 +295,14 @@ async fn the_local_panel_opens_without_a_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_page_needs_the_token_remotely_and_never_contains_it() {
+async fn the_page_opens_without_a_token_and_never_contains_it() {
     let h = start(true).await;
-    assert_eq!(get(h.addr, "/control").await.status, 401);
-    assert_eq!(
-        get(h.addr, &format!("/control?g={PLAYER}")).await.status,
-        401
-    );
+    // The shell holds code only, so a phone that reloads it (the token is no
+    // longer in its address) still gets it; the data behind it is gated.
+    let bare = get(h.addr, "/control").await;
+    assert_eq!(bare.status, 200);
+    assert_eq!(text_of(&bare), CONTROL_HTML);
+    assert_eq!(get(h.addr, "/api/control/state").await.status, 401);
 
     let page = get(h.addr, &format!("/control?g={GM}")).await;
     assert_eq!(page.status, 200, "{}", page.body);
