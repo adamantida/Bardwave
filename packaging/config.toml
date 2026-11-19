@@ -11,6 +11,17 @@ upnp = true        # ask the router to open the port for players outside the LAN
 # (--server-only) from another device (http://<address>:8080/control?g=<key>),
 # so remote control is on by default. Set it to "" to keep the page on this PC.
 
+# HTTPS: off by default, fine on a home network. Turn it on for players across
+# the internet (the keys in the links are then encrypted). Same port, links and
+# QR start with https://. Applies on the next Start; see docs/en/https.md.
+# Console: SERVER panel > SECURE CONNECTION (HTTPS).
+tls = false
+# Your own PEM certificate chain and its private key (for example from Let's
+# Encrypt or Caddy). Set both or neither. Neither = a self-signed certificate
+# made by Bardwave and kept in the "tls" folder of the data directory.
+# tls_cert = "/etc/ssl/bardwave/fullchain.pem"
+# tls_key = "/etc/ssl/bardwave/privkey.pem"
+
 [audio]
 buffer_size = 960  # sound-card buffer in frames (960 = 20 ms); 0 = driver default
 sample_rate = 48000 # sound-card rate to ask for; the stream itself is always 48 kHz

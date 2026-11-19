@@ -19,6 +19,7 @@ pub mod dialog;
 pub mod gm_bridge;
 pub mod groups;
 pub mod hotkeys_ui;
+pub mod https_ui;
 #[cfg(test)]
 mod layout_check;
 #[cfg(test)]
@@ -36,7 +37,6 @@ pub mod settings_extras;
 pub mod sound_list;
 pub mod theme;
 pub mod timeline;
-pub mod tls_section;
 pub mod top_bar;
 pub mod types;
 pub mod widgets;
