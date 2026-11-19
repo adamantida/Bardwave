@@ -16,6 +16,7 @@
 pub mod app;
 pub mod dialog;
 pub mod groups;
+pub mod library_ui;
 pub mod motion;
 pub mod server_panel;
 pub mod sound_list;
@@ -183,6 +184,8 @@ impl App for GuiApp {
 
         // Modal dialogs (rename / move) painted above everything.
         dialog::show_dialogs(ctx, &mut self.state);
+        // Library modals (add folder, bundles, tags, path prefix).
+        library_ui::show_library_dialogs(ctx, &mut self.state);
 
         if self.state.tooltip_requested() {
             ctx.request_repaint();

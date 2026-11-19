@@ -10,7 +10,6 @@ use crate::gui::types::{
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use egui::Context;
-use rfd::FileDialog;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -131,7 +130,7 @@ pub struct SoundSharedApp {
     app_state: AppState,
 
     // Audio engine (must stay on main thread due to cpal::Stream not being Send)
-    audio_engine: Arc<Mutex<Option<AudioEngine>>>,
+    pub(crate) audio_engine: Arc<Mutex<Option<AudioEngine>>>,
 
     // Audio command receiver (for processing commands on main thread)
     audio_cmd_rx: Receiver<AudioCommand>,
@@ -141,7 +140,7 @@ pub struct SoundSharedApp {
     director: Director,
 
     // Local sound cache (synced from audio engine)
-    sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
+    pub(crate) sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
     sound_order: Arc<Mutex<Vec<SoundId>>>,
 
     // Master volume cache
@@ -167,13 +166,15 @@ pub struct SoundSharedApp {
     server_status_tx: Sender<AppServerStatus>,
 
     // Sound library + groups (the operator's saved collection)
-    library: Library,
+    pub(crate) library: Library,
+    /// Search, tag filter, dialogs and previews of the library panel.
+    pub(crate) lib_ui: crate::gui::library_ui::LibraryUi,
     /// Which group the library panel is filtered to.
     group_filter: GroupFilter,
     /// Name shown in the group-name field of the currently open modal.
     dialog: Dialog,
     /// Set when the library changed and needs writing to config.toml.
-    library_dirty: bool,
+    pub(crate) library_dirty: bool,
     /// Last time the library was flushed to disk.
     last_persist: Instant,
     /// Master volume stashed while muted.
@@ -328,6 +329,7 @@ impl SoundSharedApp {
             server_status_rx,
             server_status_tx,
             library,
+            lib_ui: crate::gui::library_ui::LibraryUi::new(cc.egui_ctx.clone()),
             group_filter: GroupFilter::All,
             dialog: Dialog::None,
             library_dirty: false,
@@ -984,13 +986,9 @@ impl SoundSharedApp {
 
     /// Open native file dialog to add sound
     pub fn open_file_dialog(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac", "opus"])
-            .set_title("Select Audio File")
-            .pick_file()
-        {
-            self.request_load_sound(path);
-        }
+        // The chooser runs off the frame (see `library_ui::tasks`); the
+        // files come back as a library event.
+        self.open_add_files();
     }
 
     // ===== YouTube links =====
@@ -1265,6 +1263,7 @@ impl SoundSharedApp {
 
     /// Stop every playing sound at once (the command-bar panic control).
     pub fn stop_all_sounds(&mut self) {
+        crate::gui::library_ui::stop_preview(self);
         let (response_tx, _response_rx) = bounded(1);
         let cmd = AudioCommand::StopAll {
             response: response_tx,
@@ -1384,6 +1383,7 @@ impl SoundSharedApp {
         self.process_audio_commands();
         self.finish_decoded();
         self.poll_youtube_results();
+        crate::gui::library_ui::poll(self, ctx);
 
         // Auto-detect tracks that finished playing (mixer marks them stopped but keeps them)
         // so the GUI button switches from "Stop" back to "Play" and the sound can be removed.
