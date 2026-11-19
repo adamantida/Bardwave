@@ -186,6 +186,8 @@ pub struct SoundSharedApp {
     pub(crate) library: Library,
     /// Search, tag filter, dialogs and previews of the library panel.
     pub(crate) lib_ui: crate::gui::library_ui::LibraryUi,
+    /// Profile menu and dialogs.
+    pub(crate) profiles_ui: crate::gui::profiles_ui::ProfilesUi,
     /// Which group the library panel is filtered to.
     group_filter: GroupFilter,
     /// Name shown in the group-name field of the currently open modal.
@@ -412,6 +414,7 @@ impl SoundSharedApp {
             server_status_tx,
             library,
             lib_ui: crate::gui::library_ui::LibraryUi::new(ctx.clone()),
+            profiles_ui: Default::default(),
             group_filter: GroupFilter::All,
             dialog: Dialog::None,
             library_dirty: false,

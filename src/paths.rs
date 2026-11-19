@@ -16,6 +16,10 @@
 //! | otherwise, Windows                                                | `%APPDATA%\Bardwave`                        |
 //! | otherwise, Linux / other Unix                                     | `$XDG_DATA_HOME/bardwave` or `~/.local/share/bardwave` |
 //!
+//! That directory is the *root*. With `--profile <name>` the config and the
+//! library move to `<root>/profiles/<name>/` (see [`crate::profiles`]); the log,
+//! the downloaded tools and `recent.toml` stay in the root and are shared.
+//!
 //! The decision itself is a pure function ([`choose_data_dir`]) so every OS
 //! branch is unit-tested on any host.
 
@@ -181,11 +185,12 @@ fn resolve(exe_dir: &Path) -> PathBuf {
     choose_data_dir(Os::current(), exe_dir, &Env::from_process(), probe)
 }
 
-/// The directory for config, library, log and downloaded tools.
+/// The root data directory: where the default profile keeps its files and where
+/// the shared log, the downloaded tools and `recent.toml` live.
 ///
 /// Decided once per process and created on first use. If the chosen system
 /// directory cannot be created the executable directory is used instead.
-pub fn data_dir() -> PathBuf {
+pub fn root_dir() -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let exe = exe_dir();
@@ -203,14 +208,48 @@ pub fn data_dir() -> PathBuf {
     .clone()
 }
 
+/// Profile chosen for this process: `None` is the default profile.
+static ACTIVE_PROFILE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Choose the profile of this process (`--profile`). Must run before anything
+/// asks for [`data_dir`]; returns false (and changes nothing) when a profile was
+/// already fixed, either explicitly or by an earlier path lookup.
+pub fn set_active_profile(profile: Option<String>) -> bool {
+    ACTIVE_PROFILE.set(profile).is_ok()
+}
+
+/// The profile this process runs: `None` for the default profile. Fixed on the
+/// first call, so a path can never change under a running app.
+pub fn active_profile() -> Option<String> {
+    ACTIVE_PROFILE.get_or_init(|| None).clone()
+}
+
+/// The directory for config and library of the active profile: the root itself
+/// for the default profile, `<root>/profiles/<name>` otherwise (created on
+/// first use; falls back to the root if it cannot be created).
+pub fn data_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let root = root_dir();
+        match active_profile() {
+            None => root,
+            Some(name) => match crate::profiles::profile_dir(&root, Some(&name)) {
+                Ok(dir) if std::fs::create_dir_all(&dir).is_ok() => dir,
+                _ => root,
+            },
+        }
+    })
+    .clone()
+}
+
 /// `config.toml` inside the data directory.
 pub fn config_path() -> PathBuf {
     data_dir().join(CONFIG_FILE)
 }
 
-/// `bardwave.log` inside the data directory.
+/// `bardwave.log`, shared by all profiles (in the root).
 pub fn log_path() -> PathBuf {
-    data_dir().join(LOG_FILE)
+    root_dir().join(LOG_FILE)
 }
 
 /// The downloaded-audio library folder (not created here).
@@ -218,9 +257,10 @@ pub fn library_dir() -> PathBuf {
     data_dir().join(LIBRARY_DIR)
 }
 
-/// Folder where Bardwave stores helper tools it downloaded itself.
+/// Folder where Bardwave stores helper tools it downloaded itself, shared by
+/// all profiles (in the root).
 pub fn tools_dir() -> PathBuf {
-    data_dir().join(TOOLS_DIR)
+    root_dir().join(TOOLS_DIR)
 }
 
 #[cfg(test)]
@@ -428,8 +468,11 @@ mod tests {
         let base = data_dir();
         assert!(base.is_dir());
         assert_eq!(config_path(), base.join("config.toml"));
-        assert_eq!(log_path(), base.join("bardwave.log"));
         assert_eq!(library_dir(), base.join("bardwave-library"));
+        // Without `--profile` the active profile is the default one: the root.
+        assert_eq!(active_profile(), None);
+        assert_eq!(base, root_dir());
+        assert_eq!(log_path(), base.join("bardwave.log"));
         assert_eq!(tools_dir(), base.join("tools"));
     }
 }
