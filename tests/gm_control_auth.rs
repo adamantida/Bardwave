@@ -477,6 +477,58 @@ async fn a_proxied_loopback_request_is_not_local() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebound_host_name_is_not_local() {
+    // DNS rebinding: the peer is loopback, but the page's own (attacker) name
+    // is in Host and Origin, so the Origin == Host check alone would pass.
+    let h = start(Options {
+        remote: false,
+        ..Default::default()
+    })
+    .await;
+    let port = h.addr.port();
+    let raw = |host: String, path: String| async move {
+        let mut stream = tokio::net::TcpStream::connect(h.addr)
+            .await
+            .expect("connect");
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\n\
+             X-Bardwave-Control: 1\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read");
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        text.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .expect("status line")
+    };
+    let state = "/api/control/state".to_string();
+    assert_eq!(
+        raw(format!("evil.example:{port}"), state.clone()).await,
+        401
+    );
+    assert_eq!(raw(format!("localhost:{port}"), state.clone()).await, 200);
+    assert_eq!(raw(format!("127.0.0.1:{port}"), state).await, 200);
+
+    let error = ws_connect(
+        h.addr,
+        "",
+        &[
+            ("Host", &format!("evil.example:{port}")),
+            ("Origin", &format!("http://evil.example:{port}")),
+        ],
+    )
+    .await;
+    // Either the handshake is refused (401) or it cannot be built at all.
+    if let Err(error) = error {
+        assert_eq!(status_of(&error), Some(401));
+    } else {
+        panic!("rebound host opened the control socket");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_gm_token_forbids_remote_access() {
     for token in [Some(""), None] {
         let h = start(Options {

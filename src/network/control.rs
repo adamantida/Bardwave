@@ -753,6 +753,27 @@ fn has_proxy_headers(headers: &HeaderMap) -> bool {
     PROXY_HEADERS.iter().any(|name| headers.contains_key(*name))
 }
 
+/// Whether the `Host` header names this machine (`localhost`, `127.0.0.1`,
+/// `[::1]`, with or without a port). Under DNS rebinding the browser sends the
+/// attacker's name here while the socket peer is loopback, so no-token local
+/// access must not be granted for any other name.
+fn host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((ip, tail)) if tail.is_empty() || tail.starts_with(':') => {
+                return ip == "::1";
+            }
+            _ => return false,
+        }
+    } else {
+        host.split_once(':').map_or(host, |(name, _)| name)
+    };
+    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1"
+}
+
 /// The token of `Authorization: Bearer <token>`.
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
@@ -841,7 +862,9 @@ async fn gm_gate(State(ctx): State<ControlContext>, mut request: Request, next: 
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
     let headers = request.headers();
-    let proxied = has_proxy_headers(headers);
+    // A request that does not address this PC by a loopback name (proxy
+    // headers, or a rebound hostname) is never "local": it needs the token.
+    let proxied = has_proxy_headers(headers) || !host_is_loopback(headers);
     let bearer = bearer_token(headers);
     let query = request.uri().query().and_then(|q| query_param(q, GM_PARAM));
 
@@ -1622,6 +1645,36 @@ mod tests {
         assert!(!origin_matches_host(&headers));
         headers.remove(header::HOST);
         assert!(!origin_matches_host(&headers));
+    }
+
+    #[test]
+    fn only_loopback_host_names_are_local() {
+        let host = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, value.parse().unwrap());
+            headers
+        };
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "localhost",
+            "LocalHost:8080",
+            "[::1]",
+            "[::1]:8080",
+        ] {
+            assert!(host_is_loopback(&host(ok)), "{ok}");
+        }
+        for bad in [
+            "evil.example:8080",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example",
+            "192.168.1.5:8080",
+            "[::2]:8080",
+            "[::1]x",
+        ] {
+            assert!(!host_is_loopback(&host(bad)), "{bad}");
+        }
+        assert!(!host_is_loopback(&HeaderMap::new()), "no Host");
     }
 
     #[test]
