@@ -1,7 +1,9 @@
 //! Sound groups and the persistent library model (RPG-Sounds style categories).
 //!
-//! This module is intentionally pure: it performs no I/O, touches no audio
-//! device, and imports nothing from `egui`. It is the single source of truth
+//! This module is intentionally pure: it performs no I/O (the one exception
+//! is [`Library::missing_sounds`], which stats the sound files and has a pure
+//! twin, [`Library::missing_sounds_with`]), touches no audio device, and
+//! imports nothing from `egui`. It is the single source of truth
 //! for the ordered list of sounds, their per-sound volume, their group
 //! membership, the scenes / playlists built from them and the keyboard
 //! bindings; `crate::config::LibraryConfig` (plus `Config::hotkeys`) is its
@@ -1049,6 +1051,122 @@ impl Library {
         self.sounds.is_empty()
     }
 
+    // ----------------------------------------------------- missing files ----
+
+    /// Sounds whose file is not on disk (a "file not found" marker for the UI).
+    ///
+    /// This asks the file system once per sound, so call it from a worker
+    /// thread for big libraries (or use [`Library::missing_sounds_with`] with
+    /// a cached answer). A path that cannot be inspected (no permission, the
+    /// volume is not mounted) counts as missing. Missing sounds stay in the
+    /// library with every scene / playlist reference intact.
+    pub fn missing_sounds(&self) -> Vec<&LibrarySound> {
+        self.missing_sounds_with(|path| path.exists())
+    }
+
+    /// [`Library::missing_sounds`] with the existence check supplied by the
+    /// caller (pure; used by tests and by callers that cache `stat` results).
+    pub fn missing_sounds_with(&self, exists: impl Fn(&Path) -> bool) -> Vec<&LibrarySound> {
+        self.sounds
+            .iter()
+            .filter(|sound| !exists(&sound.path))
+            .collect()
+    }
+
+    /// Point the sound registered at `path_old` at `path_new` ("Find again").
+    ///
+    /// The id, and so every scene, playlist and hotkey that uses the sound, is
+    /// kept. Returns false when `path_old` is unknown, `path_new` is empty, or
+    /// `path_new` already belongs to a different sound. Relinking a sound to
+    /// its own path succeeds without changing anything.
+    pub fn relink(&mut self, path_old: &Path, path_new: &Path) -> bool {
+        if path_old == path_new {
+            return self.by_path.contains_key(path_old);
+        }
+        self.relocate_sound(path_old, path_new)
+    }
+
+    /// Which sounds [`Library::remap_prefix`] would rewrite and to what,
+    /// without changing anything (for a "N paths will change" preview).
+    ///
+    /// A sound is rewritten when its path lies under `old_prefix` (matching
+    /// whole path components, so `/music` does not match `/music2/a.wav`; both
+    /// `/` and `\` separate components when the prefix is written with
+    /// backslashes, e.g. a Windows library opened on another system). The part
+    /// below the prefix is appended to `new_prefix`, converting separators when
+    /// the two prefixes use different styles. Sounds whose new path would be
+    /// empty, equal to the path of a sound that stays, or equal to another
+    /// rewritten path are left out, so the plan never merges two sounds.
+    /// An empty prefix (or one that is only separators) plans nothing.
+    pub fn remap_prefix_plan(&self, old_prefix: &str, new_prefix: &str) -> Vec<(SoundId, PathBuf)> {
+        let mut planned: Vec<(SoundId, PathBuf)> = Vec::new();
+        for sound in &self.sounds {
+            let Some(text) = sound.path.to_str() else {
+                continue;
+            };
+            if let Some(new_text) = remap_path_string(text, old_prefix, new_prefix) {
+                if new_text != text {
+                    planned.push((sound.id, PathBuf::from(new_text)));
+                }
+            }
+        }
+        if planned.is_empty() {
+            return planned;
+        }
+        let moving: HashSet<SoundId> = planned.iter().map(|(id, _)| *id).collect();
+        let staying: HashSet<&Path> = self
+            .sounds
+            .iter()
+            .filter(|sound| !moving.contains(&sound.id))
+            .map(|sound| sound.path.as_path())
+            .collect();
+        let mut uses: HashMap<&Path, usize> = HashMap::new();
+        for (_, path) in &planned {
+            *uses.entry(path.as_path()).or_insert(0) += 1;
+        }
+        let keep: Vec<bool> = planned
+            .iter()
+            .map(|(_, path)| !staying.contains(path.as_path()) && uses[path.as_path()] == 1)
+            .collect();
+        planned
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(entry, keep)| keep.then_some(entry))
+            .collect()
+    }
+
+    /// Rewrite the path prefix of every sound under `old_prefix` to
+    /// `new_prefix` (bulk "my sound folder moved"). Ids are never touched.
+    /// Returns the number of rewritten paths; see
+    /// [`Library::remap_prefix_plan`] for the matching rules.
+    pub fn remap_prefix(&mut self, old_prefix: &str, new_prefix: &str) -> usize {
+        let plan = self.remap_prefix_plan(old_prefix, new_prefix);
+        if plan.is_empty() {
+            return 0;
+        }
+        let count = plan.len();
+        let new_paths: HashMap<SoundId, PathBuf> = plan.into_iter().collect();
+        for sound in &mut self.sounds {
+            if let Some(path) = new_paths.get(&sound.id) {
+                sound.path = path.clone();
+            }
+        }
+        self.reindex_paths();
+        count
+    }
+
+    /// Replace the persisted content (groups, sounds, scenes, playlists) with
+    /// `cfg`, going through the same repair rules as [`Library::from_config`],
+    /// but keep the keyboard bindings. Bundle import builds the merged
+    /// `LibraryConfig` and applies it here in one step, so a failed import
+    /// never leaves the library half-changed.
+    pub fn apply_library_config(&mut self, cfg: &LibraryConfig) {
+        let rebuilt = Self::from_config(cfg);
+        let hotkeys = std::mem::take(&mut self.hotkeys);
+        *self = rebuilt;
+        self.hotkeys = hotkeys;
+    }
+
     // ------------------------------------------------------------ scenes ----
 
     /// All scenes, in display order.
@@ -1859,5 +1977,125 @@ fn filter_accepts(filter: GroupFilter, sound: &LibrarySound) -> bool {
         GroupFilter::All => true,
         GroupFilter::Ungrouped => sound.group.is_none(),
         GroupFilter::Group(id) => sound.group == Some(id),
+    }
+}
+
+/// How a path prefix spells its separators.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathStyle {
+    Slash,
+    Backslash,
+}
+
+/// A prefix that uses `\` and never `/` is a Windows-style path.
+fn path_style(prefix: &str) -> PathStyle {
+    if prefix.contains('\\') && !prefix.contains('/') {
+        PathStyle::Backslash
+    } else {
+        PathStyle::Slash
+    }
+}
+
+/// Rewrite `path` when it lies under `old_prefix`, giving the same location
+/// below `new_prefix`; `None` when it does not, or a prefix is unusable.
+///
+/// Matches whole components only. `\` counts as a separator when the old
+/// prefix is Windows-style (or on Windows); elsewhere it is an ordinary file
+/// name character. The remainder is converted when the two prefixes use
+/// different separator styles.
+fn remap_path_string(path: &str, old_prefix: &str, new_prefix: &str) -> Option<String> {
+    let old_style = path_style(old_prefix);
+    let new_style = path_style(new_prefix);
+    let backslash_separates = old_style == PathStyle::Backslash || cfg!(windows);
+    let is_sep = |c: char| c == '/' || (backslash_separates && c == '\\');
+
+    let old = old_prefix.trim_end_matches(is_sep);
+    let new = new_prefix.trim_end_matches(['/', '\\']);
+    if old.trim().is_empty() || new.trim().is_empty() {
+        return None;
+    }
+    let head = path.get(..old.len())?;
+    let same = if cfg!(windows) {
+        head.eq_ignore_ascii_case(old)
+    } else {
+        head == old
+    };
+    if !same {
+        return None;
+    }
+    let rest = &path[old.len()..];
+    if rest.is_empty() {
+        return Some(new.to_string());
+    }
+    if !rest.starts_with(is_sep) {
+        return None;
+    }
+    let rest = rest.trim_start_matches(is_sep);
+    if rest.is_empty() {
+        return Some(new.to_string());
+    }
+    let (new_sep, rest) = match (old_style, new_style) {
+        (PathStyle::Backslash, PathStyle::Slash) => ('/', rest.replace('\\', "/")),
+        (PathStyle::Slash, PathStyle::Backslash) => ('\\', rest.replace('/', "\\")),
+        (_, PathStyle::Backslash) => ('\\', rest.to_string()),
+        (_, PathStyle::Slash) => ('/', rest.to_string()),
+    };
+    Some(format!("{new}{new_sep}{rest}"))
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use super::remap_path_string as remap;
+
+    #[test]
+    fn matches_whole_components_only() {
+        assert_eq!(
+            remap("/music/a.wav", "/music", "/mnt/music").as_deref(),
+            Some("/mnt/music/a.wav")
+        );
+        assert_eq!(remap("/music2/a.wav", "/music", "/mnt"), None);
+        assert_eq!(remap("/other/a.wav", "/music", "/mnt"), None);
+    }
+
+    #[test]
+    fn trailing_separators_are_ignored() {
+        assert_eq!(
+            remap("/music/sub/a.wav", "/music/", "/new//").as_deref(),
+            Some("/new/sub/a.wav")
+        );
+    }
+
+    #[test]
+    fn converts_between_windows_and_unix_styles() {
+        assert_eq!(
+            remap(r"C:\Sounds\Tavern\a.wav", r"C:\Sounds", "/Users/me/Sounds").as_deref(),
+            Some("/Users/me/Sounds/Tavern/a.wav")
+        );
+        assert_eq!(
+            remap(
+                "/Users/me/Sounds/Tavern/a.wav",
+                "/Users/me/Sounds",
+                r"D:\Snd"
+            )
+            .as_deref(),
+            Some(r"D:\Snd\Tavern\a.wav")
+        );
+    }
+
+    #[test]
+    fn rejects_unusable_prefixes() {
+        assert_eq!(remap("/a/b.wav", "", "/x"), None);
+        assert_eq!(remap("/a/b.wav", "/", "/x"), None);
+        assert_eq!(remap("/a/b.wav", "/a", ""), None);
+        assert_eq!(remap("/a/b.wav", "/a", "///"), None);
+    }
+
+    #[test]
+    fn does_not_split_inside_a_multibyte_character() {
+        assert_eq!(remap("/музыка/a.wav", "/муз", "/x"), None);
+        assert_eq!(
+            remap("/музыка/a.wav", "/музыка", "/звук").as_deref(),
+            Some("/звук/a.wav")
+        );
     }
 }

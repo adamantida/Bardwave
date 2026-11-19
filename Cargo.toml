@@ -88,6 +88,8 @@ ebur128 = "0.1.11"
 # Lock-free SPSC ring buffer (pure Rust) between the stream decoder thread and
 # the audio callback
 rtrb = "0.3.6"
+# Library bundles (.zip export/import); deflate only, via flate2 (pure Rust)
+zip = { version = "=2.6.1", default-features = false, features = ["deflate-flate2", "flate2"] }
 
 # getifaddrs for LAN address detection on Linux / macOS
 [target.'cfg(unix)'.dependencies]
