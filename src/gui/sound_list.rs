@@ -17,6 +17,10 @@
 use crate::audio::SoundId;
 use crate::gui::app::{SoundEntry, SoundSharedApp};
 use crate::gui::groups::GroupFilter;
+use crate::gui::library_ui::logic::{format_tags, highlight_job, RowItem};
+use crate::gui::library_ui::{
+    library_toolbar, missing_row, paint_badge, preview_button, MissingAction,
+};
 use crate::gui::theme::{
     alpha, console_panel, hairline, micro_label, micro_label_accent, panel_title, telemetry,
     ui_font, Metrics, Palette,
@@ -60,7 +64,11 @@ pub fn sound_library_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) 
                     Vec2::new(ui.available_width(), list_h),
                     Layout::top_down(Align::Min),
                     |ui| {
-                        sound_rows(ui, state, list_h);
+                        // Search, tag chips and library actions, then the rows
+                        // in whatever height is left.
+                        library_toolbar(ui, state);
+                        let rows_h = ui.available_height().max(80.0);
+                        sound_rows(ui, state, rows_h);
                     },
                 );
             },
@@ -152,8 +160,11 @@ fn group_rail(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
 
                     let active = state.group_filter();
-                    let ungrouped = state.count_for(GroupFilter::Ungrouped);
-                    let all = state.count_for(GroupFilter::All);
+                    // Counts follow the search text and the lit tags, so the
+                    // rail shows what each category would list right now.
+                    let counts = state.library().group_counts(&state.current_query());
+                    let ungrouped = counts.for_filter(GroupFilter::Ungrouped);
+                    let all = counts.for_filter(GroupFilter::All);
 
                     if rail_chip(ui, "All Sounds", all, active == GroupFilter::All, None)
                         == RailAction::Select
@@ -187,7 +198,7 @@ fn group_rail(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
                             (
                                 group.id,
                                 group.name.clone(),
-                                state.count_for(GroupFilter::Group(group.id)),
+                                counts.for_filter(GroupFilter::Group(group.id)),
                             )
                         })
                         .collect();
@@ -345,13 +356,16 @@ fn count_badge(painter: &egui::Painter, rect: Rect, count: usize, color: egui::C
 
 /// Scrollable list of sound rows for the active filter.
 fn sound_rows(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
-    let sounds = state.visible_sounds();
+    let rows = state.list_rows();
     let filter = state.group_filter();
 
-    if sounds.is_empty() {
+    if rows.is_empty() {
         empty_state(ui, state, filter, height);
         return;
     }
+
+    // What the search box is looking for, to highlight it in the names.
+    let terms = state.current_query().text_terms();
 
     egui::ScrollArea::vertical()
         .id_salt("sound_rows_scroll")
@@ -367,9 +381,34 @@ fn sound_rows(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
             let mut assign: Option<(SoundId, String)> = None;
             let mut volume: Option<(SoundId, std::path::PathBuf, f32)> = None;
             let mut set_loop: Option<(SoundId, std::path::PathBuf, bool)> = None;
+            let mut preview: Option<(SoundId, std::path::PathBuf)> = None;
+            let mut edit_tags: Option<std::path::PathBuf> = None;
+            let mut locate: Option<std::path::PathBuf> = None;
+            let mut remove_missing: Option<std::path::PathBuf> = None;
 
-            for sound in &sounds {
-                let action = sound_row(ui, state, sound);
+            for row in &rows {
+                let sound = match row {
+                    RowItem::Loaded(sound) => sound,
+                    RowItem::Missing(missing) => {
+                        match missing_row(ui, missing, &terms) {
+                            MissingAction::Locate => locate = Some(missing.path.clone()),
+                            MissingAction::Remove => remove_missing = Some(missing.path.clone()),
+                            MissingAction::None => {}
+                        }
+                        continue;
+                    }
+                };
+                let view = RowView {
+                    missing: state.lib_ui.missing.contains(&sound.path),
+                    previewing: state.lib_ui.is_previewing(sound.id),
+                    tags: state
+                        .library()
+                        .sound(&sound.path)
+                        .map(|s| s.tags.clone())
+                        .unwrap_or_default(),
+                    terms: &terms,
+                };
+                let action = sound_row(ui, state, sound, &view);
                 match action {
                     RowAction::Toggle => toggle = Some(sound.id),
                     RowAction::Remove => remove = Some(sound.id),
@@ -380,6 +419,9 @@ fn sound_rows(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
                     RowAction::SetLoop(looped) => {
                         set_loop = Some((sound.id, sound.path.clone(), looped))
                     }
+                    RowAction::Preview => preview = Some((sound.id, sound.path.clone())),
+                    RowAction::EditTags => edit_tags = Some(sound.path.clone()),
+                    RowAction::Locate => locate = Some(sound.path.clone()),
                     RowAction::None => {}
                 }
             }
@@ -391,7 +433,9 @@ fn sound_rows(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
                 state.request_set_sound_volume(id, &path, value);
             }
             if let Some(id) = toggle {
-                let playing = sounds.iter().any(|s| s.id == id && s.playing);
+                let playing = rows
+                    .iter()
+                    .any(|row| matches!(row, RowItem::Loaded(s) if s.id == id && s.playing));
                 if playing {
                     state.request_stop_sound(id);
                 } else {
@@ -404,6 +448,18 @@ fn sound_rows(ui: &mut Ui, state: &mut SoundSharedApp, height: f32) {
             if let Some(id) = remove {
                 state.request_remove_sound(id);
             }
+            if let Some((id, path)) = preview {
+                state.toggle_preview(id, &path);
+            }
+            if let Some(path) = edit_tags {
+                state.open_tag_editor(path);
+            }
+            if let Some(path) = locate {
+                state.locate_sound(path);
+            }
+            if let Some(path) = remove_missing {
+                state.remove_missing_sound(&path);
+            }
         });
 }
 
@@ -415,13 +471,36 @@ enum RowAction {
     Assign,
     Volume(f32),
     SetLoop(bool),
+    /// Start or stop the local preview.
+    Preview,
+    /// Open the tag editor.
+    EditTags,
+    /// Pick the new location of a missing file.
+    Locate,
+}
+
+/// Library facts about a row that the engine-side entry does not carry.
+struct RowView<'a> {
+    /// The file is not on disk.
+    missing: bool,
+    /// This sound is being auditioned on this machine.
+    previewing: bool,
+    /// Tags of the sound.
+    tags: Vec<String>,
+    /// Lower-cased search terms to highlight.
+    terms: &'a [String],
 }
 
 /// A single 64px sound row.
 ///
 /// Playing rows get the rose tint, a flush left signal bar and a pulsing dot —
 /// exactly like the mockup's `Intro Theme` row.
-fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> RowAction {
+fn sound_row(
+    ui: &mut Ui,
+    state: &mut SoundSharedApp,
+    sound: &SoundEntry,
+    view: &RowView,
+) -> RowAction {
     let mut action = RowAction::None;
     let height = Metrics::ROW_H;
     let width = ui.available_width();
@@ -454,6 +533,8 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
             1.0_f32,
             if playing {
                 alpha(Palette::ROSE_600, 110)
+            } else if view.missing {
+                alpha(Palette::AMBER_400, 90)
             } else if hovered {
                 Palette::BORDER_STRONG
             } else {
@@ -557,9 +638,45 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
         });
     }
 
+    // ---- Preview in the headphones (never sent to the players) ----
+    let preview_rect = Rect::from_center_size(
+        egui::pos2(loop_rect.right() + 6.0 + 9.0, rect.center().y),
+        Vec2::splat(18.0),
+    );
+    let preview_resp = preview_button(
+        ui,
+        preview_rect,
+        resp.id.with("preview"),
+        view.previewing,
+        !view.missing,
+    );
+    if preview_resp.clicked() {
+        action = RowAction::Preview;
+    }
+
+    // The group chip is measured first: it decides how much room the name and
+    // the meta line have before the right-hand controls start.
+    let group_name = sound
+        .group
+        .and_then(|id| state.group_name(id))
+        .unwrap_or_else(|| "No group".to_string());
+    let tag_text = elide(&group_name, 14).to_uppercase();
+    let tag_galley = painter.layout_no_wrap(
+        tag_text,
+        crate::gui::widgets::glyph_font(9.0),
+        Palette::ZINC_500,
+    );
+    let tag_w = tag_galley.size().x + 14.0;
+    // Remove (10 + 24), readout (34), gaps (8 + 12), slider, chip.
+    let cluster_left = rect.right() - 168.0 - tag_w;
+
     // ---- Name + metadata ----
-    let text_x = loop_rect.right() + 12.0;
+    let text_x = preview_rect.right() + 12.0;
     let mut name_x = text_x;
+    let text_painter = painter.with_clip_rect(Rect::from_min_max(
+        rect.min,
+        egui::pos2((cluster_left - 8.0).max(text_x), rect.max.y),
+    ));
 
     if playing {
         // Pulsing dot in front of the name (the mockup's playing indicator).
@@ -585,11 +702,30 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
         Palette::WHITE
     };
     let name = elide(&sound.name, 38);
-    let name_galley = painter.layout_no_wrap(name, ui_font(14.0), name_color);
+    // Search matches are lit inside the name.
+    let name_job = highlight_job(
+        &name,
+        view.terms,
+        ui_font(14.0),
+        name_color,
+        Palette::WHITE,
+        alpha(Palette::ROSE_600, 90),
+    );
+    let name_galley = painter.layout_job(name_job);
     // Name sits right above the centre line, the meta line right below it;
     // the old fixed offset let the two overlap by a few pixels.
     let name_y = rect.center().y - name_galley.size().y;
-    painter.galley(egui::pos2(name_x, name_y), name_galley, name_color);
+    let name_size = name_galley.size();
+    text_painter.galley(egui::pos2(name_x, name_y), name_galley, name_color);
+    if view.missing {
+        paint_badge(
+            &text_painter,
+            name_x + name_size.x + 10.0,
+            name_y + name_size.y / 2.0,
+            "File not found",
+            Palette::AMBER_400,
+        );
+    }
 
     // `48 kHz / 00:42 / WAV` — mono telemetry under the name.
     let rate = if sound.sample_rate > 0 {
@@ -603,13 +739,65 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
         format_duration(sound.duration),
         crate::gui::widgets::format_extension(&sound.path)
     );
-    painter.text(
+    let meta_rect = text_painter.text(
         egui::pos2(text_x, rect.center().y + 3.0),
         egui::Align2::LEFT_TOP,
         meta.to_uppercase(),
         crate::gui::widgets::glyph_font(10.0),
         Palette::ZINC_500,
     );
+
+    // After the telemetry: how to fix a missing file, or the tags (a click
+    // edits them; an untagged row offers "+ TAG" while hovered).
+    let extra_x = meta_rect.right() + 14.0;
+    if view.missing {
+        let galley = painter.layout_no_wrap(
+            "LOCATE…".to_string(),
+            crate::gui::widgets::glyph_font(10.0),
+            Palette::AMBER_400,
+        );
+        let locate_rect = Rect::from_min_size(
+            egui::pos2(extra_x - 4.0, meta_rect.top() - 2.0),
+            galley.size() + Vec2::new(8.0, 4.0),
+        );
+        let locate_resp = ui
+            .interact(locate_rect, resp.id.with("locate"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Pick the file's new location");
+        let color = if locate_resp.hovered() {
+            Palette::WHITE
+        } else {
+            Palette::AMBER_400
+        };
+        text_painter.galley(egui::pos2(extra_x, meta_rect.top()), galley, color);
+        if locate_resp.clicked() {
+            action = RowAction::Locate;
+        }
+    } else if !view.tags.is_empty() || hovered {
+        let (text, color) = if view.tags.is_empty() {
+            ("+ TAG".to_string(), Palette::ZINC_600)
+        } else {
+            (format_tags(&view.tags, 4), Palette::ZINC_400)
+        };
+        let galley = painter.layout_no_wrap(text, crate::gui::widgets::glyph_font(10.0), color);
+        let tags_rect = Rect::from_min_size(
+            egui::pos2(extra_x - 4.0, meta_rect.top() - 2.0),
+            galley.size() + Vec2::new(8.0, 4.0),
+        );
+        let tags_resp = ui
+            .interact(tags_rect, resp.id.with("tags"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Edit tags");
+        let color = if tags_resp.hovered() {
+            Palette::WHITE
+        } else {
+            color
+        };
+        text_painter.galley(egui::pos2(extra_x, meta_rect.top()), galley, color);
+        if tags_resp.clicked() {
+            action = RowAction::EditTags;
+        }
+    }
 
     // ---- Right side: group tag, volume, assign, remove ----
     let mut cursor = rect.right() - 10.0;
@@ -711,18 +899,7 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
     }
     cursor -= Metrics::ROW_SLIDER_W;
 
-    // Group tag (click to reassign)
-    let group_name = sound
-        .group
-        .and_then(|id| state.group_name(id))
-        .unwrap_or_else(|| "No group".to_string());
-    let tag_text = elide(&group_name, 14).to_uppercase();
-    let tag_galley = painter.layout_no_wrap(
-        tag_text,
-        crate::gui::widgets::glyph_font(9.0),
-        Palette::ZINC_500,
-    );
-    let tag_w = tag_galley.size().x + 14.0;
+    // Group tag (click to reassign); measured above.
     cursor -= Metrics::MD;
     let tag_rect = Rect::from_center_size(
         egui::pos2(cursor - tag_w / 2.0, rect.center().y),
@@ -770,6 +947,28 @@ fn action_is_none(action: &RowAction) -> bool {
 
 /// Centred empty state with a contextual call to action.
 fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, height: f32) {
+    // A search or tag filter that matches nothing is not an empty library.
+    if state.lib_ui.filter.is_active() {
+        ui.allocate_ui(Vec2::new(ui.available_width(), height), |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space((height * 0.2).clamp(12.0, 90.0));
+                ui.label(telemetry("NO MATCHES", 22.0, Palette::BORDER_STRONG));
+                ui.add_space(Metrics::SM);
+                ui.label(micro_label("Nothing fits the search and tags above"));
+                ui.add_space(Metrics::LG);
+                if ConsoleButton::ghost("Clear Filters")
+                    .glyph(glyph::CROSS)
+                    .width(150.0)
+                    .id_salt("empty_clear_filters")
+                    .show(ui)
+                    .clicked()
+                {
+                    state.lib_ui.filter.clear();
+                }
+            });
+        });
+        return;
+    }
     let filter_desc = match filter {
         GroupFilter::All => "No sounds yet".to_string(),
         GroupFilter::Ungrouped => "Nothing ungrouped".to_string(),
