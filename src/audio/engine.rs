@@ -1741,6 +1741,7 @@ mod tests {
             sample_rate: 1,
             channels: 0,
             master_volume: 0.8,
+            ..crate::config::AudioConfig::default()
         };
         assert_eq!(
             DevicePrefs::from_audio_config(&audio),

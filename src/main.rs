@@ -518,6 +518,13 @@ fn main() -> Result<()> {
             warn!("Could not save the new access key to config.toml: {}", e);
         }
     }
+    // The remote game-master panel has its own key. Missing => generated and
+    // saved; `gm_token = ""` keeps the panel reachable from this PC only.
+    if config.server.ensure_gm_token() {
+        if let Err(e) = config.save() {
+            warn!("Could not save the new gm_token to config.toml: {}", e);
+        }
+    }
     let access = soundshared::network::AccessGuard::new(config.server.access_token.clone());
     if access.current().is_none() {
         warn!("Listener stream is open: access_token is empty in config.toml");
