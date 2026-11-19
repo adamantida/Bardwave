@@ -49,6 +49,32 @@ pub enum AudioCommand {
     StopAll {
         response: Sender<anyhow::Result<()>>,
     },
+    /// Switch to a scene (library scene id, a UUID string): the Director
+    /// starts its sounds, retunes common ones and fades out the rest.
+    ActivateScene {
+        id: String,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Fade out the active scene's sounds.
+    StopScene {
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Save the mix that plays now as a new scene. The reply is the scene as
+    /// stored in the library.
+    SnapshotScene {
+        name: String,
+        response: Sender<anyhow::Result<crate::config::SceneConfig>>,
+    },
+    /// Play a sound once over everything, independent of the active scene.
+    PlayStinger {
+        id: SoundId,
+        response: Sender<anyhow::Result<()>>,
+    },
+    /// Fade everything out over `fade_ms` milliseconds.
+    StopAllFade {
+        fade_ms: u32,
+        response: Sender<anyhow::Result<()>>,
+    },
 }
 
 /// Sound information for GUI display
