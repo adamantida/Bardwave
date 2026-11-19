@@ -21,7 +21,8 @@
 //!
 //! A ring buffer cannot be flushed from the consumer side while the producer
 //! is writing. [`seek`](StreamSource::seek) therefore bumps a generation
-//! counter and sends the target to the worker; the worker repositions the
+//! counter and publishes the target in atomics (the audio callback may seek:
+//! it must not touch an allocating channel); the worker repositions the
 //! file, then publishes `(generation, samples pushed so far)`. The reader
 //! plays silence until it sees its generation acknowledged and then discards
 //! exactly the samples that were pushed before the acknowledgement.
@@ -36,7 +37,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use parking_lot::Mutex;
 use rtrb::{Consumer, Producer, RingBuffer};
 use tracing::{debug, warn};
@@ -107,17 +108,23 @@ impl Default for StreamOptions {
     }
 }
 
-/// Messages to the worker.
-enum Cmd {
-    Seek { generation: u32, frame: u64 },
-    Stop,
-}
+/// Wake-up token for the worker. The channel is bounded (capacity 1) so a
+/// `try_send` from the audio callback never allocates; the payload of a seek
+/// travels in [`Shared`] atomics, the token only cuts the worker's sleep short.
+struct Wake;
 
 /// State shared by the reader and the worker.
 struct Shared {
     stop: AtomicBool,
     paused: AtomicBool,
     looped: AtomicBool,
+    /// Newest seek the reader asked for: generation and target frame. The
+    /// reader writes the frame first, then the generation (Release).
+    seek_generation: AtomicU32,
+    seek_target: AtomicU64,
+    /// The worker thread panicked: nothing more will ever be decoded. Set
+    /// before `eof`, so a reader that sees `eof` also sees this.
+    dead: AtomicBool,
     /// The worker has pushed the last frame of the file (not looping).
     eof: AtomicBool,
     /// Last seek generation the worker has carried out ...
@@ -138,7 +145,7 @@ pub struct StreamSource {
     // does not lock.
     consumer: Mutex<Consumer<f32>>,
     shared: Arc<Shared>,
-    cmd_tx: Sender<Cmd>,
+    cmd_tx: Sender<Wake>,
     meta: TrackMeta,
     path: PathBuf,
     /// Duration from the container header, in frames at 48 kHz.
@@ -190,11 +197,14 @@ impl StreamSource {
             .map(|s| (s * f64::from(TARGET_SAMPLE_RATE)).round() as u64);
 
         let (producer, consumer) = RingBuffer::new(options.ring_frames.max(PREFILL_FRAMES) * CH);
-        let (cmd_tx, cmd_rx) = unbounded();
+        let (cmd_tx, cmd_rx) = bounded(1);
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(options.start_paused),
             looped: AtomicBool::new(false),
+            seek_generation: AtomicU32::new(0),
+            seek_target: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
             eof: AtomicBool::new(false),
             ack_generation: AtomicU32::new(0),
             ack_boundary: AtomicU64::new(0),
@@ -214,13 +224,13 @@ impl StreamSource {
             pushed: 0,
             pass_frames: 0,
             ended: false,
+            handled_generation: 0,
         };
         thread::Builder::new()
             .name("bardwave-stream".into())
             .spawn(move || {
-                let exited = Arc::clone(&worker.shared.exited);
-                worker.run();
-                exited.store(true, Ordering::Release);
+                let shared = Arc::clone(&worker.shared);
+                run_guarded(&shared, std::panic::AssertUnwindSafe(move || worker.run()));
             })?;
 
         Ok(Self {
@@ -363,12 +373,15 @@ impl StreamSource {
         self.finished = false;
         self.base_frame = frame;
         self.played_frames = 0;
-        // Only fails when the worker is gone (it ended on an error): nothing
-        // to seek then, the reader will play the track out as finished.
-        let _ = self.cmd_tx.send(Cmd::Seek {
-            generation: self.want_generation,
-            frame,
-        });
+        // Atomics plus a bounded wake-up: no allocation, safe from the audio
+        // callback (a stopped or looped track rewinds there).
+        self.shared.seek_target.store(frame, Ordering::Relaxed);
+        self.shared
+            .seek_generation
+            .store(self.want_generation, Ordering::Release);
+        // A full channel already holds a pending wake-up; a gone worker
+        // (disconnected) has nothing to seek, see `read`.
+        let _ = self.cmd_tx.try_send(Wake);
     }
 
     /// Back to the start, for a track that is played again. Does nothing (and
@@ -394,6 +407,12 @@ impl StreamSource {
         let dst = &mut dst[..want * CH];
 
         if self.seek_pending && !self.sync_seek() {
+            if self.shared.dead.load(Ordering::Acquire) {
+                // The worker panicked and will never acknowledge: end the
+                // track so a playlist moves on instead of playing silence.
+                self.finish();
+                return 0;
+            }
             dst.fill(0.0);
             return want;
         }
@@ -415,21 +434,16 @@ impl StreamSource {
         }
 
         if eof {
-            if self.shared.looped.load(Ordering::Relaxed) {
+            if self.shared.looped.load(Ordering::Relaxed)
+                && !self.shared.dead.load(Ordering::Acquire)
+            {
                 // Looping was switched on after the worker had finished the
                 // file: restart it (one short gap, once).
                 self.seek_frame(0);
                 dst[n * CH..].fill(0.0);
                 return want;
             }
-            self.finished = true;
-            if let Some((tx, track_id)) = &self.events {
-                // Bounded channel: no allocation. A full channel drops the
-                // event rather than blocking the audio thread.
-                let _ = tx.try_send(StreamEvent::TrackFinished {
-                    track_id: *track_id,
-                });
-            }
+            self.finish();
             return n;
         }
 
@@ -438,6 +452,21 @@ impl StreamSource {
             self.underruns += 1;
         }
         want
+    }
+
+    /// Mark the track as played out and tell the listener, once.
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some((tx, track_id)) = &self.events {
+            // Bounded channel: no allocation. A full channel drops the
+            // event rather than blocking the audio thread.
+            let _ = tx.try_send(StreamEvent::TrackFinished {
+                track_id: *track_id,
+            });
+        }
     }
 
     /// Complete a pending seek: true once the worker acknowledged it and the
@@ -468,7 +497,7 @@ impl StreamSource {
 impl Drop for StreamSource {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
-        let _ = self.cmd_tx.send(Cmd::Stop);
+        let _ = self.cmd_tx.try_send(Wake);
         // The worker is not joined: this may run under the mixer's track lock
         // and must not wait for a decode in progress. It notices within a
         // packet and ends (see `worker_exit_flag`).
@@ -483,12 +512,32 @@ fn ms_to_frames(ms: u64) -> u64 {
     ms * u64::from(TARGET_SAMPLE_RATE) / 1000
 }
 
+/// Run the worker body, turning a panic into an orderly end of the stream.
+///
+/// A panicking decoder must not leave the track playing silence forever: the
+/// panic is logged, the stream is marked dead and as ended (`eof`), so the
+/// reader drains what is buffered, reports the track finished and a playlist
+/// moves on. `exited` is set in every case.
+fn run_guarded(shared: &Shared, body: impl FnOnce() + std::panic::UnwindSafe) {
+    if let Err(payload) = std::panic::catch_unwind(body) {
+        let what = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        tracing::error!("stream decoder thread panicked: {what}");
+        shared.dead.store(true, Ordering::Release);
+        shared.eof.store(true, Ordering::Release);
+    }
+    shared.exited.store(true, Ordering::Release);
+}
+
 /// The decoder thread.
 struct Worker {
     reader: PacketReader,
     path: PathBuf,
     producer: Producer<f32>,
-    rx: Receiver<Cmd>,
+    rx: Receiver<Wake>,
     shared: Arc<Shared>,
     /// Built when the first packet tells the real sample rate.
     resampler: Option<Resampler>,
@@ -501,6 +550,8 @@ struct Worker {
     pass_frames: u64,
     /// The pass is over and the file is not repeating: nothing more to decode.
     ended: bool,
+    /// Newest seek generation this worker has carried out.
+    handled_generation: u32,
 }
 
 impl Worker {
@@ -509,16 +560,16 @@ impl Worker {
             if self.shared.stop.load(Ordering::Acquire) {
                 return;
             }
-            // Commands first; only the newest seek matters.
-            let mut seek = None;
+            // Wake-ups first (their payload is in the atomics); the source
+            // being dropped disconnects the channel.
             loop {
                 match self.rx.try_recv() {
-                    Ok(Cmd::Seek { generation, frame }) => seek = Some((generation, frame)),
-                    Ok(Cmd::Stop) | Err(TryRecvError::Disconnected) => return,
+                    Ok(Wake) => {}
+                    Err(TryRecvError::Disconnected) => return,
                     Err(TryRecvError::Empty) => break,
                 }
             }
-            if let Some((generation, frame)) = seek {
+            if let Some((generation, frame)) = self.requested_seek() {
                 self.seek(generation, frame);
             }
 
@@ -559,17 +610,32 @@ impl Worker {
     /// Sleep up to `timeout`, waking early for a command.
     fn idle(&mut self, timeout: Duration) {
         match self.rx.recv_timeout(timeout) {
-            Ok(Cmd::Seek { generation, frame }) => self.seek(generation, frame),
-            Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => {
-                self.shared.stop.store(true, Ordering::Release)
+            // The run loop picks up the seek request right after.
+            Ok(Wake) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => self.shared.stop.store(true, Ordering::Release),
+        }
+    }
+
+    /// The newest seek the reader asked for, if it was not carried out yet.
+    fn requested_seek(&self) -> Option<(u32, u64)> {
+        loop {
+            let generation = self.shared.seek_generation.load(Ordering::Acquire);
+            if generation == self.handled_generation {
+                return None;
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            let frame = self.shared.seek_target.load(Ordering::Relaxed);
+            // A newer request may have landed between the two loads: retry so
+            // generation and frame belong together.
+            if self.shared.seek_generation.load(Ordering::Acquire) == generation {
+                return Some((generation, frame));
+            }
         }
     }
 
     /// Reposition the file, drop what was decoded for the old position and
     /// acknowledge to the reader.
     fn seek(&mut self, generation: u32, frame: u64) {
+        self.handled_generation = generation;
         self.pending.clear();
         self.pending_pos = 0;
         self.ended = false;
@@ -709,6 +775,146 @@ mod tests {
     fn ms_and_frames_round_trip() {
         assert_eq!(ms_to_frames(1000), 48_000);
         assert_eq!(frames_to_ms(48_000 * 3 + 480), 3_010);
+    }
+
+    /// A tiny 48 kHz stereo WAV in the system temp dir (removed by the test).
+    fn temp_wav(frames: usize) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("bardwave-ss-unit-{}.wav", Uuid::new_v4()));
+        let data_len = (frames * 4) as u32;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&48_000u32.to_le_bytes());
+        b.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..frames * 2 {
+            b.extend_from_slice(&(((i % 100) as i16 + 1) * 10).to_le_bytes());
+        }
+        std::fs::write(&path, b).unwrap();
+        path
+    }
+
+    /// A source whose decoder is held back, so only the flags set by the test
+    /// decide what the reader sees.
+    fn held_source(path: &Path) -> (StreamSource, Receiver<StreamEvent>, Uuid) {
+        let mut source = StreamSource::open_with(
+            path,
+            StreamOptions {
+                start_paused: true,
+                ..StreamOptions::default()
+            },
+        )
+        .unwrap();
+        let (tx, rx) = bounded(8);
+        let id = Uuid::new_v4();
+        source.set_event_sink(tx, id);
+        (source, rx, id)
+    }
+
+    fn kill_worker(source: &StreamSource) {
+        source.shared.dead.store(true, Ordering::Release);
+        source.shared.eof.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn a_dead_decoder_ends_the_track_instead_of_silence() {
+        let path = temp_wav(48_000);
+        let (mut source, events, id) = held_source(&path);
+        kill_worker(&source);
+        let mut buf = vec![0.0f32; 256 * CH];
+        assert_eq!(source.read(&mut buf), 0);
+        assert!(source.is_finished());
+        assert_eq!(
+            events.try_recv(),
+            Ok(StreamEvent::TrackFinished { track_id: id })
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_dead_decoder_does_not_restart_a_looping_track() {
+        let path = temp_wav(48_000);
+        let (mut source, events, id) = held_source(&path);
+        source.set_looped(true);
+        kill_worker(&source);
+        let mut buf = vec![0.0f32; 256 * CH];
+        assert_eq!(source.read(&mut buf), 0);
+        assert!(source.is_finished());
+        assert_eq!(
+            events.try_recv(),
+            Ok(StreamEvent::TrackFinished { track_id: id })
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_seek_on_a_dead_decoder_finishes_the_track() {
+        let path = temp_wav(48_000);
+        let (mut source, events, id) = held_source(&path);
+        source.shared.dead.store(true, Ordering::Release);
+        source.seek_frame(1000); // never acknowledged
+        let mut buf = vec![0.0f32; 256 * CH];
+        assert_eq!(source.read(&mut buf), 0);
+        assert_eq!(
+            events.try_recv(),
+            Ok(StreamEvent::TrackFinished { track_id: id })
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_panicking_worker_is_caught_and_marks_the_stream_ended() {
+        let path = temp_wav(4_800);
+        let source = StreamSource::open_with(
+            &path,
+            StreamOptions {
+                start_paused: true,
+                ..StreamOptions::default()
+            },
+        )
+        .unwrap();
+        let shared = Arc::clone(&source.shared);
+        // Make sure the real worker is out of the way before staging a panic.
+        drop(source);
+        let staged = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            looped: AtomicBool::new(false),
+            seek_generation: AtomicU32::new(0),
+            seek_target: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            eof: AtomicBool::new(false),
+            ack_generation: AtomicU32::new(0),
+            ack_boundary: AtomicU64::new(0),
+            total_frames: AtomicU64::new(0),
+            exited: Arc::new(AtomicBool::new(false)),
+        });
+        drop(shared);
+        run_guarded(&staged, || panic!("decoder blew up"));
+        assert!(staged.dead.load(Ordering::Acquire));
+        assert!(staged.eof.load(Ordering::Acquire));
+        assert!(staged.exited.load(Ordering::Acquire));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_seek_does_not_use_the_command_channel_payload() {
+        // The seek travels through atomics: after a seek the request is
+        // visible without anything having been queued except the wake token.
+        let path = temp_wav(48_000);
+        let (mut source, _events, _id) = held_source(&path);
+        source.seek_frame(777);
+        assert_eq!(source.shared.seek_target.load(Ordering::Relaxed), 777);
+        assert_eq!(source.shared.seek_generation.load(Ordering::Relaxed), 1);
+        assert!(source.cmd_tx.len() <= 1);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

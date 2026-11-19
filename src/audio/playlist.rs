@@ -105,6 +105,32 @@ pub trait MusicPlayback {
     fn meta(&self, sound: SoundId) -> Option<TrackMeta>;
     /// Sounds whose track played to its end since the last call.
     fn take_finished(&self) -> Vec<SoundId>;
+    /// Ids of the sound's tracks that exist right now (empty when the output
+    /// has no track ids). The player remembers them: a track that ended and
+    /// was removed by another start can still be recognised as the one that
+    /// ended.
+    fn track_ids(&self, _sound: SoundId) -> Vec<uuid::Uuid> {
+        Vec::new()
+    }
+    /// Like [`take_finished`](Self::take_finished), plus the ids of the tracks
+    /// that ended, *including those already pruned from the engine's
+    /// registry* (their sound can no longer be looked up). Default: the sound
+    /// list only.
+    fn take_ended(&self) -> EndedTracks {
+        EndedTracks {
+            sounds: self.take_finished(),
+            tracks: Vec::new(),
+        }
+    }
+}
+
+/// What [`MusicPlayback::take_ended`] reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EndedTracks {
+    /// Sounds whose track ended (resolved while the track was registered).
+    pub sounds: Vec<SoundId>,
+    /// Every track that ended, by id.
+    pub tracks: Vec<uuid::Uuid>,
 }
 
 impl MusicPlayback for AudioEngine {
@@ -150,16 +176,33 @@ impl MusicPlayback for AudioEngine {
     }
 
     fn take_finished(&self) -> Vec<SoundId> {
-        let events = self.stream_events();
-        let tracks = self.inner.active_tracks.read();
-        events
+        self.take_ended().sounds
+    }
+
+    fn track_ids(&self, sound: SoundId) -> Vec<uuid::Uuid> {
+        self.tracks_of(sound)
+    }
+
+    fn take_ended(&self) -> EndedTracks {
+        // Streamed tracks report themselves; any track (streamed or not)
+        // that ended and was pruned by a later start lands in the mixer's log.
+        let mut ids: Vec<uuid::Uuid> = self
+            .stream_events()
             .try_iter()
-            .filter_map(|event| match event {
-                crate::audio::StreamEvent::TrackFinished { track_id } => {
-                    tracks.get(&track_id).copied()
-                }
+            .map(|event| match event {
+                crate::audio::StreamEvent::TrackFinished { track_id } => track_id,
             })
-            .collect()
+            .collect();
+        ids.extend(self.take_pruned_ended());
+        let tracks = self.inner.active_tracks.read();
+        let sounds = ids
+            .iter()
+            .filter_map(|id| tracks.get(id).copied())
+            .collect();
+        EndedTracks {
+            sounds,
+            tracks: ids,
+        }
     }
 }
 
@@ -321,6 +364,8 @@ struct Current {
     sound: SoundId,
     library_id: String,
     meta: TrackMeta,
+    /// Ids of the engine tracks of this start (see [`MusicPlayback::track_ids`]).
+    tracks: Vec<uuid::Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,7 +709,23 @@ impl PlaylistPlayer {
         now: Instant,
     ) -> bool {
         self.apply_pending(pb);
-        let finished = pb.music().map(|m| m.take_finished()).unwrap_or_default();
+        let ended = pb.music().map(|m| m.take_ended()).unwrap_or_default();
+        let mut finished = ended.sounds;
+        if let Some(current) = self.current.as_mut() {
+            // The ids of the track(s) of the current start: kept up to date
+            // while they exist, so an end that another start pruned before
+            // this tick is still attributed to this track.
+            if let Some(music) = pb.music() {
+                for id in music.track_ids(current.sound) {
+                    if !current.tracks.contains(&id) {
+                        current.tracks.push(id);
+                    }
+                }
+            }
+            if ended.tracks.iter().any(|id| current.tracks.contains(id)) {
+                finished.push(current.sound);
+            }
+        }
         self.deadline = None;
         let mut changed = false;
         if self.status == PlaylistStatus::Playing {
@@ -967,6 +1028,10 @@ impl PlaylistPlayer {
             meta: pb
                 .music()
                 .and_then(|m| m.meta(entry.sound))
+                .unwrap_or_default(),
+            tracks: pb
+                .music()
+                .map(|m| m.track_ids(entry.sound))
                 .unwrap_or_default(),
         })
     }

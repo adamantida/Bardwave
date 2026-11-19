@@ -1032,6 +1032,12 @@ impl AudioEngine {
         self.inner.mixer.stream_events()
     }
 
+    /// Tracks that played out and were pruned by a later start since the last
+    /// call (see [`AudioMixer::take_pruned_ended`]).
+    pub fn take_pruned_ended(&self) -> Vec<Uuid> {
+        self.inner.mixer.take_pruned_ended()
+    }
+
     /// Playback position of a track, in milliseconds.
     pub fn track_position_ms(&self, track_id: Uuid) -> Result<u64, EngineError> {
         Ok(self.inner.mixer.track_position_ms(track_id)?)
@@ -1271,6 +1277,24 @@ impl AudioEngine {
         }
 
         debug!("Set volume of sound {} to {}", sound_id.0, volume);
+        Ok(())
+    }
+
+    /// Multiply the volume of a sound by `ratio` (clamped to `0.0..=1.0`)
+    /// without cutting a fade of a running track short, see
+    /// [`AudioMixer::scale_track_volume`].
+    pub fn scale_sound_volume(&self, sound_id: SoundId, ratio: f32) -> Result<(), EngineError> {
+        if !self.has_sound(sound_id) {
+            return Err(EngineError::SoundNotFound(sound_id));
+        }
+        {
+            let mut volumes = self.inner.sound_volumes.write();
+            let volume = volumes.entry(sound_id).or_insert(1.0);
+            *volume = (*volume * ratio).clamp(0.0, 1.0);
+        }
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.inner.mixer.scale_track_volume(track_id, ratio)?;
+        }
         Ok(())
     }
 
@@ -2818,5 +2842,90 @@ mod mixer_facade_tests {
         );
         assert!(dev.iter().all(|s| (*s - 0.25).abs() < 1e-6));
         assert!(rx.try_recv().is_err());
+    }
+
+    fn short_sound(engine: &AudioEngine, frames: usize) -> SoundId {
+        engine.load_sound_from_data(DecodedAudio::new(vec![0.25; frames * 2], 48_000, 2))
+    }
+
+    fn mix(engine: &AudioEngine, frames: usize) {
+        callback(engine, frames);
+    }
+
+    /// The track ended, then another `play` pruned it from the engine before
+    /// the player's next tick: the player must still move on to the next
+    /// track instead of stopping.
+    #[test]
+    fn a_pruned_ended_track_still_advances_the_playlist() {
+        let engine = AudioEngine::new().unwrap();
+        let (a, b, sfx) = (
+            short_sound(&engine, 2_000),
+            short_sound(&engine, 20_000),
+            short_sound(&engine, 500),
+        );
+        let catalog = vec![
+            crate::audio::director::CatalogSound::new("a", a),
+            crate::audio::director::CatalogSound::new("b", b),
+            crate::audio::director::CatalogSound::new("sfx", sfx),
+        ];
+        let config = crate::config::PlaylistConfig {
+            id: "pl".into(),
+            name: "pl".into(),
+            items: vec!["a".into(), "b".into()],
+            shuffle: false,
+            repeat: crate::config::RepeatMode::Off,
+            crossfade_ms: 0,
+            bus: crate::config::Bus::Music,
+        };
+        let mut player = crate::audio::playlist::PlaylistPlayer::with_seed(1);
+        player.start(&engine, &catalog, config, 0).unwrap();
+        assert_eq!(player.current_sound(), Some(a));
+
+        // The first track plays out ...
+        mix(&engine, 4_000);
+        // ... and a stinger starts before the player has ticked: that play
+        // prunes the finished track out of the engine.
+        engine.play(sfx).unwrap();
+        assert!(
+            !engine.inner.active_tracks.read().values().any(|s| *s == a),
+            "the ended track is gone"
+        );
+
+        player.tick(&engine, &catalog, std::time::Instant::now());
+        assert_eq!(
+            player.status(),
+            crate::audio::playlist::PlaylistStatus::Playing
+        );
+        assert_eq!(player.current_sound(), Some(b));
+    }
+
+    /// A track stopped by somebody else (not ended) still halts the player.
+    #[test]
+    fn a_stopped_track_does_not_count_as_ended() {
+        let engine = AudioEngine::new().unwrap();
+        let (a, b) = (short_sound(&engine, 480_000), short_sound(&engine, 480_000));
+        let catalog = vec![
+            crate::audio::director::CatalogSound::new("a", a),
+            crate::audio::director::CatalogSound::new("b", b),
+        ];
+        let config = crate::config::PlaylistConfig {
+            id: "pl".into(),
+            name: "pl".into(),
+            items: vec!["a".into(), "b".into()],
+            shuffle: false,
+            repeat: crate::config::RepeatMode::Off,
+            crossfade_ms: 0,
+            bus: crate::config::Bus::Music,
+        };
+        let mut player = crate::audio::playlist::PlaylistPlayer::with_seed(1);
+        player.start(&engine, &catalog, config, 0).unwrap();
+        mix(&engine, 1_000);
+        engine.stop_sound(a).unwrap();
+        mix(&engine, 1_000);
+        player.tick(&engine, &catalog, std::time::Instant::now());
+        assert_ne!(
+            player.status(),
+            crate::audio::playlist::PlaylistStatus::Playing
+        );
     }
 }

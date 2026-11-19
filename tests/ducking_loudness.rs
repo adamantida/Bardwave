@@ -118,6 +118,14 @@ impl Playback for MixerRig {
         self.levels.lock().insert(sound, volume);
         Ok(())
     }
+    fn scale_volume(&self, sound: SoundId, ratio: f32) -> R {
+        let track = self.track(sound)?;
+        self.mixer.scale_track_volume(track, ratio)?;
+        let mut levels = self.levels.lock();
+        let level = levels.entry(sound).or_insert(1.0);
+        *level = (*level * ratio).clamp(0.0, 1.0);
+        Ok(())
+    }
     fn set_looped(&self, sound: SoundId, looped: bool) -> R {
         Ok(self.mixer.set_track_looped(self.track(sound)?, looped)?)
     }
@@ -655,6 +663,42 @@ fn user_volume_and_gain_multiply() {
     assert_eq!(rig.volume(sound), Some(1.0));
 
     assert!(!director.set_sound_gain_db(&rig, "nope", -3.0));
+}
+
+#[test]
+fn a_measured_gain_does_not_reset_a_fade_in_progress() {
+    let rig = MixerRig::new();
+    let sound = rig.add_dc(0.5);
+    let mut director = director_with(&[("s", sound, Bus::Ambience)], &quick_audio());
+    director.play_sound(&rig, sound, true).unwrap();
+    rig.settle(50);
+
+    // A one second fade from full level down to 0.2 is running ...
+    let track = rig.track(sound).unwrap();
+    rig.mixer
+        .fade_track_to(track, 0.2, 1000, soundshared::audio::FadeCurve::Linear)
+        .unwrap();
+    rig.render(RATE as usize / 4);
+    let before = rig.mixer.track_gain(track).unwrap();
+    assert!(before > 0.3 && before < 0.9, "mid-fade gain {before}");
+
+    // ... when the loudness measurement comes back with -6 dB.
+    assert!(director.set_sound_gain_db(&rig, "s", -6.0));
+    assert!(
+        rig.mixer.is_track_fading(track).unwrap(),
+        "the fade must keep running"
+    );
+    let out = rig.render(RATE as usize / 8);
+    let first = out[0] / 0.5;
+    assert!(
+        (first - before).abs() < 0.02,
+        "no jump at the hand-over: {first} vs {before}"
+    );
+    // The fade still ends where it was heading, scaled by the gain.
+    rig.render(RATE as usize);
+    let end = rig.mixer.track_gain(track).unwrap();
+    approx(end, 0.2 * 10f32.powf(-6.0 / 20.0), 1e-4);
+    assert!(!rig.mixer.is_track_fading(track).unwrap());
 }
 
 #[test]
