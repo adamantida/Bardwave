@@ -192,7 +192,7 @@ pub struct SoundSharedApp {
     /// Last time the library was flushed to disk.
     last_persist: Instant,
     /// Master volume stashed while muted.
-    muted: Option<f32>,
+    pub(crate) muted: Option<f32>,
 
     /// Last known state of the desktop output (`Running`, `Headless`, `Failed`).
     ///
@@ -240,6 +240,8 @@ pub struct SoundSharedApp {
     /// Hotkeys, bus faders / ducking / normalization and the game-master link
     /// state (see `hotkeys_ui`, `settings_extras`, `server_panel`).
     pub(crate) extras: crate::gui::settings_extras::ConsoleExtras,
+    /// The phone panel's end of the console, when this process serves it.
+    pub(crate) gm: Option<crate::gui::gm_bridge::GmBridge>,
 }
 
 /// Hand the Director the current scenes and the loaded library sounds.
@@ -379,6 +381,7 @@ impl SoundSharedApp {
         // Hotkeys: the bindings come with the library; the system-wide service
         // starts here because eframe creates the app on the main thread.
         let extras = crate::gui::settings_extras::ConsoleExtras::new(ctx, &app_state, &library);
+        let gm_link = app_state.gm_panel.clone();
 
         let mut app = Self {
             app_state,
@@ -426,6 +429,7 @@ impl SoundSharedApp {
             scenes: Default::default(),
             music: Default::default(),
             extras,
+            gm: gm_link.map(|link| crate::gui::gm_bridge::GmBridge::attach(ctx, link)),
         };
 
         // Request initial server status
@@ -1498,6 +1502,9 @@ impl SoundSharedApp {
         // Scene deck: replies to its commands, the active scene, its repaints.
         self.scene_frame(ctx);
 
+        // Phone panel: run its commands on this thread, publish the state.
+        self.gm_frame();
+
         // Feed the engine the library files that did not fit the channel on
         // the previous pass.
         self.pump_pending_loads();
@@ -1677,7 +1684,7 @@ impl SoundSharedApp {
     }
 
     /// Process pending audio commands on the main thread
-    fn process_audio_commands(&mut self) {
+    pub(crate) fn process_audio_commands(&mut self) {
         // Try to get commands without blocking
         while let Ok(cmd) = self.audio_cmd_rx.try_recv() {
             if let Some(engine) = self.audio_engine.lock().unwrap().as_mut() {

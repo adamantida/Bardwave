@@ -248,6 +248,10 @@ pub struct AppState {
     /// Whether this process actually serves `/control` (today only with
     /// `--server-only`). The console says so next to the game-master link.
     pub gm_panel_served: bool,
+
+    /// Where the phone panel's commands arrive and its state goes, when the
+    /// console serves the panel (see `gui::gm_bridge`).
+    pub gm_panel: Option<crate::gui::gm_bridge::GmPanelLink>,
 }
 
 impl AppState {
@@ -268,6 +272,7 @@ impl AppState {
             access: Default::default(),
             gm: Default::default(),
             gm_panel_served: false,
+            gm_panel: None,
         }
     }
 
@@ -276,6 +281,14 @@ impl AppState {
     pub fn with_gm(mut self, gm: crate::network::GmGuard, served: bool) -> Self {
         self.gm = gm;
         self.gm_panel_served = served;
+        self
+    }
+
+    /// Serve the phone panel from this console: its commands are run by the
+    /// window's own loop and its state is the window's state.
+    pub fn with_gm_panel(mut self, link: crate::gui::gm_bridge::GmPanelLink) -> Self {
+        self.gm_panel = Some(link);
+        self.gm_panel_served = true;
         self
     }
 

@@ -608,15 +608,23 @@ fn main() -> Result<()> {
         config.server.gm_token.clone(),
     ));
     let control_feed = soundshared::network::control::ControlFeed::new();
-    let control_routes = server_only.then(|| {
-        soundshared::network::control::ControlContext::new(
-            control_tx,
-            gm_auth.clone(),
-            control_feed.clone(),
-        )
-    });
+    // Both modes serve the panel: `--server-only` runs the commands on the
+    // main thread, the console runs them in its own frame loop. The routes
+    // are part of the router, so they are reachable exactly while the server
+    // is started.
+    let control_routes = Some(soundshared::network::control::ControlContext::new(
+        control_tx,
+        gm_auth.clone(),
+        control_feed.clone(),
+    ));
     // The console shows the game-master link and can replace the token.
-    let app_state = app_state.with_gm(gm_auth.guard().clone(), control_routes.is_some());
+    let mut app_state = app_state.with_gm(gm_auth.guard().clone(), true);
+    if !server_only {
+        app_state = app_state.with_gm_panel(soundshared::gui::gm_bridge::GmPanelLink {
+            commands: control_rx.clone(),
+            feed: control_feed.clone(),
+        });
+    }
     thread::spawn(move || {
         if let Err(e) = run_server_and_get_handle(
             server_config_clone,

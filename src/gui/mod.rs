@@ -15,6 +15,7 @@
 
 pub mod app;
 pub mod dialog;
+pub mod gm_bridge;
 pub mod groups;
 pub mod hotkeys_ui;
 pub mod library_ui;
