@@ -287,6 +287,10 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
             }
         }
 
+        Dialog::SaveMixAsScene { .. } | Dialog::EditScene(_) | Dialog::DeleteScene { .. } => {
+            crate::gui::scenes::show_scene_dialog(ctx, state, dialog);
+        }
+
         Dialog::AddYouTube { url, error } => {
             let mut field = url;
             let mut submit = false;
@@ -433,8 +437,13 @@ fn assign_row(ui: &mut Ui, label: &str, selected: bool) -> bool {
 
 /// Standard modal chrome: centred, fixed width, console panel frame.
 fn modal(ctx: &Context, add: impl FnOnce(&mut Ui)) {
-    egui::Window::new("soundshared_modal")
-        .id(egui::Id::new("soundshared_modal"))
+    modal_sized(ctx, "soundshared_modal", MODAL_W, add);
+}
+
+/// [`modal`] with its own window id and width (the scene editor is wider).
+pub(crate) fn modal_sized(ctx: &Context, id: &'static str, width: f32, add: impl FnOnce(&mut Ui)) {
+    egui::Window::new(id)
+        .id(egui::Id::new(id))
         .order(egui::Order::Foreground)
         .title_bar(false)
         .collapsible(false)
@@ -442,7 +451,7 @@ fn modal(ctx: &Context, add: impl FnOnce(&mut Ui)) {
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
         .frame(crate::gui::theme::panel_frame())
         .show(ctx, |ui| {
-            ui.set_width(MODAL_W);
+            ui.set_width(width);
             add(ui);
         });
 }
@@ -458,7 +467,7 @@ fn paint_scrim(ctx: &Context) {
 }
 
 /// `TITLE` + a one-line explanation.
-fn header(ui: &mut Ui, title: &str, subtitle: &str) {
+pub(crate) fn header(ui: &mut Ui, title: &str, subtitle: &str) {
     ui.label(crate::gui::theme::micro_label_accent("Confirm"));
     ui.add_space(2.0);
     ui.label(panel_title(title));
@@ -479,7 +488,7 @@ fn name_field(ui: &mut Ui, value: &mut String, hint: &str) -> egui::Response {
 }
 
 /// Red validation line under a field.
-fn error_line(ui: &mut Ui, message: &str) {
+pub(crate) fn error_line(ui: &mut Ui, message: &str) {
     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
         ui.label(
             RichText::new(message.to_uppercase())

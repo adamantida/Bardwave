@@ -17,6 +17,7 @@ pub mod app;
 pub mod dialog;
 pub mod groups;
 pub mod motion;
+pub mod scenes;
 pub mod server_panel;
 pub mod sound_list;
 pub mod theme;

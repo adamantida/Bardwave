@@ -60,6 +60,12 @@ pub enum Dialog {
     /// its validation error; the download itself runs on a worker thread and
     /// reports into [`SoundSharedApp::youtube_result_rx`].
     AddYouTube { url: String, error: Option<String> },
+    /// Save the mix that plays now as a scene (name field and its error).
+    SaveMixAsScene { name: String, error: Option<String> },
+    /// Create or edit a scene (see [`crate::gui::scenes`]).
+    EditScene(Box<crate::gui::scenes::SceneForm>),
+    /// Confirm deletion of a scene.
+    DeleteScene { id: crate::gui::groups::SceneId },
 }
 
 /// How long the library may stay unsaved before it is flushed to disk.
@@ -128,20 +134,20 @@ pub struct ServerState {
 /// Main GUI application state
 pub struct SoundSharedApp {
     // Reference to shared app state
-    app_state: AppState,
+    pub(crate) app_state: AppState,
 
     // Audio engine (must stay on main thread due to cpal::Stream not being Send)
-    audio_engine: Arc<Mutex<Option<AudioEngine>>>,
+    pub(crate) audio_engine: Arc<Mutex<Option<AudioEngine>>>,
 
     // Audio command receiver (for processing commands on main thread)
     audio_cmd_rx: Receiver<AudioCommand>,
 
     /// The control core shared with the headless `/control` page: scenes,
     /// stingers and every playback command go through it.
-    director: Director,
+    pub(crate) director: Director,
 
     // Local sound cache (synced from audio engine)
-    sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
+    pub(crate) sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
     sound_order: Arc<Mutex<Vec<SoundId>>>,
 
     // Master volume cache
@@ -167,13 +173,13 @@ pub struct SoundSharedApp {
     server_status_tx: Sender<AppServerStatus>,
 
     // Sound library + groups (the operator's saved collection)
-    library: Library,
+    pub(crate) library: Library,
     /// Which group the library panel is filtered to.
     group_filter: GroupFilter,
     /// Name shown in the group-name field of the currently open modal.
-    dialog: Dialog,
+    pub(crate) dialog: Dialog,
     /// Set when the library changed and needs writing to config.toml.
-    library_dirty: bool,
+    pub(crate) library_dirty: bool,
     /// Last time the library was flushed to disk.
     last_persist: Instant,
     /// Master volume stashed while muted.
@@ -218,10 +224,12 @@ pub struct SoundSharedApp {
     youtube_busy: bool,
     /// MASTER OUTPUT meter position (0..1, dB scale with peak decay).
     output_meter: f32,
+    /// State of the scene deck: pending replies, transition display, notices.
+    pub(crate) scenes: crate::gui::scenes::SceneUi,
 }
 
 /// Hand the Director the current scenes and the loaded library sounds.
-fn sync_director(
+pub(crate) fn sync_director(
     director: &mut Director,
     library: &Library,
     sounds: &Mutex<HashMap<SoundId, SoundEntry>>,
@@ -347,6 +355,7 @@ impl SoundSharedApp {
             youtube_status: Arc::new(Mutex::new(String::new())),
             youtube_busy: false,
             output_meter: 0.0,
+            scenes: Default::default(),
         };
 
         // Request initial server status
@@ -1414,6 +1423,9 @@ impl SoundSharedApp {
         // Delayed scene starts, and the rows of sounds a scene started.
         self.run_director();
 
+        // Scene deck: replies to its commands, the active scene, its repaints.
+        self.scene_frame(ctx);
+
         // Feed the engine the library files that did not fit the channel on
         // the previous pass.
         self.pump_pending_loads();
@@ -1695,6 +1707,10 @@ impl SoundSharedApp {
                     }
                     AudioCommand::ActivateScene { id, response } => {
                         sync_director(&mut self.director, &self.library, &self.sounds);
+                        crate::gui::scenes::patch_director(
+                            &mut self.director,
+                            self.scenes.override_ms(),
+                        );
                         let result = self.director.activate_scene(&*engine, &id);
                         mirror_playing(&self.sounds, engine);
                         let _ = response.send(match result {
@@ -1708,6 +1724,11 @@ impl SoundSharedApp {
                         });
                     }
                     AudioCommand::StopScene { response } => {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        crate::gui::scenes::patch_director(
+                            &mut self.director,
+                            self.scenes.override_ms(),
+                        );
                         let result = self.director.stop_scene(&*engine);
                         mirror_playing(&self.sounds, engine);
                         let _ = response.send(result.map(|_| ()).map_err(|e| e.into()));
