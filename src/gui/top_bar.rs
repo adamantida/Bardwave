@@ -197,6 +197,8 @@ pub fn status_strip(ui: &mut Ui, state: &SoundSharedApp) {
 
             ui.add_space(Metrics::LG);
             local_audio_readout(ui, state);
+            ui.add_space(Metrics::LG);
+            crate::updates::status_indicator(ui, state);
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(Metrics::PANEL_PAD);

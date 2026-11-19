@@ -202,6 +202,19 @@ pub struct GuiConfig {
     /// Record 32-bit float WAV instead of 16-bit PCM.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub record_float32: bool,
+    /// Check GitHub for a newer release once a day at start-up. Off by
+    /// default: a stock install makes no network requests on its own (the
+    /// "Check for updates" button still works on demand).
+    #[serde(default)]
+    pub check_updates: bool,
+
+    /// Unix time (seconds) of the last update check; 0 = never.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub last_update_check: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Persistent library + groups configuration

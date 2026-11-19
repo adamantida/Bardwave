@@ -1478,6 +1478,7 @@ impl SoundSharedApp {
         self.finish_decoded();
         self.poll_youtube_results();
         crate::gui::library_ui::poll(self, ctx);
+        crate::updates::frame(self, ctx);
 
         // Auto-detect tracks that finished playing (mixer marks them stopped but keeps them)
         // so the GUI button switches from "Stop" back to "Play" and the sound can be removed.

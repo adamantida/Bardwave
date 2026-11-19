@@ -50,6 +50,8 @@ pub struct ConsoleExtras {
     pub timers: crate::gui::timeline::TimersUi,
     /// Output / preview device dropdowns (see `audio_settings`).
     pub audio: crate::gui::audio_settings::AudioSettingsUi,
+    /// Update check (off by default, see `crate::updates`).
+    pub updates: crate::updates::UpdateChecker,
 }
 
 impl ConsoleExtras {
@@ -65,6 +67,7 @@ impl ConsoleExtras {
                 app_state.config.lock().unwrap().timers.clone(),
             ),
             audio: Default::default(),
+            updates: crate::updates::UpdateChecker::new(),
         }
     }
 }
