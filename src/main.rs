@@ -769,24 +769,19 @@ fn stop_server_and_wait(server_cmd_tx: &Sender<ServerCommand>) {
 
 /// Initialize logging based on configuration
 ///
-/// With `logging.file_logging = true` the log also goes to `bardwave.log` next
-/// to the executable — the only way to read it from a release build, which
-/// has no console window.
+/// With `logging.file_logging = true` the log also goes to `bardwave.log` in
+/// the data directory (see `paths::data_dir`) — the only way to read it from a
+/// release build, which has no console window.
 fn init_logging(config: &Config) -> Result<()> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
 
     let log_file = if config.logging.file_logging {
-        std::env::current_exe()
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(soundshared::paths::log_path())
             .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("bardwave.log")))
-            .and_then(|path| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .ok()
-            })
     } else {
         None
     };

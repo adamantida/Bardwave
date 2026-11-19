@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod gui;
 pub mod network;
+pub mod paths;
 
 /// SoundShared version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -291,16 +291,10 @@ impl Config {
         Ok(())
     }
 
-    /// Get the path to config.toml (next to executable)
+    /// Get the path to config.toml (inside [`crate::paths::data_dir`]: next to
+    /// the executable as in v1.4.0, or the per-user data folder).
     fn config_path() -> Result<PathBuf> {
-        let exe_path = std::env::current_exe()
-            .map_err(|e| ConfigError::NotFound(format!("Failed to get executable path: {}", e)))?;
-
-        let config_dir = exe_path.parent().ok_or_else(|| {
-            ConfigError::NotFound("Executable has no parent directory".to_string())
-        })?;
-
-        Ok(config_dir.join("config.toml"))
+        Ok(crate::paths::config_path())
     }
 
     /// Get the socket address for the server

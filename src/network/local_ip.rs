@@ -113,6 +113,86 @@ fn score(ip: IpAddr) -> Option<u32> {
     })
 }
 
+/// Interface-name prefixes that never carry the LAN: tunnels, AirDrop / Wi-Fi
+/// Direct, VM and container bridges, loopback and similar. Matched
+/// case-insensitively against the start of the name.
+///
+/// macOS: `utun`, `awdl`, `llw`, `bridge`, `ap`, `anpi`, `lo`, `gif`, `stf`,
+/// plus `vmenet`/`vmnet` (VM NICs). Linux: `docker`, `veth`, `br-`, `virbr`,
+/// `tun`, `tap`, `wg`, `tailscale`, `zt`.
+#[cfg(any(unix, test))]
+const VIRTUAL_INTERFACE_PREFIXES: &[&str] = &[
+    "utun",
+    "awdl",
+    "llw",
+    "bridge",
+    "ap",
+    "anpi",
+    "lo",
+    "gif",
+    "stf",
+    "vmenet",
+    "vmnet",
+    "docker",
+    "veth",
+    "br-",
+    "virbr",
+    "tun",
+    "tap",
+    "wg",
+    "tailscale",
+    "zt",
+];
+
+/// Whether an interface name denotes a virtual / non-LAN interface.
+#[cfg(any(unix, test))]
+pub fn is_virtual_interface(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    VIRTUAL_INTERFACE_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// How much a (non-virtual) interface name looks like the real network card:
+/// `en0` (the primary on macOS) beats other `en*`, `eth*` and `wl*`, which beat
+/// anything else.
+#[cfg(any(unix, test))]
+fn interface_rank(name: &str) -> u32 {
+    let lower = name.to_ascii_lowercase();
+    if lower == "en0" {
+        3
+    } else if lower.starts_with("en") || lower.starts_with("eth") || lower.starts_with("wl") {
+        2
+    } else {
+        1
+    }
+}
+
+/// Addresses of non-virtual interfaces that could be advertised, best
+/// interface first (stable among equals). Input is `(interface name, address)`.
+#[cfg(any(unix, test))]
+pub fn lan_addresses_by_preference(interfaces: &[(String, IpAddr)]) -> Vec<IpAddr> {
+    let mut usable: Vec<&(String, IpAddr)> = interfaces
+        .iter()
+        .filter(|(name, ip)| !is_virtual_interface(name) && is_advertisable(*ip))
+        .collect();
+    usable.sort_by_key(|(name, _)| std::cmp::Reverse(interface_rank(name)));
+    usable.into_iter().map(|(_, ip)| *ip).collect()
+}
+
+/// The best address among `(interface name, address)` pairs, or None when no
+/// interface qualifies: virtual interfaces and unusable ranges (link-local
+/// 169.254.x.x included) are skipped, the address score decides, and between
+/// equal scores the more LAN-like interface name (`en0`, then `en*`) wins.
+#[cfg(any(unix, test))]
+pub fn pick_best_interface_address(
+    interfaces: &[(String, IpAddr)],
+    bind_addr: IpAddr,
+) -> Option<IpAddr> {
+    let ordered = lan_addresses_by_preference(interfaces);
+    pick_advertised(&ordered, bind_addr)
+}
+
 /// Every address this machine could be reached on, best guess first.
 ///
 /// Only advertisable addresses are listed: an address that cannot be opened
@@ -234,13 +314,13 @@ fn adapter_addresses() -> Vec<IpAddr> {
     windows::unicast_addresses()
 }
 
-/// Outside Windows the adapter table is not read: the route probe and the range
-/// filter still keep TUN addresses out of the published URL, which is what this
-/// module exists for. Reading the table elsewhere would need libc getifaddrs,
-/// and this app ships for Windows.
+/// On Linux / macOS the interface table is read with `getifaddrs`. Virtual
+/// interfaces (tunnels, AirDrop, VM bridges...) are dropped by name and the
+/// rest is ordered so physical `en*` / `eth*` / `wl*` adapters come first; see
+/// [`lan_addresses_by_preference`].
 #[cfg(unix)]
 fn adapter_addresses() -> Vec<IpAddr> {
-    unix::interface_addresses()
+    lan_addresses_by_preference(&unix::interface_addresses())
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -255,9 +335,11 @@ fn adapter_addresses() -> Vec<IpAddr> {
 /// lets the scoring prefer the real LAN address, as on Windows.
 #[cfg(unix)]
 mod unix {
+    use std::ffi::CStr;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    pub fn interface_addresses() -> Vec<IpAddr> {
+    /// `(interface name, address)` of every up, non-loopback interface.
+    pub fn interface_addresses() -> Vec<(String, IpAddr)> {
         let mut found = Vec::new();
         let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
         // SAFETY: getifaddrs allocates a linked list into `head`, released
@@ -280,16 +362,25 @@ mod unix {
             // SAFETY: ifa_addr is non-null and points at a sockaddr whose
             // family tells which concrete type it is.
             let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
+            let name = if ifa.ifa_name.is_null() {
+                String::new()
+            } else {
+                // SAFETY: ifa_name is a NUL-terminated C string owned by the list.
+                unsafe { CStr::from_ptr(ifa.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
             if family == libc::AF_INET {
                 // SAFETY: family AF_INET means a sockaddr_in.
                 let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-                found.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
-                    sin.sin_addr.s_addr,
-                ))));
+                found.push((
+                    name,
+                    IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))),
+                ));
             } else if family == libc::AF_INET6 {
                 // SAFETY: family AF_INET6 means a sockaddr_in6.
                 let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
-                found.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+                found.push((name, IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr))));
             }
         }
         // SAFETY: `head` came from getifaddrs and is freed exactly once.
@@ -301,8 +392,28 @@ mod unix {
     mod tests {
         #[test]
         fn lists_without_loopback() {
-            for ip in super::interface_addresses() {
-                assert!(!ip.is_loopback(), "{ip}");
+            for (name, ip) in super::interface_addresses() {
+                assert!(!ip.is_loopback(), "{name}: {ip}");
+                assert!(!name.is_empty());
+            }
+        }
+
+        /// The real adapter table, run through the same filter the app uses:
+        /// nothing virtual or link-local may survive.
+        #[test]
+        fn real_machine_survives_the_filter_cleanly() {
+            let all = super::interface_addresses();
+            for ip in crate::network::local_ip::lan_addresses_by_preference(&all) {
+                let name = all
+                    .iter()
+                    .find(|(_, candidate)| *candidate == ip)
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("");
+                assert!(
+                    !crate::network::local_ip::is_virtual_interface(name),
+                    "{name} {ip}"
+                );
+                assert!(crate::network::local_ip::is_advertisable(ip), "{ip}");
             }
         }
     }
@@ -630,5 +741,116 @@ mod tests {
         if let Some(ip) = probe_route() {
             assert!(is_advertisable(ip), "route probe offered {ip}");
         }
+    }
+
+    fn nic(name: &str, ip: IpAddr) -> (String, IpAddr) {
+        (name.to_string(), ip)
+    }
+
+    #[test]
+    fn virtual_interface_names_are_recognised() {
+        for name in [
+            "utun0",
+            "utun7",
+            "awdl0",
+            "llw0",
+            "bridge0",
+            "bridge100",
+            "ap1",
+            "anpi0",
+            "lo0",
+            "lo",
+            "gif0",
+            "stf0",
+            "vmenet0",
+            "docker0",
+            "veth12ab",
+            "br-1a2b",
+            "virbr0",
+            "tun0",
+            "tap1",
+            "wg0",
+            "tailscale0",
+            "UTUN3",
+        ] {
+            assert!(is_virtual_interface(name), "{name} should be virtual");
+        }
+        for name in [
+            "en0",
+            "en1",
+            "en5",
+            "eth0",
+            "wlan0",
+            "wlp3s0",
+            "enp0s31f6",
+            "bond0",
+        ] {
+            assert!(!is_virtual_interface(name), "{name} should be physical");
+        }
+    }
+
+    #[test]
+    fn interface_filter_drops_virtual_and_link_local() {
+        let list = [
+            nic("utun4", v4(192, 168, 77, 1)),
+            nic("bridge100", v4(192, 168, 139, 3)),
+            nic("awdl0", v4(10, 9, 9, 9)),
+            nic("en0", v4(169, 254, 3, 4)),
+            nic("en0", v4(192, 168, 0, 106)),
+            nic("lo0", v4(127, 0, 0, 1)),
+        ];
+        assert_eq!(
+            lan_addresses_by_preference(&list),
+            vec![v4(192, 168, 0, 106)]
+        );
+    }
+
+    #[test]
+    fn en0_beats_other_interfaces_with_an_equal_address_class() {
+        // The macOS machine this was written on: bridge100 (VM bridge) and en0
+        // both hold 192.168.x.x; only en0 is the LAN.
+        let list = [
+            nic("bridge100", v4(192, 168, 139, 3)),
+            nic("en5", v4(192, 168, 50, 9)),
+            nic("en0", v4(192, 168, 0, 106)),
+            nic("bridge101", v4(192, 168, 194, 0)),
+        ];
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            pick_best_interface_address(&list, any),
+            Some(v4(192, 168, 0, 106))
+        );
+        // Without en0, another en* still beats unknown names.
+        let list = [
+            nic("foo1", v4(192, 168, 1, 1)),
+            nic("en5", v4(192, 168, 2, 2)),
+        ];
+        assert_eq!(
+            pick_best_interface_address(&list, any),
+            Some(v4(192, 168, 2, 2))
+        );
+    }
+
+    #[test]
+    fn address_score_still_decides_before_the_interface_name() {
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let list = [nic("en0", v4(8, 8, 8, 8)), nic("eth1", v4(10, 0, 0, 5))];
+        assert_eq!(
+            pick_best_interface_address(&list, any),
+            Some(v4(10, 0, 0, 5)),
+            "a private LAN address beats a public one on a better-named interface"
+        );
+    }
+
+    #[test]
+    fn nothing_usable_means_none() {
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let list = [
+            nic("utun0", v4(10, 0, 0, 2)),
+            nic("en0", v4(169, 254, 1, 1)),
+            nic("lo0", v4(127, 0, 0, 1)),
+        ];
+        assert_eq!(pick_best_interface_address(&list, any), None);
+        assert_eq!(pick_best_interface_address(&[], any), None);
     }
 }
