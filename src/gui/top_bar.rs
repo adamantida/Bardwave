@@ -495,7 +495,21 @@ pub fn top_bar(ui: &mut Ui, state: &mut SoundSharedApp) {
     right.add_space(gap);
     vertical_divider(&mut right);
     right.add_space(gap);
-    crate::gui::onboarding::help_menu(&mut right, state);
+    // Help sits in a cell as tall as the bar, placed by hand, and centres
+    // itself in it: it shares the centre line of the controls on the left
+    // whatever the cursor of the right-to-left layout has drifted to.
+    let help_w = layout.widths.help;
+    let help_cell = Rect::from_min_size(
+        egui::pos2(right.min_rect().left() - help_w, right_rect.top()),
+        Vec2::new(help_w, right_rect.height()),
+    );
+    right.allocate_new_ui(
+        UiBuilder::new()
+            .id_salt("top_bar_help")
+            .max_rect(help_cell)
+            .layout(Layout::left_to_right(Align::Center)),
+        |cell| crate::gui::onboarding::help_menu(cell, state),
+    );
     #[cfg(test)]
     {
         let right_start = right.min_rect().left();
@@ -1704,6 +1718,18 @@ mod tests {
             .collect();
         if !right.iter().any(|t| t.text == "HELP") {
             out.push("Help is not painted".to_string());
+        }
+        // The menu buttons sit on the bar's centre line like the other
+        // controls (Help used to hang several points below it).
+        let mid = Metrics::TOPBAR_H / 2.0;
+        for t in bar.texts.iter().filter(|t| t.text == "HELP") {
+            if (t.rect.center().y - mid).abs() > 1.5 {
+                out.push(format!(
+                    "Help text centred at y {:.1}, the bar's centre line is {:.1}",
+                    t.rect.center().y,
+                    mid
+                ));
+            }
         }
         // The two clusters keep apart, as laid out and as painted.
         // The plan holds without help from the clip: what the controls took

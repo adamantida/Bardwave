@@ -324,7 +324,7 @@ pub fn top_bar_controls(ui: &mut Ui, state: &mut SoundSharedApp, compact: bool, 
         } else {
             REC_BTN_W
         })
-        .height(26.0)
+        .height(Metrics::BTN_H_SM)
         .enabled(!busy)
         .tooltip(tooltip)
         .id_salt("top_rec");

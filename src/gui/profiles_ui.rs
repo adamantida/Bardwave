@@ -403,48 +403,42 @@ pub fn profile_menu(ui: &mut Ui, state: &mut SoundSharedApp, style: ProfileStyle
         ui.label(micro_label("Profile"));
         ui.add_space(Metrics::SM);
     }
-    let menu = ui.menu_button(
-        RichText::new(shown).font(font).color(Palette::WHITE),
-        |ui| {
-            ui.set_min_width(220.0);
-            ui.label(micro_label("Switch to (restarts Bardwave)"));
-            ui.add_space(Metrics::SM);
-            for entry in state.profiles_ui.menu_entries() {
-                let current = same_profile(&entry, &active);
-                let text = if current {
-                    format!("{}  (running)", display_name(&entry))
-                } else {
-                    display_name(&entry).to_string()
-                };
-                if ui.selectable_label(current, text).clicked() && !current {
-                    state.profiles_ui.open_switch(entry);
-                    ui.close_menu();
-                }
+    let button = crate::gui::widgets::bar_menu_button(ui, "profile", &shown, |ui| {
+        ui.set_min_width(220.0);
+        ui.label(micro_label("Switch to (restarts Bardwave)"));
+        ui.add_space(Metrics::SM);
+        for entry in state.profiles_ui.menu_entries() {
+            let current = same_profile(&entry, &active);
+            let text = if current {
+                format!("{}  (running)", display_name(&entry))
+            } else {
+                display_name(&entry).to_string()
+            };
+            if ui.selectable_label(current, text).clicked() && !current {
+                state.profiles_ui.open_switch(entry);
             }
-            ui.add_space(Metrics::SM);
-            hairline(ui);
-            ui.add_space(Metrics::SM);
-            if ui.button("New profile…").clicked() {
-                state.profiles_ui.open_new();
-                ui.close_menu();
+        }
+        ui.add_space(Metrics::SM);
+        hairline(ui);
+        ui.add_space(Metrics::SM);
+        if ui.button("New profile…").clicked() {
+            state.profiles_ui.open_new();
+        }
+        if ui.button("Manage profiles…").clicked() {
+            state.profiles_ui.refresh(&env);
+            state.profiles_ui.open_manage(None);
+        }
+        if ui.button("Open data folder").clicked() {
+            if let Err(e) = profiles::open_in_file_manager(&env.data_dir) {
+                tracing::warn!("Could not open {}: {}", env.data_dir.display(), e);
             }
-            if ui.button("Manage profiles…").clicked() {
-                state.profiles_ui.refresh(&env);
-                state.profiles_ui.open_manage(None);
-                ui.close_menu();
-            }
-            if ui.button("Open data folder").clicked() {
-                if let Err(e) = profiles::open_in_file_manager(&env.data_dir) {
-                    tracing::warn!("Could not open {}: {}", env.data_dir.display(), e);
-                }
-                ui.close_menu();
-            }
-        },
-    );
-    menu.response.clone().on_hover_text(format!(
+        }
+    });
+    let clicked = button.clicked();
+    button.on_hover_text(format!(
         "Profile: {full_name}. Switch, create or manage profiles"
     ));
-    if menu.response.clicked() {
+    if clicked {
         // Opening the menu: pick up profiles created or removed elsewhere.
         state.profiles_ui.refresh(&env);
     }

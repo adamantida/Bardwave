@@ -517,6 +517,90 @@ impl<'a> ConsoleButton<'a> {
     }
 }
 
+/// Width of a [`bar_menu_button`] showing `text`: the text and the horizontal
+/// padding of a console button, never narrower than egui's minimum target.
+pub fn bar_menu_width(ui: &Ui, text: &str) -> f32 {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), glyph_font(11.0), Palette::ZINC_300);
+    (galley.size().x + 2.0 * Metrics::MD)
+        .max(ui.spacing().interact_size.x)
+        .ceil()
+}
+
+/// A menu opened from the top bar: painted like the ghost console buttons next
+/// to it (same height, border, hover) instead of egui's grey menu button, and
+/// centred on the line it is placed on. The popup opens below the button and
+/// closes when something in it is clicked or the user clicks elsewhere.
+///
+/// `text` is shown as typed (no upper-casing: profile names are the user's).
+pub fn bar_menu_button<R>(
+    ui: &mut Ui,
+    id_salt: &str,
+    text: &str,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> Response {
+    let width = bar_menu_width(ui, text);
+    let popup_id = ui.make_persistent_id(("bar_menu_popup", id_salt));
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, Metrics::BTN_H_SM), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    if resp.clicked() {
+        resp.request_focus();
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+    // Space / Enter on the focused button opens it, like a click.
+    if resp.fake_primary_click && !resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+
+    let open = ui.memory(|m| m.is_popup_open(popup_id));
+    let hovered = resp.hovered();
+    let pressed = resp.is_pointer_button_down_on();
+    let fill = if pressed {
+        Palette::BORDER
+    } else if hovered || open {
+        Palette::ROW
+    } else {
+        Palette::TRANSPARENT
+    };
+    let border = if hovered || open {
+        Palette::BORDER_STRONG
+    } else {
+        Palette::BORDER
+    };
+    let painter = ui.painter();
+    if fill != Palette::TRANSPARENT {
+        painter.rect_filled(rect, Rounding::same(Metrics::R_BTN), fill);
+    }
+    painter.rect_stroke(
+        rect,
+        Rounding::same(Metrics::R_BTN),
+        Stroke::new(1.0_f32, border),
+    );
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect.expand(1.0),
+            Rounding::same(Metrics::R_BTN + 1.0),
+            Stroke::new(1.0_f32, Palette::ROSE_400),
+        );
+    }
+    let galley = painter.layout_no_wrap(text.to_string(), glyph_font(11.0), Palette::ZINC_300);
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    painter.galley(pos, galley, Palette::ZINC_300);
+
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &resp,
+        egui::PopupCloseBehavior::CloseOnClick,
+        add_contents,
+    );
+    resp
+}
+
 /// Square icon button used for transport controls and row actions.
 pub struct IconButton<'a> {
     glyph: Glyph,
