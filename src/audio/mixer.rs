@@ -562,6 +562,18 @@ impl TrackState {
         }
     }
 
+    /// A track starting from silence begins at its target pan instead of
+    /// slewing there, so the attack of a hard-panned one-shot does not leak
+    /// into the opposite channel. A track that is already sounding keeps its
+    /// ramp.
+    fn snap_pan_if_silent(&mut self) {
+        if !self.playing {
+            let (l, r) = pan_gains(self.pan);
+            self.pan_l = l;
+            self.pan_r = r;
+        }
+    }
+
     /// Back to the start of the source.
     fn rewind(&mut self) {
         self.position = 0;
@@ -1243,6 +1255,7 @@ impl AudioMixer {
     /// hit) must keep its attack.
     pub fn play_track(&self, track_id: Uuid) -> Result<(), MixerError> {
         self.with_track(track_id, |track| {
+            track.snap_pan_if_silent();
             track.playing = true;
             track.rewind();
             track.halt = None;
@@ -1265,6 +1278,7 @@ impl AudioMixer {
     ) -> Result<(), MixerError> {
         self.with_track(track_id, |track| {
             let start = if track.playing { track.gain } else { 0.0 };
+            track.snap_pan_if_silent();
             track.playing = true;
             track.rewind();
             track.halt = None;
@@ -1284,6 +1298,7 @@ impl AudioMixer {
     pub fn resume_track(&self, track_id: Uuid) -> Result<(), MixerError> {
         self.with_track(track_id, |track| {
             if !track.playing {
+                track.snap_pan_if_silent();
                 track.gain = 0.0;
             }
             track.playing = !track.at_end() || track.looped;
@@ -1302,6 +1317,7 @@ impl AudioMixer {
     ) -> Result<(), MixerError> {
         self.with_track(track_id, |track| {
             if !track.playing {
+                track.snap_pan_if_silent();
                 track.gain = 0.0;
             }
             track.playing = !track.at_end() || track.looped;
@@ -2160,6 +2176,23 @@ mod fade_bus_tests {
         let out = mix(&mixer, 960);
         assert!(out.iter().all(|s| *s == 0.5));
         assert_eq!(pan_gains(0.0), (1.0, 1.0));
+    }
+
+    #[test]
+    fn hard_panned_one_shot_starts_at_its_target_pan() {
+        let mixer = AudioMixer::new();
+        for (pan, silent_left) in [(1.0f32, true), (-1.0, false)] {
+            let id = constant(&mixer, 0.5, 100 * SR, true);
+            mixer.set_track_pan(id, pan).unwrap();
+            mixer.play_track(id).unwrap();
+            let out = mix(&mixer, 4);
+            let (silent, loud) = if silent_left { (0, 1) } else { (1, 0) };
+            assert_eq!(out[silent], 0.0, "pan {pan}: leaked into the far channel");
+            assert!((out[loud] - 0.5).abs() < 1e-6, "pan {pan}: near channel");
+            mixer.stop_track(id).unwrap();
+            mix(&mixer, 480);
+            mixer.remove_track(id).unwrap();
+        }
     }
 
     #[test]
