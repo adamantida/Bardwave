@@ -11,5 +11,7 @@ pub use engine::{
     AudioEngine, EngineError, EngineStats, LocalOutputState, LocalOutputStatus, SoundId,
     TrackHandle,
 };
-pub use mixer::{AudioMixer, MixedOutput, MixerConfig, MixerError};
+pub use mixer::{
+    pan_gains, AudioMixer, Bus, DuckSettings, FadeCurve, MixedOutput, MixerConfig, MixerError,
+};
 pub use youtube::{display_name as youtube_display_name, extract_video_id};
