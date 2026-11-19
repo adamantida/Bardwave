@@ -75,7 +75,7 @@ pub fn tls_section(ui: &mut Ui, state: &mut SoundSharedApp, editable: bool) {
         }
     });
 
-    ui.add_space(Metrics::XS);
+    ui.add_space(Metrics::SM);
     match info {
         Some(info) => {
             let kind = match info.source {
@@ -83,11 +83,13 @@ pub fn tls_section(ui: &mut Ui, state: &mut SoundSharedApp, editable: bool) {
                 CertSource::SelfSigned => "Self-signed certificate",
             };
             ui.label(micro_label(format!("{kind} / SHA-256")));
+            ui.add_space(Metrics::XS);
             let fingerprint = ui.add(
                 egui::Label::new(
                     RichText::new(&info.fingerprint_sha256)
                         .font(glyph_font(Metrics::MICRO_TINY))
-                        .color(Palette::ZINC_300),
+                        .color(Palette::ZINC_300)
+                        .line_height(Some(Metrics::MICRO_TINY * 1.6)),
                 )
                 .wrap()
                 .sense(Sense::click()),
@@ -110,14 +112,16 @@ pub fn tls_section(ui: &mut Ui, state: &mut SoundSharedApp, editable: bool) {
         }
     }
 
-    if editable
-        && !settings.uses_custom_certificate()
-        && ConsoleButton::ghost("New certificate")
-            .small()
-            .tooltip("Replace the self-signed certificate (phones will ask to trust it again)")
-            .id_salt("tls_new_cert")
-            .show(ui)
-            .clicked()
+    if !(editable && !settings.uses_custom_certificate()) {
+        return;
+    }
+    ui.add_space(Metrics::SM);
+    if ConsoleButton::ghost("New certificate")
+        .small()
+        .tooltip("Replace the self-signed certificate (phones will ask to trust it again)")
+        .id_salt("tls_new_cert")
+        .show(ui)
+        .clicked()
     {
         let dir = settings.cert_dir();
         std::thread::spawn(move || {

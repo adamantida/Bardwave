@@ -38,7 +38,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
 
         // ---- Header ----
         ui.label(micro_label_accent("02 / Network"));
-        ui.add_space(2.0);
+        ui.add_space(Metrics::XS);
         ui.label(panel_title("Network Server"));
         ui.add_space(Metrics::LG);
 
@@ -84,8 +84,8 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                     .strong(),
             );
         });
-        ui.add_space(Metrics::XS);
-        ui.label(micro_label(subline));
+        ui.add_space(Metrics::SM);
+        ui.add(egui::Label::new(micro_label(subline).line_height(Some(NOTE_LINE_H))).wrap());
 
         ui.add_space(Metrics::LG);
         hairline(ui);
@@ -146,28 +146,25 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
             }
         });
 
+        // Everything under the URL well is a stack of small lines: a full `SM`
+        // below the well, `XS` between the lines, and the same line height for
+        // each so a wrapped one does not touch its neighbour.
         if state.copied_feedback() {
-            ui.add_space(Metrics::XS);
-            ui.label(
-                RichText::new("COPIED TO CLIPBOARD")
-                    .font(crate::gui::widgets::glyph_font(9.0))
-                    .color(Palette::ROSE_400)
-                    .extra_letter_spacing(1.0),
-            );
+            ui.add_space(Metrics::SM);
+            caution(ui, "Copied to clipboard", Palette::ROSE_400);
         }
 
         // The URL above carries the LAN address, which is what the players
         // open. This machine always has loopback, and showing it means a wrong
         // or blocked address detection can never hide the way in.
-        let advertised_is_loopback = url.starts_with("http://127.0.0.1")
-            || url.starts_with("http://[::1]")
-            || url.starts_with("https://127.0.0.1")
-            || url.starts_with("https://[::1]");
-        if running && !advertised_is_loopback {
+        if running && !is_loopback_url(&url) {
             if let Some(local) = server.local_url.as_deref() {
-                ui.add_space(Metrics::XS);
+                ui.add_space(Metrics::SM);
                 let label = ui.add(
-                    egui::Label::new(micro_label(format!("Local {local}"))).sense(Sense::click()),
+                    egui::Label::new(
+                        micro_label(format!("Local {local}")).line_height(Some(NOTE_LINE_H)),
+                    )
+                    .sense(Sense::click()),
                 );
                 if label
                     .on_hover_text("Click to copy the link for this PC (with the access key)")
@@ -182,18 +179,12 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         // Router port forwarding: players outside the LAN use this URL.
         if running {
             use crate::network::upnp::UpnpStatus;
-            let line = match &server.upnp {
-                UpnpStatus::Off => None,
-                UpnpStatus::Searching => Some("Internet: asking the router…".to_string()),
-                UpnpStatus::Mapped { url, .. } => Some(format!("Internet {url}")),
-                UpnpStatus::DoubleNat { external } => {
-                    Some(format!("Internet: blocked by a second NAT ({external})"))
-                }
-                UpnpStatus::Unavailable(_) => Some("Internet: no UPnP router".to_string()),
-            };
-            if let Some(line) = line {
-                ui.add_space(Metrics::XS);
-                let label = ui.add(egui::Label::new(micro_label(line)).sense(Sense::click()));
+            if let Some(line) = upnp_line(&server.upnp) {
+                ui.add_space(Metrics::SM);
+                let label = ui.add(
+                    egui::Label::new(micro_label(line).line_height(Some(NOTE_LINE_H)))
+                        .sense(Sense::click()),
+                );
                 match &server.upnp {
                     UpnpStatus::Mapped { url, .. } => {
                         if label
@@ -227,23 +218,15 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         // the default route, a firewall rule that could not be added.
         if running {
             for note in &server.notes {
-                ui.add_space(Metrics::XS);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(note.to_uppercase())
-                            .font(crate::gui::widgets::glyph_font(Metrics::MICRO_TINY))
-                            .color(Palette::AMBER_400)
-                            .extra_letter_spacing(0.6),
-                    )
-                    .wrap(),
-                );
+                ui.add_space(Metrics::SM);
+                caution(ui, note, Palette::AMBER_400);
             }
         }
 
         // ---- Access key ----
         // Players need it in the link; a new one revokes the old link and
         // disconnects everyone who used it (e.g. after it leaked).
-        ui.add_space(Metrics::SM);
+        ui.add_space(Metrics::MD);
         ui.horizontal(|ui| {
             // The key itself stays lowercase (it is case-sensitive); only the
             // label follows the console's uppercase style.
@@ -290,7 +273,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         };
         gm_link_block(ui, state, gm_base.as_deref());
 
-        ui.add_space(Metrics::LG);
+        ui.add_space(Metrics::XL);
 
         // ---- Listener occupancy ----
         ui.label(micro_label("Listeners"));
@@ -420,7 +403,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(micro_label("Port"));
-                ui.add_space(2.0);
+                ui.add_space(Metrics::SM);
                 let response = config_input(
                     ui,
                     state.port_input_mut(),
@@ -434,7 +417,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
             ui.add_space(Metrics::SM);
             ui.vertical(|ui| {
                 ui.label(micro_label("Bind Address"));
-                ui.add_space(2.0);
+                ui.add_space(Metrics::SM);
                 let response = config_input(
                     ui,
                     state.bind_input_mut(),
@@ -457,18 +440,13 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         }
 
         if let Some(error) = state.config_error() {
-            ui.add_space(Metrics::XS);
-            ui.label(
-                RichText::new(error.to_uppercase())
-                    .font(crate::gui::widgets::glyph_font(9.0))
-                    .color(Palette::ROSE_400)
-                    .extra_letter_spacing(0.8),
-            );
+            ui.add_space(Metrics::SM);
+            caution(ui, error, Palette::ROSE_400);
         }
 
-        ui.add_space(Metrics::XS);
+        ui.add_space(Metrics::MD);
         crate::gui::tls_section::tls_section(ui, state, config_enabled);
-        ui.add_space(Metrics::XS);
+        ui.add_space(Metrics::MD);
         ui.horizontal(|ui| {
             ui.label(micro_label(if config_enabled {
                 "Editable while stopped"
@@ -491,7 +469,36 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         hairline(ui);
         ui.add_space(Metrics::MD);
         ui.label(micro_label("WS / 48 kHz / Stereo"));
+        // The column scrolls when the window is short: keep the last line off
+        // the edge of the panel body instead of flush with it.
+        ui.add_space(Metrics::LG);
     });
+}
+
+/// Line height of the small wrapped lines under the URL and in the notes.
+const NOTE_LINE_H: f32 = Metrics::MICRO * 1.7;
+
+/// Whether `url` points at this machine only (`127.0.0.1` or `[::1]`).
+fn is_loopback_url(url: &str) -> bool {
+    ["http://", "https://"].iter().any(|scheme| {
+        url.strip_prefix(scheme)
+            .is_some_and(|rest| rest.starts_with("127.0.0.1") || rest.starts_with("[::1]"))
+    })
+}
+
+/// The "Internet ..." line of the URL block for a router-mapping state, `None`
+/// when the mapping is switched off.
+fn upnp_line(status: &crate::network::upnp::UpnpStatus) -> Option<String> {
+    use crate::network::upnp::UpnpStatus;
+    match status {
+        UpnpStatus::Off => None,
+        UpnpStatus::Searching => Some("Internet: asking the router…".to_string()),
+        UpnpStatus::Mapped { url, .. } => Some(format!("Internet {url}")),
+        UpnpStatus::DoubleNat { external } => {
+            Some(format!("Internet: blocked by a second NAT ({external})"))
+        }
+        UpnpStatus::Unavailable(_) => Some("Internet: no UPnP router".to_string()),
+    }
 }
 
 /// Width of the `PORT` well, and of the `BIND ADDRESS` well next to it.
@@ -1155,5 +1162,86 @@ mod gm_ui_tests {
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod spacing_tests {
+    use super::*;
+    use crate::network::upnp::UpnpStatus;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    #[test]
+    fn loopback_urls_are_recognised_but_lan_urls_are_not() {
+        for url in [
+            "http://127.0.0.1:8080",
+            "https://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "https://[::1]:8080",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "—",
+            "",
+            "http://192.168.1.5:8080",
+            "http://example.com/127.0.0.1",
+            "ftp://127.0.0.1",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn the_internet_line_follows_the_router_state() {
+        let external = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 8080);
+        assert_eq!(upnp_line(&UpnpStatus::Off), None);
+        assert_eq!(
+            upnp_line(&UpnpStatus::Searching).as_deref(),
+            Some("Internet: asking the router…")
+        );
+        assert_eq!(
+            upnp_line(&UpnpStatus::Mapped {
+                external,
+                url: "http://203.0.113.7:8080".into()
+            })
+            .as_deref(),
+            Some("Internet http://203.0.113.7:8080")
+        );
+        assert!(upnp_line(&UpnpStatus::DoubleNat { external })
+            .unwrap()
+            .contains("second NAT (203.0.113.7:8080)"));
+        assert_eq!(
+            upnp_line(&UpnpStatus::Unavailable("timeout".into())).as_deref(),
+            Some("Internet: no UPnP router")
+        );
+    }
+
+    #[test]
+    fn cautions_wrap_with_air_between_their_lines() {
+        let ctx = egui::Context::default();
+        let mut height = 0.0;
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(200.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(120.0);
+                    let before = ui.cursor().top();
+                    caution(
+                        ui,
+                        "The current link stops working at once and every phone is disconnected",
+                        Palette::AMBER_400,
+                    );
+                    height = ui.cursor().top() - before;
+                });
+            });
+        }
+        assert!(height >= 3.0 * Metrics::MICRO_TINY * 1.7, "height {height}");
     }
 }
