@@ -193,7 +193,7 @@ pub struct SoundSharedApp {
     pub(crate) master_volume: Arc<Mutex<f32>>,
 
     // Server state cache
-    server_state: Arc<Mutex<ServerState>>,
+    pub(crate) server_state: Arc<Mutex<ServerState>>,
 
     // UI feedback
     copied_feedback: Arc<Mutex<bool>>,

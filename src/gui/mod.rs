@@ -20,6 +20,8 @@ pub mod gm_bridge;
 pub mod groups;
 pub mod hotkeys_ui;
 #[cfg(test)]
+mod layout_check;
+#[cfg(test)]
 pub(crate) mod layout_probe;
 pub mod library_ui;
 pub mod motion;
@@ -127,13 +129,22 @@ fn install_theme(ctx: &egui::Context) {
 
 impl App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        self.state.update(ctx);
-        draw_shell(ctx, &mut self.state);
+        self.draw_frame(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.state.persist_library();
         tracing::info!("SoundShared GUI shutting down");
+    }
+}
+
+impl GuiApp {
+    /// One full frame of the console: state update, backdrop, every panel and
+    /// the overlays. Split from [`App::update`] (which needs an eframe
+    /// `Frame`) so the headless layout checks run exactly what the window runs.
+    fn draw_frame(&mut self, ctx: &egui::Context) {
+        self.state.update(ctx);
+        draw_shell(ctx, &mut self.state);
     }
 }
 
