@@ -21,7 +21,7 @@ use self::device_adapter::{DeviceAdapter, StreamResampler};
 use crate::audio::decoder::{
     AudioDecoder, DecodedAudio, DecoderError, TARGET_CHANNELS, TARGET_SAMPLE_RATE,
 };
-use crate::audio::mixer::{AudioMixer, MixedOutput, MixerConfig};
+use crate::audio::mixer::{AudioMixer, Bus, DuckSettings, FadeCurve, MixedOutput, MixerConfig};
 
 /// Sample rate of the mix pipeline: what the mixer produces, what the network
 /// forwarder publishes and what every web listener receives. The local device
@@ -439,6 +439,10 @@ pub(crate) struct AudioEngineInner {
     /// Per-sound volume, applied to tracks of that sound as they are created
     /// and to the ones already playing
     sound_volumes: RwLock<HashMap<SoundId, f32>>,
+    /// Per-sound pan, applied to new tracks of that sound like the volume
+    sound_pans: RwLock<HashMap<SoundId, f32>>,
+    /// Per-sound bus, applied to new tracks of that sound like the volume
+    sound_buses: RwLock<HashMap<SoundId, Bus>>,
     /// Active tracks: track_id -> SoundId
     active_tracks: RwLock<HashMap<Uuid, SoundId>>,
     /// CPAL output stream
@@ -528,6 +532,8 @@ impl AudioEngine {
             mixer,
             sounds: RwLock::new(HashMap::new()),
             sound_volumes: RwLock::new(HashMap::new()),
+            sound_pans: RwLock::new(HashMap::new()),
+            sound_buses: RwLock::new(HashMap::new()),
             active_tracks: RwLock::new(HashMap::new()),
             stream: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
@@ -555,6 +561,8 @@ impl AudioEngine {
             mixer,
             sounds: RwLock::new(HashMap::new()),
             sound_volumes: RwLock::new(HashMap::new()),
+            sound_pans: RwLock::new(HashMap::new()),
+            sound_buses: RwLock::new(HashMap::new()),
             active_tracks: RwLock::new(HashMap::new()),
             stream: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
@@ -944,6 +952,51 @@ impl AudioEngine {
         sound_id: SoundId,
         looped: bool,
     ) -> Result<TrackHandle, EngineError> {
+        self.start_track(sound_id, looped, None, false)
+    }
+
+    /// Play a loaded sound, fading it in over `fade_in_ms` along `curve`.
+    ///
+    /// The fade ends at the sound's volume (see
+    /// [`set_sound_volume`](Self::set_sound_volume)). A zero or very short time
+    /// still gets the 10 ms click-protection ramp.
+    pub fn play_sound_fade(
+        &self,
+        sound_id: SoundId,
+        looped: bool,
+        fade_in_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<TrackHandle, EngineError> {
+        self.start_track(sound_id, looped, Some((fade_in_ms, curve)), false)
+    }
+
+    /// Play a sound as a **local preview**: heard on this machine's output
+    /// only, never sent to the players' stream.
+    ///
+    /// The track is not registered with the sound, so
+    /// [`stop_sound`](Self::stop_sound), [`stop_all`](Self::stop_all) and
+    /// [`is_sound_playing`](Self::is_sound_playing) do not see it; control it
+    /// through the returned handle (or [`stop_track`](Self::stop_track)). It
+    /// ignores the sound's remembered pan and bus.
+    pub fn play_preview(
+        &self,
+        sound_id: SoundId,
+        looped: bool,
+    ) -> Result<TrackHandle, EngineError> {
+        self.start_track(sound_id, looped, None, true)
+    }
+
+    /// The one place a track is created and started.
+    ///
+    /// `fade_in`: fade from silence instead of starting at full gain.
+    /// `preview`: local-only track that is not registered as an active track.
+    fn start_track(
+        &self,
+        sound_id: SoundId,
+        looped: bool,
+        fade_in: Option<(u32, FadeCurve)>,
+        preview: bool,
+    ) -> Result<TrackHandle, EngineError> {
         let audio = {
             let sounds = self.inner.sounds.read();
             sounds
@@ -977,12 +1030,34 @@ impl AudioEngine {
             self.inner.mixer.set_track_volume(track_id, sound_volume)?;
         }
 
+        if preview {
+            self.inner.mixer.set_track_local_only(track_id, true)?;
+        } else {
+            // Pan and bus are remembered per sound, like the volume.
+            let pan = self.inner.sound_pans.read().get(&sound_id).copied();
+            if let Some(pan) = pan {
+                self.inner.mixer.set_track_pan(track_id, pan)?;
+            }
+            let bus = self.inner.sound_buses.read().get(&sound_id).copied();
+            if let Some(bus) = bus {
+                self.inner.mixer.set_track_bus(track_id, bus)?;
+            }
+        }
+
         // Start playback — the central mix loop will read audio directly from
         // the track's decoded samples, no feeder thread needed.
-        self.inner.mixer.play_track(track_id)?;
+        match fade_in {
+            Some((ms, curve)) => self
+                .inner
+                .mixer
+                .play_track_with_fade_in(track_id, ms, curve)?,
+            None => self.inner.mixer.play_track(track_id)?,
+        }
 
         // Register active track
-        self.inner.active_tracks.write().insert(track_id, sound_id);
+        if !preview {
+            self.inner.active_tracks.write().insert(track_id, sound_id);
+        }
 
         let handle = TrackHandle {
             sound_id,
@@ -991,14 +1066,14 @@ impl AudioEngine {
         };
 
         debug!(
-            "Started {}playback of sound {} on track {}",
+            "Started {}{}playback of sound {} on track {}",
+            if preview { "preview " } else { "" },
             if looped { "looped " } else { "" },
             sound_id.0,
             track_id
         );
         Ok(handle)
     }
-
     /// Play a sound with looping enabled
     pub fn play_loop(&self, sound_id: SoundId) -> Result<TrackHandle, EngineError> {
         self.play_with_loop(sound_id, true)
@@ -1120,6 +1195,194 @@ impl AudioEngine {
         Ok(())
     }
 
+    /// Fade every active track of a sound to `target_gain` (0.0 - 1.0) over
+    /// `duration_ms` along `curve`.
+    ///
+    /// A fade started in the middle of another one continues from the gain the
+    /// track has at that moment, so there is no jump. The tracks keep playing
+    /// (silently for 0.0). The sound's remembered volume is left alone, so a
+    /// fade-out does not mute the next play of the sound.
+    pub fn fade_sound(
+        &self,
+        sound_id: SoundId,
+        target_gain: f32,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.inner
+                .mixer
+                .fade_track_to(track_id, target_gain, duration_ms, curve)?;
+        }
+        Ok(())
+    }
+
+    /// Fade one track to `target_gain`; see [`fade_sound`](Self::fade_sound).
+    pub fn fade_track(
+        &self,
+        track_id: Uuid,
+        target_gain: f32,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .mixer
+            .fade_track_to(track_id, target_gain, duration_ms, curve)?;
+        Ok(())
+    }
+
+    /// Stop every track of a sound after a fade-out of `duration_ms`.
+    ///
+    /// The sound reports as stopped at once while the tail still sounds; the
+    /// mixer drops the tracks once they are silent. Safe to call again during
+    /// the fade-out.
+    pub fn stop_sound_fade(
+        &self,
+        sound_id: SoundId,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.stop_track_fade(track_id, duration_ms, curve)?;
+        }
+        Ok(())
+    }
+
+    /// Stop one track after a fade-out of `duration_ms`.
+    pub fn stop_track_fade(
+        &self,
+        track_id: Uuid,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .mixer
+            .stop_track_with_fade_out(track_id, duration_ms, curve)?;
+        self.inner.active_tracks.write().remove(&track_id);
+        Ok(())
+    }
+
+    /// Stop all playback with a fade-out of `duration_ms`.
+    pub fn stop_all_fade(&self, duration_ms: u32, curve: FadeCurve) -> Result<(), EngineError> {
+        let track_ids: Vec<Uuid> = self.inner.active_tracks.read().keys().copied().collect();
+        for track_id in track_ids {
+            self.stop_track_fade(track_id, duration_ms, curve)?;
+        }
+        Ok(())
+    }
+
+    /// Pause one track after a fade-out of `duration_ms`; the position is kept
+    /// for [`resume_track`](Self::resume_track).
+    pub fn pause_track_fade(
+        &self,
+        track_id: Uuid,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .mixer
+            .pause_track_with_fade_out(track_id, duration_ms, curve)?;
+        Ok(())
+    }
+
+    /// Resume a paused track, fading in over `duration_ms`.
+    pub fn resume_track_fade(
+        &self,
+        track_id: Uuid,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .mixer
+            .resume_track_with_fade_in(track_id, duration_ms, curve)?;
+        Ok(())
+    }
+
+    /// Pan a sound, -1.0 (left) ..= 1.0 (right), 0.0 = centre (untouched).
+    ///
+    /// Applies to the sound's active tracks and is remembered for tracks
+    /// created later, like the volume. Sources are stereo, so this is a
+    /// balance with an equal-power law (see `mixer::pan_gains`).
+    pub fn set_sound_pan(&self, sound_id: SoundId, pan: f32) -> Result<(), EngineError> {
+        if !(-1.0..=1.0).contains(&pan) {
+            return Err(EngineError::Mixer(
+                crate::audio::mixer::MixerError::InvalidPan(pan),
+            ));
+        }
+        if !self.inner.sounds.read().contains_key(&sound_id) {
+            return Err(EngineError::SoundNotFound(sound_id));
+        }
+        self.inner.sound_pans.write().insert(sound_id, pan);
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.inner.mixer.set_track_pan(track_id, pan)?;
+        }
+        Ok(())
+    }
+
+    /// Pan most recently set for a sound, or 0.0.
+    pub fn sound_pan(&self, sound_id: SoundId) -> f32 {
+        self.inner
+            .sound_pans
+            .read()
+            .get(&sound_id)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Put a sound on a mixing bus (default [`Bus::Ambience`]).
+    ///
+    /// Applies to the sound's active tracks and is remembered for tracks
+    /// created later.
+    pub fn set_sound_bus(&self, sound_id: SoundId, bus: Bus) -> Result<(), EngineError> {
+        if !self.inner.sounds.read().contains_key(&sound_id) {
+            return Err(EngineError::SoundNotFound(sound_id));
+        }
+        self.inner.sound_buses.write().insert(sound_id, bus);
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.inner.mixer.set_track_bus(track_id, bus)?;
+        }
+        Ok(())
+    }
+
+    /// Bus a sound plays on.
+    pub fn sound_bus(&self, sound_id: SoundId) -> Bus {
+        self.inner
+            .sound_buses
+            .read()
+            .get(&sound_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Set the volume of a bus (0.0 - 1.0); applied before the master limiter.
+    pub fn set_bus_volume(&self, bus: Bus, volume: f32) -> Result<(), EngineError> {
+        self.inner.mixer.set_bus_volume(bus, volume)?;
+        Ok(())
+    }
+
+    /// Volume of a bus.
+    pub fn bus_volume(&self, bus: Bus) -> f32 {
+        self.inner.mixer.bus_volume(bus)
+    }
+
+    /// Duck a bus (turn it down under something else); see [`DuckSettings`].
+    /// With `hold_ms: None` it stays down until
+    /// [`release_duck`](Self::release_duck).
+    pub fn duck_bus(&self, bus: Bus, settings: DuckSettings) {
+        self.inner.mixer.duck_bus(bus, settings);
+    }
+
+    /// Bring a ducked bus back to its full volume.
+    pub fn release_duck(&self, bus: Bus) {
+        self.inner.mixer.release_duck(bus);
+    }
+
+    /// Gain currently applied to a track (volume and fades, before bus, pan
+    /// and master), as of the last mixed block. For tests and meters.
+    pub fn track_gain(&self, track_id: Uuid) -> Result<f32, EngineError> {
+        Ok(self.inner.mixer.track_gain(track_id)?)
+    }
+
     /// Set master volume (0.0 - 1.0)
     pub fn set_master_volume(&self, volume: f32) -> Result<(), EngineError> {
         if !(0.0..=1.0).contains(&volume) {
@@ -1206,6 +1469,8 @@ impl AudioEngine {
         self.stop_sound(sound_id)?;
         self.inner.sounds.write().remove(&sound_id);
         self.inner.sound_volumes.write().remove(&sound_id);
+        self.inner.sound_pans.write().remove(&sound_id);
+        self.inner.sound_buses.write().remove(&sound_id);
         Ok(())
     }
 
@@ -1446,7 +1711,9 @@ impl MixWriter for f32 {
             if playing {
                 mixer.publish_broadcast(data);
             }
-            return playing;
+            // Previews are added after the broadcast copy was taken.
+            let previewing = mixer.mix_local_into(data);
+            return playing || previewing;
         }
 
         converted_mix(mixer, resampler, data, adapter)
@@ -1491,7 +1758,9 @@ where
         if playing {
             mixer.publish_broadcast(fresh);
         }
-        playing
+        // Previews are added after the broadcast copy was taken.
+        let previewing = mixer.mix_local_into(fresh);
+        playing || previewing
     })
 }
 
@@ -2196,5 +2465,184 @@ mod tests {
         assert_eq!(status.channels, 2);
         assert_eq!(status.sample_format, "i16");
         assert!(status.summary().contains("failed"));
+    }
+}
+
+/// Facade tests for fades, pan, buses and previews.
+#[cfg(test)]
+mod mixer_facade_tests {
+    use super::*;
+
+    fn engine_with_sound(value: f32) -> (AudioEngine, SoundId) {
+        let engine = AudioEngine::new().unwrap();
+        let sound =
+            engine.load_sound_from_data(DecodedAudio::new(vec![value; 48_000 * 2], 48_000, 2));
+        (engine, sound)
+    }
+
+    /// One device callback: mix, publish, add previews. Returns the device buffer.
+    fn callback(engine: &AudioEngine, frames: usize) -> Vec<f32> {
+        let mixer = &engine.inner.mixer;
+        let mut out = vec![0.0f32; frames * 2];
+        if mixer.mix_into(&mut out) {
+            mixer.publish_broadcast(&out);
+        }
+        mixer.mix_local_into(&mut out);
+        out
+    }
+
+    #[test]
+    fn play_sound_fade_ramps_up_to_the_sound_volume() {
+        let (engine, sound) = engine_with_sound(0.5);
+        engine.set_sound_volume(sound, 0.8).unwrap();
+        let handle = engine
+            .play_sound_fade(sound, true, 100, FadeCurve::Linear)
+            .unwrap();
+        let out = callback(&engine, 480);
+        assert!(out[0] < 0.01);
+        assert!(engine.track_gain(handle.track_id()).unwrap() < 0.8);
+        callback(&engine, 4320);
+        assert_eq!(engine.track_gain(handle.track_id()).unwrap(), 0.8);
+    }
+
+    #[test]
+    fn stop_sound_fade_reports_stopped_then_drops_the_track() {
+        let (engine, sound) = engine_with_sound(0.5);
+        let handle = engine.play_loop(sound).unwrap();
+        callback(&engine, 480);
+        engine
+            .stop_sound_fade(sound, 100, FadeCurve::EqualPower)
+            .unwrap();
+        assert!(!engine.is_sound_playing(sound).unwrap());
+        // Once stopped it is no longer registered, so a repeat is a no-op.
+        engine
+            .stop_sound_fade(sound, 100, FadeCurve::EqualPower)
+            .unwrap();
+        let out = callback(&engine, 2400);
+        assert!(out[0] > 0.3, "the tail is still audible");
+        callback(&engine, 2400);
+        assert_eq!(engine.inner.mixer.prune_finished(), 1);
+        assert!(!engine.inner.mixer.has_track(handle.track_id()));
+    }
+
+    #[test]
+    fn fade_sound_does_not_change_the_remembered_volume() {
+        let (engine, sound) = engine_with_sound(0.5);
+        let handle = engine.play_loop(sound).unwrap();
+        engine
+            .fade_sound(sound, 0.0, 100, FadeCurve::Linear)
+            .unwrap();
+        callback(&engine, 4800);
+        assert_eq!(engine.track_gain(handle.track_id()).unwrap(), 0.0);
+        assert_eq!(engine.sound_volume(sound).unwrap(), 1.0);
+        assert!(engine
+            .fade_sound(sound, 1.5, 100, FadeCurve::Linear)
+            .is_err());
+    }
+
+    #[test]
+    fn sound_pan_and_bus_apply_to_playing_and_later_tracks() {
+        let (engine, sound) = engine_with_sound(0.5);
+        let first = engine.play_loop(sound).unwrap();
+        engine.set_sound_pan(sound, -1.0).unwrap();
+        engine.set_sound_bus(sound, Bus::Music).unwrap();
+        callback(&engine, 1000);
+        let out = callback(&engine, 480);
+        assert_eq!((out[0], out[1]), (0.5, 0.0));
+        assert_eq!(engine.sound_pan(sound), -1.0);
+        assert_eq!(engine.sound_bus(sound), Bus::Music);
+
+        let second = engine.play(sound).unwrap();
+        let mixer = &engine.inner.mixer;
+        assert_eq!(mixer.track_pan(second.track_id()).unwrap(), -1.0);
+        assert_eq!(mixer.track_bus(second.track_id()).unwrap(), Bus::Music);
+        assert_eq!(mixer.track_bus(first.track_id()).unwrap(), Bus::Music);
+
+        assert!(engine.set_sound_pan(sound, 2.0).is_err());
+        assert!(engine.set_sound_pan(SoundId::new(), 0.0).is_err());
+    }
+
+    #[test]
+    fn bus_volume_and_ducking_through_the_facade() {
+        let (engine, sound) = engine_with_sound(0.4);
+        engine.set_sound_bus(sound, Bus::Music).unwrap();
+        engine.play_loop(sound).unwrap();
+        callback(&engine, 480);
+
+        engine.set_bus_volume(Bus::Music, 0.5).unwrap();
+        assert_eq!(engine.bus_volume(Bus::Music), 0.5);
+        callback(&engine, 960);
+        assert!((callback(&engine, 480)[0] - 0.2).abs() < 1e-6);
+
+        engine.duck_bus(
+            Bus::Music,
+            DuckSettings {
+                target: 0.5,
+                attack_ms: 20,
+                release_ms: 20,
+                hold_ms: None,
+            },
+        );
+        callback(&engine, 4800);
+        assert!((callback(&engine, 480)[0] - 0.1).abs() < 1e-6);
+        engine.release_duck(Bus::Music);
+        callback(&engine, 4800);
+        assert!((callback(&engine, 480)[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn preview_is_heard_locally_but_not_broadcast() {
+        let (engine, sound) = engine_with_sound(0.5);
+        let rx = engine.broadcast_output_receiver();
+        let preview = engine.play_preview(sound, true).unwrap();
+
+        let out = callback(&engine, 480);
+        assert!(out.iter().all(|s| (*s - 0.5).abs() < 1e-6));
+        assert!(rx.try_recv().is_err(), "nothing for the players");
+        // Not registered with the sound: stop_sound / is_sound_playing ignore it.
+        assert!(!engine.is_sound_playing(sound).unwrap());
+
+        // A real track alongside: the broadcast carries only that one, the
+        // device hears both (limited to the ceiling).
+        engine.play_loop(sound).unwrap();
+        let out = callback(&engine, 480);
+        assert!((out[0] - 0.97).abs() < 1e-6);
+        let published = rx.try_recv().unwrap();
+        assert!(published.buffer.iter().all(|s| (*s - 0.5).abs() < 1e-6));
+
+        preview.stop().unwrap();
+        callback(&engine, 960);
+    }
+
+    #[test]
+    fn device_callback_path_keeps_previews_out_of_the_broadcast() {
+        use super::device_adapter::DeviceAdapter;
+        use cpal::Sample;
+        let (engine, sound) = engine_with_sound(0.25);
+        engine.play_preview(sound, true).unwrap();
+        let rx = engine.broadcast_output_receiver();
+
+        // Converted (44.1 kHz u16) and identity (48 kHz f32) paths.
+        let mut resampler = StreamResampler::new();
+        let mut dev = vec![0u16; 441 * 2];
+        let playing = <u16 as MixWriter>::mix_and_publish(
+            &engine.inner.mixer,
+            &mut resampler,
+            &mut dev,
+            DeviceAdapter::new(44_100, 2),
+        );
+        assert!(playing, "the preview keeps the callback marked as playing");
+        assert_eq!(dev[0], u16::from_sample(0.25f32), "audible on the device");
+
+        let mut resampler = StreamResampler::new();
+        let mut dev = vec![0.0f32; 480 * 2];
+        <f32 as MixWriter>::mix_and_publish(
+            &engine.inner.mixer,
+            &mut resampler,
+            &mut dev,
+            DeviceAdapter::new(48_000, 2),
+        );
+        assert!(dev.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        assert!(rx.try_recv().is_err());
     }
 }
