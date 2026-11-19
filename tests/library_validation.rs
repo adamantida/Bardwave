@@ -36,6 +36,7 @@ fn item(sound: &str) -> SceneItemConfig {
         looped: false,
         start: Default::default(),
         delay_ms: 0,
+        pan: 0.0,
     }
 }
 

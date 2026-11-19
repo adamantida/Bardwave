@@ -20,11 +20,12 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
 use crate::audio::director_audio::{DuckMode, DuckTarget, MixControl};
 use crate::audio::SoundId;
+use crate::config::Bus;
 use crate::gui::app::SoundSharedApp;
 use crate::gui::types::AudioCommand;
 use crate::network::control::{
-    BoardState, ControlAction, ControlCommand, ControlFeed, ControlPlaylist, ControlScene,
-    ControlSound,
+    BoardState, ControlAction, ControlBuses, ControlCommand, ControlFeed, ControlPlaylist,
+    ControlPlaylistState, ControlScene, ControlSound,
 };
 
 /// How many panel commands one frame runs at most, so a flood from a phone
@@ -169,20 +170,48 @@ impl SoundSharedApp {
             })
             .collect();
 
+        let ducked_buses: Vec<String> = [Bus::Music, Bus::Ambience, Bus::Sfx]
+            .into_iter()
+            .filter(|bus| self.director.is_ducked(*bus))
+            .map(|bus| crate::audio::director_audio::bus_name(bus).to_string())
+            .collect();
+
         BoardState {
             sounds: control_sounds,
             master_volume: self.get_master_volume(),
             scenes,
             active_scene,
             playlists,
-            ducked: [
-                crate::config::Bus::Music,
-                crate::config::Bus::Ambience,
-                crate::config::Bus::Sfx,
-            ]
-            .into_iter()
-            .any(|bus| self.director.is_ducked(bus)),
+            ducked: !ducked_buses.is_empty(),
+            ducked_buses,
+            buses: ControlBuses {
+                music: self.director.bus_volume(Bus::Music),
+                ambience: self.director.bus_volume(Bus::Ambience),
+                sfx: self.director.bus_volume(Bus::Sfx),
+            },
+            playlist: Some(self.gm_playlist_view()),
         }
+    }
+
+    /// The music layer for the panel (position rounded down to a second, so a
+    /// playing track publishes once a second).
+    fn gm_playlist_view(&self) -> ControlPlaylistState {
+        let mut state = self.director.playlist_state();
+        state.position_ms -= state.position_ms % 1000;
+        if state.playlist.is_none() {
+            // The player's idle defaults settle after its first tick; do not
+            // let that read as a change of state.
+            state.crossfade_ms = 0;
+        }
+        let label = state.track.as_ref().map(|track| {
+            let fallback = uuid::Uuid::parse_str(track)
+                .ok()
+                .and_then(|id| self.library.sound_by_id(id))
+                .map(crate::gui::music::sound_label)
+                .unwrap_or_else(|| track.clone());
+            state.label(&fallback)
+        });
+        ControlPlaylistState { state, label }
     }
 
     /// Run one panel action and report the state afterwards.
@@ -269,6 +298,7 @@ impl SoundSharedApp {
                 })?;
             }
             ControlAction::Mix(control) => self.gm_mix(control)?,
+            ControlAction::Playlist(command) => self.gm_playlist(command)?,
         }
         Ok(self.gm_state())
     }
@@ -309,6 +339,17 @@ impl SoundSharedApp {
             Ok(result) => result.map_err(|e| e.to_string()),
             Err(_) => Err("the audio engine did not answer".to_string()),
         }
+    }
+
+    /// Music-layer commands go straight to the Director, as the console's own
+    /// music controls do.
+    fn gm_playlist(&mut self, command: crate::audio::PlaylistCommand) -> Result<(), String> {
+        let guard = self.audio_engine.lock().unwrap();
+        let engine = guard.as_ref().ok_or("audio engine stopped")?;
+        crate::gui::app::sync_director(&mut self.director, &self.library, &self.sounds);
+        let result = self.director.playlist_command(engine, command);
+        crate::gui::app::mirror_playing(&self.sounds, engine);
+        result.map_err(|e| e.to_string())
     }
 
     /// Bus volumes and ducking go straight to the Director, as the console's

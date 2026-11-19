@@ -1044,6 +1044,7 @@ mod merge_tests {
             gain_db: 0.0,
             bus: Default::default(),
             oneshot_stinger: false,
+            pan: 0.0,
         }
     }
 

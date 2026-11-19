@@ -143,6 +143,7 @@ fn console(options: Options) -> Console {
             looped: true,
             start: SceneStart::OnEnter,
             delay_ms: 0,
+            pan: 0.0,
         }],
         ..Default::default()
     }];
