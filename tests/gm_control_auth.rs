@@ -455,6 +455,8 @@ async fn a_proxied_loopback_request_is_not_local() {
         "X-Real-IP",
         "Forwarded",
         "CF-Connecting-IP",
+        "Via",
+        "X-Forwarded-Port",
     ] {
         let reply = http(
             h.addr,

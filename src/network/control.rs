@@ -16,7 +16,12 @@
 //!   `gm_token` disables remote access altogether;
 //! * "local" is decided from the socket address, never from `X-Forwarded-For`;
 //!   a request that carries reverse-proxy headers counts as remote, so a tunnel
-//!   running on this PC does not turn the whole internet into "local";
+//!   running on this PC does not turn the whole internet into "local". The
+//!   `Host` must also be a loopback name, so a relay that adds no header but
+//!   keeps the public name is refused too. A plain TCP tunnel (`ssh -R`, bore,
+//!   frp, ...) or a proxy that rewrites `Host` to `127.0.0.1` cannot be told
+//!   from the GM's own browser: point such tunnels at the listener port only
+//!   with a `gm_token` set and never at a no-token panel, or avoid them;
 //! * wrong or missing tokens all get the same 401; after
 //!   [`GM_MAX_FAILURES`](crate::network::access::GM_MAX_FAILURES) failures in a
 //!   minute the address gets 429 + `Retry-After`;
@@ -747,6 +752,14 @@ const PROXY_HEADERS: &[&str] = &[
     "cf-connecting-ip",
     "true-client-ip",
     "x-client-ip",
+    "via",
+    "x-forwarded-port",
+    "x-forwarded-server",
+    "x-forwarded-scheme",
+    "x-original-forwarded-for",
+    "x-cluster-client-ip",
+    "fastly-client-ip",
+    "cdn-loop",
 ];
 
 fn has_proxy_headers(headers: &HeaderMap) -> bool {
@@ -1683,6 +1696,16 @@ mod tests {
         assert!(!has_proxy_headers(&headers));
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         assert!(has_proxy_headers(&headers));
+        for name in [
+            "via",
+            "x-forwarded-port",
+            "cdn-loop",
+            "x-original-forwarded-for",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, "1".parse().unwrap());
+            assert!(has_proxy_headers(&headers), "{name}");
+        }
     }
 
     #[test]
