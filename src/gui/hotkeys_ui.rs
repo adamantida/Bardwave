@@ -567,6 +567,10 @@ impl Default for Draft {
 /// Everything the hotkeys need between frames.
 pub struct HotkeyUi {
     map: HotkeyMap,
+    /// The bindings `map` and `service` were built from. Deleting a sound,
+    /// scene or playlist prunes the library's bindings behind the dialog's
+    /// back; comparing against this list notices it.
+    source: Vec<HotkeyConfig>,
     dispatcher: HotkeyDispatcher,
     service: Option<HotkeyService>,
     status: ServiceStatus,
@@ -590,6 +594,7 @@ impl HotkeyUi {
         }
         Self {
             map: HotkeyMap::build(library.hotkeys()),
+            source: library.hotkeys().to_vec(),
             dispatcher: HotkeyDispatcher::new(),
             service: started.service,
             status: started.status,
@@ -603,6 +608,11 @@ impl HotkeyUi {
     /// What the dialog says about the system-wide service.
     pub fn status(&self) -> &ServiceStatus {
         &self.status
+    }
+
+    /// Whether `list` differs from the bindings the map was built from.
+    fn is_stale(&self, list: &[HotkeyConfig]) -> bool {
+        self.source != list
     }
 
     /// Number of bindings that can fire (for the one-line summary).
@@ -639,6 +649,11 @@ impl SoundSharedApp {
     /// Call at the start of `update`, before any widget is drawn.
     pub(crate) fn poll_hotkeys(&mut self, ctx: &Context) {
         let capturing = self.hotkeys_capturing();
+        // Deleting a sound, scene or playlist drops its bindings from the
+        // library only; bring the key map and OS shortcuts back in line.
+        if self.extras.hotkeys.is_stale(self.library.hotkeys()) {
+            self.hotkeys_changed();
+        }
         let hk = &mut self.extras.hotkeys;
         let mut events: Vec<HotkeyEvent> = Vec::new();
         if let Some(service) = hk.service.as_ref() {
@@ -703,6 +718,7 @@ impl SoundSharedApp {
         let list = self.library.hotkeys().to_vec();
         let hk = &mut self.extras.hotkeys;
         hk.map = HotkeyMap::build(&list);
+        hk.source = list.clone();
         if let Some(service) = hk.service.as_mut() {
             let report = service.sync(&list);
             hk.status = ServiceStatus::Active {
@@ -1266,6 +1282,57 @@ mod tests {
             scenes: vec![(ID_B.to_string(), "Tavern".to_string())],
             playlists: vec![],
         }
+    }
+
+    fn idle_ui(library: &Library) -> HotkeyUi {
+        HotkeyUi {
+            map: HotkeyMap::build(library.hotkeys()),
+            source: library.hotkeys().to_vec(),
+            dispatcher: HotkeyDispatcher::new(),
+            service: None,
+            status: ServiceStatus::Disabled,
+            capture: None,
+            draft: Draft::default(),
+            key_text: String::new(),
+            notice: None,
+        }
+    }
+
+    #[test]
+    fn deleting_a_scene_makes_the_key_map_stale() {
+        let mut library = Library::new();
+        let tavern = library.add_scene("Tavern").expect("scene");
+        let camp = library.add_scene("Camp").expect("scene");
+        library
+            .add_hotkey(
+                "Ctrl+1",
+                HotkeyAction::Scene {
+                    target: tavern.to_string(),
+                },
+            )
+            .unwrap();
+        library
+            .add_hotkey(
+                "Ctrl+2",
+                HotkeyAction::Scene {
+                    target: camp.to_string(),
+                },
+            )
+            .unwrap();
+        let mut ui = idle_ui(&library);
+        assert_eq!(ui.active_count(), 2);
+        assert!(!ui.is_stale(library.hotkeys()));
+
+        assert!(library.remove_scene(tavern));
+        assert_eq!(library.hotkeys().len(), 1);
+        // The map still holds the dead Ctrl+1 until it is rebuilt.
+        assert_eq!(ui.active_count(), 2);
+        assert!(ui.is_stale(library.hotkeys()));
+
+        ui.map = HotkeyMap::build(library.hotkeys());
+        ui.source = library.hotkeys().to_vec();
+        assert_eq!(ui.active_count(), 1);
+        assert!(!ui.is_stale(library.hotkeys()));
     }
 
     #[test]
