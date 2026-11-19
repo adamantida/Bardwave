@@ -2,7 +2,7 @@
 
 > **Project:** Bardwave — free, open-source ambience, music and sound effects for tabletop RPG
 > **Repo:** https://github.com/adamantida/Bardwave
-> **Package:** `soundshared` (version in `Cargo.toml`, currently 1.4.0; the binary is shipped as `Bardwave`)
+> **Package:** `soundshared` (version in `Cargo.toml`, currently 1.5.0; the binary is shipped as `Bardwave`)
 > **License:** MIT © 2026 adamantida
 
 This file describes what the code **is**. User-facing documentation is `README.md`, the change history is `CHANGELOG.md`, the development plan (in Russian) is `PLAN.md`.

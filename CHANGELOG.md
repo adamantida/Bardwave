@@ -2,9 +2,13 @@
 
 All notable changes to Bardwave are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-The version in `Cargo.toml` is **1.4.0** and has not been changed: a release is published when the version changes on `main`, and that is the owner's decision. Everything below *Unreleased* is on the `swarm/integration` branch and is not part of any published release yet. The baseline is v1.4.0 (the commit `cargo 1.4.0`).
+The version in `Cargo.toml` is **1.5.0**. Pushing it to `main` makes the **Release** workflow publish the release for that version. The baseline for this changelog is v1.4.0 (the commit `cargo 1.4.0`).
 
 ## [Unreleased]
+
+Nothing yet.
+
+## [1.5.0] - 2026-11-19
 
 ### Not verified on real hardware
 

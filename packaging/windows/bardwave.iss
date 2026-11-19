@@ -2,7 +2,7 @@
 ;
 ; Build (from the repository root, after `cargo build --release`):
 ;
-;   ISCC.exe /DMyAppVersion=1.4.0 /DMyAppNumVersion=1.4.0.0 /Odist packaging\windows\bardwave.iss
+;   ISCC.exe /DMyAppVersion=1.5.0 /DMyAppNumVersion=1.5.0.0 /Odist packaging\windows\bardwave.iss
 ;
 ; Parameters (all optional):
 ;   /DMyAppVersion=<x.y.z[-pre]>   shown in Programs and Features, used in the file name
