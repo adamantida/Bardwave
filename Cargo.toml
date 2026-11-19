@@ -87,3 +87,34 @@ roxmltree = { workspace = true }
 # getifaddrs for LAN address detection on Linux / macOS
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Debian/Ubuntu package: `cargo deb` (cargo-deb), see packaging/linux and
+# .github/workflows/release-extras.yml. The crate is called `soundshared`; the
+# package, the installed binary and the menu entry are called Bardwave.
+[package.metadata.deb]
+name = "bardwave"
+maintainer = "Bardwave contributors <noreply@github.com>"
+section = "sound"
+priority = "optional"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Bardwave is a desktop ambience console for tabletop role-playing games. \
+It mixes music, ambience and sound effects on the game master's computer \
+and streams the result to the players' browsers over the local network \
+(or the internet). Players only open a link; nothing is installed on their side."""
+# $auto adds the exact shared libraries the binary links against; the rest are
+# libraries loaded at run time (winit/egui dlopen X11/Wayland/xkbcommon, rfd
+# loads GTK 3) plus the CI build list (libasound2 for cpal, libssl for TLS).
+# The "t64" names are the Ubuntu 24.04 / Debian 13 renames of the same packages.
+depends = "$auto, libasound2 | libasound2t64, libgtk-3-0 | libgtk-3-0t64, libxkbcommon0, libssl3 | libssl3t64"
+assets = [
+    ["target/release/soundshared", "usr/bin/bardwave", "755"],
+    ["packaging/linux/bardwave.desktop", "usr/share/applications/bardwave.desktop", "644"],
+    ["assets/icons/icon-48.png", "usr/share/icons/hicolor/48x48/apps/bardwave.png", "644"],
+    ["assets/icons/icon-128.png", "usr/share/icons/hicolor/128x128/apps/bardwave.png", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/bardwave.png", "644"],
+    ["assets/icons/icon-512.png", "usr/share/icons/hicolor/512x512/apps/bardwave.png", "644"],
+    ["README.md", "usr/share/doc/bardwave/README.md", "644"],
+    ["packaging/README.txt", "usr/share/doc/bardwave/QUICKSTART.txt", "644"],
+    ["packaging/config.toml", "usr/share/doc/bardwave/examples/config.toml", "644"],
+]
