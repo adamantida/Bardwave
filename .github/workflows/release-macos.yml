@@ -1,0 +1,127 @@
+name: Release macOS
+
+# Builds the universal (aarch64 + x86_64) Bardwave.app, packs it into a .dmg and
+# attaches the .dmg and its sha256 to an existing GitHub release.
+# - release: published        -> the release that was just published;
+# - workflow_dispatch (tag)   -> any existing release, by hand (also the fallback: releases
+#                                created with the default GITHUB_TOKEN by release.yml do not
+#                                trigger "release" events, so run this workflow for them).
+# Signing and notarization happen only when the secrets below are set; otherwise an
+# unsigned (ad-hoc signed) build is attached, which is fine (see packaging/macos/README.md).
+#
+# Optional secrets:
+#   MACOS_CERTIFICATE           base64 of the Developer ID Application .p12
+#   MACOS_CERTIFICATE_PASSWORD  password of that .p12
+#   CODESIGN_IDENTITY           e.g. "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID, TEAM_ID, APP_PASSWORD   notarization (app-specific password)
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the macOS build to, e.g. v1.4.0"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: Build macOS universal dmg
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      TEAM_ID: ${{ secrets.TEAM_ID }}
+      APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+    steps:
+      - name: Validate tag
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$TAG' is not a release tag like v1.4.0"
+            exit 1
+          fi
+
+      - name: Checkout repository at the tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build aarch64-apple-darwin
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Build x86_64-apple-darwin
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Import signing certificate
+        id: cert
+        run: |
+          if [ -z "$MACOS_CERTIFICATE" ] || [ -z "$CODESIGN_IDENTITY" ]; then
+            echo "No signing secrets: building without a Developer ID signature."
+            # Make sure the scripts skip signing even if only part of the secrets exist.
+            echo "CODESIGN_IDENTITY=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/bardwave-signing.keychain-db"
+          keychain_pw="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$keychain_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_pw" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_pw" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
+
+      - name: Build universal Bardwave.app
+        run: |
+          packaging/macos/build-app.sh \
+            target/aarch64-apple-darwin/release/soundshared \
+            target/x86_64-apple-darwin/release/soundshared \
+            dist
+
+      - name: Sign and notarize app (only with secrets)
+        run: packaging/macos/sign-notarize.sh app dist/Bardwave.app
+
+      - name: Build dmg
+        run: packaging/macos/make-dmg.sh dist/Bardwave.app "dist/Bardwave-$TAG-macos-universal.dmg"
+
+      - name: Sign and notarize dmg (only with secrets)
+        run: packaging/macos/sign-notarize.sh dmg "dist/Bardwave-$TAG-macos-universal.dmg"
+
+      - name: Checksum
+        run: |
+          cd dist
+          shasum -a 256 "Bardwave-$TAG-macos-universal.dmg" > "Bardwave-$TAG-macos-universal.dmg.sha256"
+          cat "Bardwave-$TAG-macos-universal.dmg.sha256"
+
+      - name: Upload to the release
+        run: |
+          gh release upload "$TAG" \
+            "dist/Bardwave-$TAG-macos-universal.dmg" \
+            "dist/Bardwave-$TAG-macos-universal.dmg.sha256" \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Remove signing keychain
+        if: always() && steps.cert.outputs.keychain != ''
+        run: security delete-keychain "${{ steps.cert.outputs.keychain }}" || true
