@@ -60,6 +60,11 @@ pub enum Dialog {
     /// its validation error; the download itself runs on a worker thread and
     /// reports into [`SoundSharedApp::youtube_result_rx`].
     AddYouTube { url: String, error: Option<String> },
+    /// Playlist manager (see [`crate::gui::music`]); its in-progress state
+    /// lives in [`SoundSharedApp::music`].
+    Music,
+    /// Emitters and music layer of one scene ("Emitters & music…").
+    EditEmitters(crate::gui::groups::SceneId),
 }
 
 /// How long the library may stay unsaved before it is flushed to disk.
@@ -131,17 +136,17 @@ pub struct SoundSharedApp {
     app_state: AppState,
 
     // Audio engine (must stay on main thread due to cpal::Stream not being Send)
-    audio_engine: Arc<Mutex<Option<AudioEngine>>>,
+    pub(crate) audio_engine: Arc<Mutex<Option<AudioEngine>>>,
 
     // Audio command receiver (for processing commands on main thread)
     audio_cmd_rx: Receiver<AudioCommand>,
 
     /// The control core shared with the headless `/control` page: scenes,
     /// stingers and every playback command go through it.
-    director: Director,
+    pub(crate) director: Director,
 
     // Local sound cache (synced from audio engine)
-    sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
+    pub(crate) sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
     sound_order: Arc<Mutex<Vec<SoundId>>>,
 
     // Master volume cache
@@ -167,13 +172,13 @@ pub struct SoundSharedApp {
     server_status_tx: Sender<AppServerStatus>,
 
     // Sound library + groups (the operator's saved collection)
-    library: Library,
+    pub(crate) library: Library,
     /// Which group the library panel is filtered to.
     group_filter: GroupFilter,
     /// Name shown in the group-name field of the currently open modal.
     dialog: Dialog,
     /// Set when the library changed and needs writing to config.toml.
-    library_dirty: bool,
+    pub(crate) library_dirty: bool,
     /// Last time the library was flushed to disk.
     last_persist: Instant,
     /// Master volume stashed while muted.
@@ -218,10 +223,12 @@ pub struct SoundSharedApp {
     youtube_busy: bool,
     /// MASTER OUTPUT meter position (0..1, dB scale with peak decay).
     output_meter: f32,
+    /// Music panel, playlist manager and emitters dialog state.
+    pub(crate) music: crate::gui::music::MusicUi,
 }
 
 /// Hand the Director the current scenes and the loaded library sounds.
-fn sync_director(
+pub(crate) fn sync_director(
     director: &mut Director,
     library: &Library,
     sounds: &Mutex<HashMap<SoundId, SoundEntry>>,
@@ -237,7 +244,7 @@ fn sync_director(
 
 /// Copy "is it playing" from the engine into the rows: scenes and delayed
 /// starts start sounds without going through the row's Play button.
-fn mirror_playing(sounds: &Mutex<HashMap<SoundId, SoundEntry>>, engine: &AudioEngine) {
+pub(crate) fn mirror_playing(sounds: &Mutex<HashMap<SoundId, SoundEntry>>, engine: &AudioEngine) {
     for entry in sounds.lock().unwrap().values_mut() {
         entry.playing = engine.is_sound_playing(entry.id).unwrap_or(false);
     }
@@ -347,6 +354,7 @@ impl SoundSharedApp {
             youtube_status: Arc::new(Mutex::new(String::new())),
             youtube_busy: false,
             output_meter: 0.0,
+            music: Default::default(),
         };
 
         // Request initial server status
@@ -1448,6 +1456,7 @@ impl SoundSharedApp {
             let until = due.saturating_duration_since(Instant::now());
             wait = wait.min(until.max(Duration::from_millis(5)));
         }
+        wait = wait.min(self.music.repaint_hint(&self.dialog));
         ctx.request_repaint_after(wait);
     }
 
@@ -1461,6 +1470,7 @@ impl SoundSharedApp {
         self.director.configure_audio(&audio_cfg);
         self.director.tick(engine);
         mirror_playing(&self.sounds, engine);
+        self.music.observe(&self.director, Instant::now());
         // Loudness measured in the background: store the gains in the library.
         for update in self.director.take_gain_updates() {
             let path = uuid::Uuid::parse_str(&update.library_id)
