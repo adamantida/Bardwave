@@ -529,7 +529,7 @@ fn main() -> Result<()> {
         warn!("Listener stream is open: access_token is empty in config.toml");
     }
 
-    info!("Starting SoundShared v{}", soundshared::VERSION);
+    info!("Starting Bardwave v{}", env!("CARGO_PKG_VERSION"));
 
     // Create channels for inter-component communication
     let (audio_cmd_tx, audio_cmd_rx) = bounded::<AudioCommand>(32);
@@ -803,7 +803,7 @@ fn main() -> Result<()> {
             }
         }
 
-        info!("SoundShared stopped");
+        info!("Bardwave stopped");
         Ok(())
     } else {
         // Run the GUI (blocks until window closes)
@@ -826,7 +826,7 @@ fn main() -> Result<()> {
             }
         }
 
-        info!("SoundShared stopped");
+        info!("Bardwave stopped");
         gui_result.map_err(|e| SoundSharedError::Other(e.to_string()))
     }
 }

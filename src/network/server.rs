@@ -1,4 +1,4 @@
-//! HTTP/WebSocket server for SoundShared
+//! HTTP/WebSocket server for Bardwave
 
 pub use axum::response::{Html, Response};
 pub use axum::{
@@ -337,6 +337,7 @@ pub async fn api_status(
 
     let status = serde_json::json!({
         "status": "running",
+        "name": "Bardwave",
         "listeners": listener_count,
         "version": env!("CARGO_PKG_VERSION"),
         "audio_format": {

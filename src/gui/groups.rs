@@ -266,6 +266,94 @@ pub struct RemovedRefs {
     pub hotkeys: usize,
 }
 
+/// What a [`SceneWarning`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WarningScope {
+    /// A scene's own items, emitters or playlist reference.
+    Scene(SceneId),
+    /// A track of a playlist.
+    Playlist(PlaylistId),
+    /// The binding at this index of [`Library::hotkeys`].
+    Hotkey(usize),
+}
+
+/// What is wrong, see [`SceneWarning`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SceneWarningKind {
+    /// Refers to a sound id that is not in the library. `emitter` is the
+    /// emitter index when the reference sits in an emitter.
+    UnknownSound {
+        /// The unresolved id.
+        sound: SoundId,
+        /// Emitter index, `None` for a scene item, playlist track or hotkey.
+        emitter: Option<usize>,
+    },
+    /// A hotkey target that is not even a valid id.
+    UnknownTarget {
+        /// The target as stored.
+        target: String,
+    },
+    /// The sound is registered but its file is not on disk.
+    MissingFile {
+        /// The sound.
+        sound: SoundId,
+        /// Where the library expects the file.
+        path: PathBuf,
+        /// Emitter index, `None` for a scene item, playlist track or hotkey.
+        emitter: Option<usize>,
+    },
+    /// The scene has no items, no emitters and no playlist: activating it
+    /// starts nothing.
+    EmptyScene,
+    /// An emitter without any candidate sound never fires.
+    EmitterWithoutSounds {
+        /// Emitter index in the scene.
+        emitter: usize,
+    },
+    /// An emitter whose minimum interval is longer than its maximum. Loading
+    /// swaps such a pair, so this only shows for a model built in memory.
+    EmitterIntervalReversed {
+        /// Emitter index in the scene.
+        emitter: usize,
+        /// Minimum interval, ms.
+        min_ms: u32,
+        /// Maximum interval, ms.
+        max_ms: u32,
+    },
+    /// The scene's music layer (or a hotkey) names a playlist that does not exist.
+    UnknownPlaylist {
+        /// The unresolved id.
+        playlist: PlaylistId,
+    },
+    /// A hotkey names a scene that does not exist.
+    UnknownScene {
+        /// The unresolved id.
+        scene: SceneId,
+    },
+}
+
+/// A reason why a scene, playlist or hotkey would silently do nothing (or less
+/// than expected). Produced by [`Library::scene_warnings`] and
+/// [`Library::all_warnings`]; the console shows them as a badge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SceneWarning {
+    /// The scene / playlist / hotkey that is affected.
+    pub scope: WarningScope,
+    /// What is wrong.
+    pub kind: SceneWarningKind,
+}
+
+/// Warnings already logged; shared between clones of a [`Library`] so a copy
+/// (undo snapshots, the director's view) does not repeat them.
+#[derive(Debug, Clone, Default)]
+struct WarnedSet(std::sync::Arc<std::sync::Mutex<HashSet<SceneWarning>>>);
+
+impl WarnedSet {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<SceneWarning>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// A problem found by [`Library::validate`]. These are warnings: the library
 /// stays usable, the UI should show them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +499,8 @@ pub struct Library {
     by_sound_id: HashMap<SoundId, usize>,
     /// `group id -> index into groups`, kept in sync with `groups`.
     by_id: HashMap<GroupId, usize>,
+    /// Warnings already written to the log (see [`Library::log_all_warnings`]).
+    warned: WarnedSet,
 }
 
 impl Library {
@@ -438,8 +528,16 @@ impl Library {
     ///
     /// Hotkeys are not part of `LibraryConfig`: see [`Library::from_full_config`].
     pub fn from_config(cfg: &LibraryConfig) -> Self {
-        let mut library = Self::new();
+        // Hand-written non-UUID ids are replaced and the references to them
+        // follow (see `LibraryConfig::ensure_ids`), so they are not dropped
+        // below. A no-op for a config that went through `Config::load_from`.
+        let mut normalized = cfg.clone();
+        normalized.normalize_ids();
+        Self::build(&normalized)
+    }
 
+    fn build(cfg: &LibraryConfig) -> Self {
+        let mut library = Self::new();
         for persisted in &cfg.groups {
             let Ok(id) = Uuid::parse_str(persisted.id.trim()) else {
                 continue;
@@ -538,6 +636,14 @@ impl Library {
                     .emitters
                     .iter()
                     .map(|e| {
+                        if e.min_interval_ms > e.max_interval_ms {
+                            tracing::warn!(
+                                "scene \u{201c}{}\u{201d}: emitter min interval {} ms is above max {} ms, swapped",
+                                persisted.name,
+                                e.min_interval_ms,
+                                e.max_interval_ms
+                            );
+                        }
                         sanitize_emitter(Emitter {
                             sounds: parse_ids(&e.sounds),
                             min_interval_ms: e.min_interval_ms,
@@ -564,15 +670,21 @@ impl Library {
     /// ones, see [`Library::validate`]); a target that is a UUID is
     /// re-spelled in the canonical lower-case form.
     pub fn from_full_config(config: &Config) -> Self {
-        let mut library = Self::from_config(&config.library);
-        library.hotkeys = config
-            .hotkeys
+        let mut library_cfg = config.library.clone();
+        let remap = library_cfg.normalize_ids();
+        let mut hotkeys = config.hotkeys.clone();
+        remap.apply_to_hotkeys(&mut hotkeys);
+
+        let mut library = Self::build(&library_cfg);
+        library.hotkeys = hotkeys
             .iter()
             .map(|h| HotkeyConfig {
                 key: h.key.clone(),
                 action: normalize_action(&h.action),
             })
             .collect();
+        // One warning per problem, at load; the GUI reads `all_warnings`.
+        library.log_all_warnings();
         library
     }
 
@@ -1710,6 +1822,223 @@ impl Library {
         warnings
     }
 
+    // ---------------------------------------------- silent-failure checks ----
+
+    /// Why activating `scene` would start nothing, or less than the user
+    /// expects: unknown sounds, sound files missing on disk, an empty scene,
+    /// emitters without sounds or with reversed intervals, an unknown playlist.
+    /// Empty when all is well or the scene does not exist.
+    ///
+    /// This looks at the file system (one `exists` per referenced sound), so
+    /// call it on events (load, activation, a library change), not every
+    /// frame; keep the result for drawing. [`Library::scene_warnings_with`]
+    /// takes the existence check as a parameter.
+    pub fn scene_warnings(&self, scene: SceneId) -> Vec<SceneWarning> {
+        self.scene_warnings_with(scene, |path| path.exists())
+    }
+
+    /// [`Library::scene_warnings`] with a custom "does this file exist" check.
+    pub fn scene_warnings_with(
+        &self,
+        scene: SceneId,
+        exists: impl Fn(&Path) -> bool,
+    ) -> Vec<SceneWarning> {
+        let Some(found) = self.scene(scene) else {
+            return Vec::new();
+        };
+        let scope = WarningScope::Scene(scene);
+        let mut warnings = Vec::new();
+        let mut push = |kind: SceneWarningKind| warnings.push(SceneWarning { scope, kind });
+
+        if found.items.is_empty() && found.emitters.is_empty() && found.playlist.is_none() {
+            push(SceneWarningKind::EmptyScene);
+        }
+        for item in &found.items {
+            if let Some(kind) = self.sound_problem(item.sound, None, &exists) {
+                push(kind);
+            }
+        }
+        for (index, emitter) in found.emitters.iter().enumerate() {
+            if emitter.sounds.is_empty() {
+                push(SceneWarningKind::EmitterWithoutSounds { emitter: index });
+            }
+            if emitter.min_interval_ms > emitter.max_interval_ms {
+                push(SceneWarningKind::EmitterIntervalReversed {
+                    emitter: index,
+                    min_ms: emitter.min_interval_ms,
+                    max_ms: emitter.max_interval_ms,
+                });
+            }
+            for sound in &emitter.sounds {
+                if let Some(kind) = self.sound_problem(*sound, Some(index), &exists) {
+                    push(kind);
+                }
+            }
+        }
+        if let Some(playlist) = found.playlist {
+            if self.playlist(playlist).is_none() {
+                push(SceneWarningKind::UnknownPlaylist { playlist });
+            }
+        }
+        unique(warnings)
+    }
+
+    /// Every [`SceneWarning`] of the library: all scenes, the tracks of all
+    /// playlists, and the hotkeys that fire missing or broken things. Same
+    /// cost caveat as [`Library::scene_warnings`].
+    pub fn all_warnings(&self) -> Vec<SceneWarning> {
+        self.all_warnings_with(|path| path.exists())
+    }
+
+    /// [`Library::all_warnings`] with a custom "does this file exist" check.
+    pub fn all_warnings_with(&self, exists: impl Fn(&Path) -> bool) -> Vec<SceneWarning> {
+        let mut warnings = Vec::new();
+        for scene in &self.scenes {
+            warnings.extend(self.scene_warnings_with(scene.id, &exists));
+        }
+        for playlist in &self.playlists {
+            let scope = WarningScope::Playlist(playlist.id);
+            for sound in &playlist.items {
+                if let Some(kind) = self.sound_problem(*sound, None, &exists) {
+                    warnings.push(SceneWarning { scope, kind });
+                }
+            }
+        }
+        for (index, hotkey) in self.hotkeys.iter().enumerate() {
+            let Some(target) = hotkey.action.target() else {
+                continue;
+            };
+            let scope = WarningScope::Hotkey(index);
+            let kind = match Uuid::parse_str(target.trim()) {
+                Err(_) => Some(SceneWarningKind::UnknownTarget {
+                    target: target.to_string(),
+                }),
+                Ok(id) => match &hotkey.action {
+                    HotkeyAction::Sound { .. } => self.sound_problem(id, None, &exists),
+                    HotkeyAction::Scene { .. } => self
+                        .scene(id)
+                        .is_none()
+                        .then_some(SceneWarningKind::UnknownScene { scene: id }),
+                    HotkeyAction::Playlist { .. } => self
+                        .playlist(id)
+                        .is_none()
+                        .then_some(SceneWarningKind::UnknownPlaylist { playlist: id }),
+                    _ => None,
+                },
+            };
+            if let Some(kind) = kind {
+                warnings.push(SceneWarning { scope, kind });
+            }
+        }
+        unique(warnings)
+    }
+
+    /// One line describing `warning` for a log or a tooltip, with the names of
+    /// the scene / playlist it belongs to.
+    pub fn describe_warning(&self, warning: &SceneWarning) -> String {
+        let owner = match warning.scope {
+            WarningScope::Scene(id) => format!(
+                "scene \u{201c}{}\u{201d}",
+                self.scene(id).map_or("?", |s| s.name.as_str())
+            ),
+            WarningScope::Playlist(id) => format!(
+                "playlist \u{201c}{}\u{201d}",
+                self.playlist(id).map_or("?", |p| p.name.as_str())
+            ),
+            WarningScope::Hotkey(index) => match self.hotkeys.get(index) {
+                Some(h) => format!("hotkey {}", h.key),
+                None => "hotkey".to_string(),
+            },
+        };
+        let place = |emitter: &Option<usize>| match emitter {
+            Some(index) => format!(" (emitter {})", index + 1),
+            None => String::new(),
+        };
+        let what = match &warning.kind {
+            SceneWarningKind::UnknownSound { sound, emitter } => {
+                format!("refers to unknown sound {sound}{}", place(emitter))
+            }
+            SceneWarningKind::UnknownTarget { target } => {
+                format!("has an invalid target {target:?}")
+            }
+            SceneWarningKind::MissingFile {
+                sound,
+                path,
+                emitter,
+            } => format!(
+                "sound {sound} is missing its file {}{}",
+                path.display(),
+                place(emitter)
+            ),
+            SceneWarningKind::EmptyScene => "is empty, activating it starts nothing".to_string(),
+            SceneWarningKind::EmitterWithoutSounds { emitter } => {
+                format!("emitter {} has no sounds", emitter + 1)
+            }
+            SceneWarningKind::EmitterIntervalReversed {
+                emitter,
+                min_ms,
+                max_ms,
+            } => format!(
+                "emitter {} has min interval {min_ms} ms above max {max_ms} ms",
+                emitter + 1
+            ),
+            SceneWarningKind::UnknownPlaylist { playlist } => {
+                format!("refers to unknown playlist {playlist}")
+            }
+            SceneWarningKind::UnknownScene { scene } => {
+                format!("refers to unknown scene {scene}")
+            }
+        };
+        format!("{owner} {what}")
+    }
+
+    /// Write a `tracing::warn!` for every problem of the whole library that
+    /// has not been logged yet, and return how many were new. Problems that
+    /// went away are forgotten, so one that comes back is reported again.
+    /// Called once when the library is loaded ([`Library::from_full_config`]).
+    pub fn log_all_warnings(&self) -> usize {
+        let current = self.all_warnings();
+        self.warned.lock().retain(|w| current.contains(w));
+        self.log_new(&current)
+    }
+
+    /// [`Library::log_all_warnings`] for one scene, meant for the moment it is
+    /// activated. Repeated activations of a scene with the same problems log
+    /// nothing more. Returns the number of newly logged problems.
+    pub fn log_scene_warnings(&self, scene: SceneId) -> usize {
+        self.log_new(&self.scene_warnings(scene))
+    }
+
+    fn log_new(&self, warnings: &[SceneWarning]) -> usize {
+        let mut warned = self.warned.lock();
+        let mut fresh = 0;
+        for warning in warnings {
+            if warned.insert(warning.clone()) {
+                tracing::warn!("{}", self.describe_warning(warning));
+                fresh += 1;
+            }
+        }
+        fresh
+    }
+
+    /// The problem with referring to `id` as a sound, if any.
+    fn sound_problem(
+        &self,
+        id: SoundId,
+        emitter: Option<usize>,
+        exists: &impl Fn(&Path) -> bool,
+    ) -> Option<SceneWarningKind> {
+        match self.sound_by_id(id) {
+            None => Some(SceneWarningKind::UnknownSound { sound: id, emitter }),
+            Some(sound) if !exists(&sound.path) => Some(SceneWarningKind::MissingFile {
+                sound: id,
+                path: sound.path.clone(),
+                emitter,
+            }),
+            Some(_) => None,
+        }
+    }
+
     // ----------------------------------------------------------- private ----
 
     fn name_taken(&self, candidate: &str, except: Option<GroupId>) -> bool {
@@ -1814,6 +2143,15 @@ impl Library {
             action: normalize_action(&action),
         })
     }
+}
+
+/// Drop repeated warnings, keeping the first of each.
+fn unique(warnings: Vec<SceneWarning>) -> Vec<SceneWarning> {
+    let mut seen = HashSet::new();
+    warnings
+        .into_iter()
+        .filter(|w| seen.insert(w.clone()))
+        .collect()
 }
 
 /// Parse `raw` as a UUID, or mint a fresh one when it is empty, not a UUID or
@@ -2097,5 +2435,35 @@ mod remap_tests {
             remap("/музыка/a.wav", "/музыка", "/звук").as_deref(),
             Some("/звук/a.wav")
         );
+    }
+}
+
+#[cfg(test)]
+mod warning_tests {
+    use super::*;
+
+    #[test]
+    fn reversed_interval_in_the_model_is_reported() {
+        let mut library = Library::new();
+        assert!(library.insert_sound(Path::new("/fake/a.wav"), "A", 1.0, None));
+        let sound = library.id_of(Path::new("/fake/a.wav")).unwrap();
+        let scene = library.add_scene("S").unwrap();
+        assert!(library.set_emitters(scene, vec![Emitter::new(vec![sound])]));
+        // The editing API swaps a reversed pair, so reverse it behind its back.
+        let emitter = &mut library.scene_mut_internal(scene).unwrap().emitters[0];
+        emitter.min_interval_ms = 9_000;
+        emitter.max_interval_ms = 1_000;
+
+        let warnings = library.scene_warnings_with(scene, |_| true);
+        assert_eq!(
+            warnings.iter().map(|w| &w.kind).collect::<Vec<_>>(),
+            vec![&SceneWarningKind::EmitterIntervalReversed {
+                emitter: 0,
+                min_ms: 9_000,
+                max_ms: 1_000,
+            }]
+        );
+        let text = library.describe_warning(&warnings[0]);
+        assert!(text.contains("9000") && text.contains("1000"), "{text}");
     }
 }
