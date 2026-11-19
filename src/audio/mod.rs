@@ -3,6 +3,7 @@
 
 pub mod decoder;
 pub mod director;
+pub mod emitter;
 pub mod engine;
 pub mod loudness;
 pub mod mixer;
@@ -16,6 +17,9 @@ pub use decoder::{
 pub use director::{
     ActivationPlan, CatalogSound, Director, DirectorCommand, DirectorError, DirectorOutcome,
     DirectorState, FadeSpec, Playback, SceneReport,
+};
+pub use emitter::{
+    EmitterEvent, EmitterHost, EmitterRunner, EmitterSnapshot, EmitterSound, EmitterSpec, Scheduler,
 };
 pub use engine::{
     AudioEngine, EngineError, EngineStats, LocalOutputState, LocalOutputStatus, SoundId,

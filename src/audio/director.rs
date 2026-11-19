@@ -142,6 +142,11 @@ pub trait Playback {
     fn master_volume(&self) -> f32;
     /// Set the master volume.
     fn set_master_volume(&self, volume: f32) -> PlaybackResult;
+    /// Length of the sound in milliseconds, `None` when unknown. Emitters use
+    /// it to know when an instance they started has ended.
+    fn duration_ms(&self, _sound: SoundId) -> Option<u32> {
+        None
+    }
     /// Turn a bus down under something else. Default: nothing (mocks).
     fn duck_bus(&self, _bus: Bus, _settings: DuckSettings) {}
     /// Bring a ducked bus back. Default: nothing (mocks).
@@ -271,6 +276,11 @@ impl Playback for AudioEngine {
 
     fn set_master_volume(&self, volume: f32) -> PlaybackResult {
         AudioEngine::set_master_volume(self, volume)
+    }
+
+    fn duration_ms(&self, sound: SoundId) -> Option<u32> {
+        let (secs, _, _) = self.sound_info(sound).ok()?;
+        (secs.is_finite() && secs > 0.0).then(|| (secs * 1000.0).round() as u32)
     }
 
     fn duck_bus(&self, bus: Bus, settings: DuckSettings) {
@@ -469,6 +479,8 @@ pub struct Director {
     stingers: HashSet<SoundId>,
     state_tx: watch::Sender<DirectorState>,
     last_refresh: Option<Instant>,
+    /// Random / periodic sounds of the active scene (see `audio::emitter`).
+    pub(crate) emitters: crate::audio::emitter::EmitterHost,
 }
 
 impl Default for Director {
@@ -489,6 +501,7 @@ impl Director {
             stingers: HashSet::new(),
             state_tx,
             last_refresh: None,
+            emitters: crate::audio::emitter::EmitterHost::new(),
         }
     }
 
@@ -656,7 +669,11 @@ impl Director {
         if scene.stop_others {
             plan.stops = playing
                 .into_iter()
-                .filter(|sound| !in_scene.contains(sound) && !self.is_stinger(*sound))
+                .filter(|sound| {
+                    !in_scene.contains(sound)
+                        && !self.is_stinger(*sound)
+                        && !self.emitter_instance_of(scene_id, *sound)
+                })
                 .collect();
         }
         Ok(plan)
@@ -745,6 +762,7 @@ impl Director {
         }
 
         self.active = Some(plan.scene);
+        self.sync_emitters(pb, now);
         self.last_refresh = Some(now);
         self.publish(pb);
         Ok(report)
@@ -761,6 +779,7 @@ impl Director {
         if let Some(scene) = self.active.take().and_then(|id| self.scene(&id).cloned()) {
             report.scene = scene.id.clone();
             let fade = FadeSpec::new(scene.fade_out_ms, scene.curve);
+            self.fade_out_emitters(pb, fade);
             let mut seen = HashSet::new();
             for item in &scene.items {
                 let Some(entry) = self.by_library_id(&item.sound) else {
@@ -860,6 +879,7 @@ impl Director {
             .unwrap_or_default();
         self.pending.clear();
         self.active = None;
+        self.clear_emitters();
         let result = pb.stop_all(FadeSpec::new(ms, curve));
         self.publish(pb);
         Ok(result?)
@@ -959,7 +979,11 @@ impl Director {
 
     /// When [`tick`](Self::tick) next has work (the earliest delayed start).
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.pending.iter().map(|p| p.due).min()
+        let pending = self.pending.iter().map(|p| p.due).min();
+        match (pending, self.emitter_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Run what is due. Call it regularly from the engine's thread (once per
@@ -992,6 +1016,7 @@ impl Director {
                 ran = true;
             }
         }
+        ran |= self.run_emitters(pb, now);
         let stale = self
             .last_refresh
             .is_none_or(|last| now.saturating_duration_since(last) >= REFRESH_EVERY);
@@ -1206,6 +1231,8 @@ pub mod mock {
     struct Sound {
         volume: f32,
         bus: Bus,
+        pan: f32,
+        duration_ms: Option<u32>,
     }
 
     #[derive(Debug, Clone)]
@@ -1251,9 +1278,33 @@ pub mod mock {
                 Sound {
                     volume: 1.0,
                     bus: Bus::default(),
+                    pan: 0.0,
+                    duration_ms: None,
                 },
             );
             id
+        }
+
+        /// Set the length [`Playback::duration_ms`] reports for the sound.
+        pub fn set_duration(&self, sound: SoundId, duration_ms: Option<u32>) {
+            if let Some(entry) = self.state.lock().sounds.get_mut(&sound) {
+                entry.duration_ms = duration_ms;
+            }
+        }
+
+        /// The pan most recently set for the sound (`0.0` when never set).
+        pub fn pan_of(&self, sound: SoundId) -> Option<f32> {
+            self.state.lock().sounds.get(&sound).map(|s| s.pan)
+        }
+
+        /// How many tracks of the sound play (fading-out tails excluded).
+        pub fn playing_count(&self, sound: SoundId) -> usize {
+            self.state
+                .lock()
+                .tracks
+                .iter()
+                .filter(|t| t.sound == sound && !t.halting)
+                .count()
         }
 
         /// Make every call that starts this sound fail.
@@ -1398,8 +1449,15 @@ pub mod mock {
             Ok(())
         }
 
-        fn set_pan(&self, sound: SoundId, _pan: f32) -> PlaybackResult {
-            Self::check(&self.state.lock(), sound)
+        fn set_pan(&self, sound: SoundId, pan: f32) -> PlaybackResult {
+            let mut state = self.state.lock();
+            Self::check(&state, sound)?;
+            state.sounds.get_mut(&sound).expect("checked").pan = pan;
+            Ok(())
+        }
+
+        fn duration_ms(&self, sound: SoundId) -> Option<u32> {
+            self.state.lock().sounds.get(&sound)?.duration_ms
         }
 
         fn set_bus(&self, sound: SoundId, bus: Bus) -> PlaybackResult {
