@@ -198,29 +198,119 @@ impl LibraryConfig {
     /// written back on the next save). An id that is empty, not a UUID, or that
     /// repeats an earlier one in the same list is replaced too.
     ///
+    /// A replaced id that was a non-empty non-UUID string (hand-written, such
+    /// as `"rain"`) is not just forgotten: every reference to it inside the
+    /// library (scene items, emitters, a scene's playlist, playlist tracks) is
+    /// rewritten to the new id, so nothing is left dangling. Hotkeys live
+    /// outside `[library]`; use [`LibraryConfig::normalize_ids`] and
+    /// [`IdRemap::apply_to_hotkeys`], or [`Config::ensure_ids`], for those.
+    ///
     /// Returns `true` when anything was changed, i.e. when the config should be
     /// saved to make the new ids permanent. [`Config::load_from`] calls this.
     pub fn ensure_ids(&mut self) -> bool {
-        fn fix<'a>(ids: impl Iterator<Item = &'a mut String>) -> bool {
-            let mut seen = std::collections::HashSet::new();
-            let mut changed = false;
-            for id in ids {
-                match uuid::Uuid::parse_str(id.trim()) {
-                    Ok(parsed) if seen.insert(parsed) => {}
-                    _ => {
-                        let fresh = uuid::Uuid::new_v4();
-                        seen.insert(fresh);
-                        *id = fresh.to_string();
-                        changed = true;
+        self.normalize_ids().changed
+    }
+
+    /// [`LibraryConfig::ensure_ids`], but reporting which ids were replaced so
+    /// that references held elsewhere (hotkeys) can be rewritten too.
+    pub fn normalize_ids(&mut self) -> IdRemap {
+        let mut changed = false;
+        let remap = IdRemap {
+            sounds: fix_ids(self.sounds.iter_mut().map(|s| &mut s.id), &mut changed),
+            scenes: fix_ids(self.scenes.iter_mut().map(|s| &mut s.id), &mut changed),
+            playlists: fix_ids(self.playlists.iter_mut().map(|p| &mut p.id), &mut changed),
+            changed,
+        };
+
+        if !remap.sounds.is_empty() {
+            for scene in &mut self.scenes {
+                for item in &mut scene.items {
+                    remap_ref(&remap.sounds, &mut item.sound);
+                }
+                for emitter in &mut scene.emitters {
+                    for id in &mut emitter.sounds {
+                        remap_ref(&remap.sounds, id);
                     }
                 }
             }
-            changed
+            for playlist in &mut self.playlists {
+                for id in &mut playlist.items {
+                    remap_ref(&remap.sounds, id);
+                }
+            }
         }
-        let sounds = fix(self.sounds.iter_mut().map(|s| &mut s.id));
-        let scenes = fix(self.scenes.iter_mut().map(|s| &mut s.id));
-        let playlists = fix(self.playlists.iter_mut().map(|p| &mut p.id));
-        sounds | scenes | playlists
+        if !remap.playlists.is_empty() {
+            for scene in &mut self.scenes {
+                if let Some(id) = scene.playlist.as_mut() {
+                    remap_ref(&remap.playlists, id);
+                }
+            }
+        }
+        remap
+    }
+}
+
+/// Replace unusable ids in place; returns `old (trimmed, non-empty) -> new`
+/// for the ones that were non-UUID strings, so references can follow them.
+fn fix_ids<'a>(
+    ids: impl Iterator<Item = &'a mut String>,
+    changed: &mut bool,
+) -> std::collections::HashMap<String, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut map = std::collections::HashMap::new();
+    for id in ids {
+        match uuid::Uuid::parse_str(id.trim()) {
+            Ok(parsed) if seen.insert(parsed) => {}
+            result => {
+                let fresh = uuid::Uuid::new_v4();
+                seen.insert(fresh);
+                let old = id.trim().to_string();
+                *id = fresh.to_string();
+                *changed = true;
+                // Only a hand-written, non-UUID id can be referenced under its
+                // old spelling; a repeated UUID keeps pointing at its first
+                // owner. The first holder of a repeated bad id wins too.
+                if result.is_err() && !old.is_empty() {
+                    map.entry(old).or_insert_with(|| fresh.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+fn remap_ref(map: &std::collections::HashMap<String, String>, id: &mut String) {
+    if let Some(new) = map.get(id.trim()) {
+        *id = new.clone();
+    }
+}
+
+/// Which ids [`LibraryConfig::normalize_ids`] replaced: `old id -> new id`, per
+/// kind. Only non-empty, non-UUID ids appear (those are the ones other entries
+/// can refer to).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdRemap {
+    /// Sound ids.
+    pub sounds: std::collections::HashMap<String, String>,
+    /// Scene ids.
+    pub scenes: std::collections::HashMap<String, String>,
+    /// Playlist ids.
+    pub playlists: std::collections::HashMap<String, String>,
+    /// Whether any id at all was replaced (also empty or repeated ones).
+    pub changed: bool,
+}
+
+impl IdRemap {
+    /// Point hotkeys that named a replaced id at the new one.
+    pub fn apply_to_hotkeys(&self, hotkeys: &mut [HotkeyConfig]) {
+        for hotkey in hotkeys {
+            match &mut hotkey.action {
+                HotkeyAction::Sound { target } => remap_ref(&self.sounds, target),
+                HotkeyAction::Scene { target } => remap_ref(&self.scenes, target),
+                HotkeyAction::Playlist { target } => remap_ref(&self.playlists, target),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -915,12 +1005,21 @@ impl Config {
 
         // v1.4.0 files have no sound ids: mint them now, they are written out
         // by the next save.
-        if config.library.ensure_ids() {
+        if config.ensure_ids() {
             tracing::info!("Assigned ids to library entries of {:?}", path);
         }
 
         tracing::info!("Loaded configuration from {:?}", path);
         Ok(config)
+    }
+
+    /// Give library entries valid ids and keep every reference to a replaced
+    /// id (library and `[[hotkeys]]`) pointing at its new one. See
+    /// [`LibraryConfig::ensure_ids`]. True when anything changed.
+    pub fn ensure_ids(&mut self) -> bool {
+        let remap = self.library.normalize_ids();
+        remap.apply_to_hotkeys(&mut self.hotkeys);
+        remap.changed
     }
 
     /// Save configuration to config.toml next to the executable
