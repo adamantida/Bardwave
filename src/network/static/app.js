@@ -2439,11 +2439,14 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         const hasAny = !!(state.nowPlaying.scene || state.nowPlaying.track);
 
         if (els.nowPlaying) els.nowPlaying.hidden = !hasAny;
-        setText(els.nowPlayingScene, state.nowPlaying.scene || state.nowPlaying.track);
+        const headline = state.nowPlaying.scene || state.nowPlaying.track;
+        setText(els.nowPlayingScene, headline);
+        if (els.nowPlayingScene) els.nowPlayingScene.title = headline;
         if (els.nowPlayingTrack) {
             const showTrack = !!(state.nowPlaying.scene && state.nowPlaying.track);
             els.nowPlayingTrack.hidden = !showTrack;
             setText(els.nowPlayingTrack, showTrack ? state.nowPlaying.track : '');
+            els.nowPlayingTrack.title = showTrack ? state.nowPlaying.track : '';
         }
         updateMediaSession();
     }

@@ -248,6 +248,10 @@ pub struct AppState {
     /// Whether this process actually serves `/control` (today only with
     /// `--server-only`). The console says so next to the game-master link.
     pub gm_panel_served: bool,
+
+    /// Scene / track titles the console publishes for the listeners' page
+    /// (shared with the broadcaster, see `BroadcasterConfig::now_playing`).
+    pub now_playing: crate::network::broadcast::NowPlayingFeed,
 }
 
 impl AppState {
@@ -268,7 +272,14 @@ impl AppState {
             access: Default::default(),
             gm: Default::default(),
             gm_panel_served: false,
+            now_playing: Default::default(),
         }
+    }
+
+    /// Use `feed` as the listeners' "now playing" feed.
+    pub fn with_now_playing(mut self, feed: crate::network::broadcast::NowPlayingFeed) -> Self {
+        self.now_playing = feed;
+        self
     }
 
     /// Use `gm` as the remote panel's token guard; `served` says whether the

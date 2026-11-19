@@ -15,9 +15,13 @@ use axum::extract::ws::Message;
 use rusty_opus::OpusEncoder;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+use crate::audio::director::Director;
+use crate::audio::playlist::PlaylistStatus;
+use crate::config::LibraryConfig;
 
 pub use super::opus_wire::wire_encoder;
 use super::opus_wire::{WireEncoder, WIRE_CHANNELS, WIRE_FRAME_FRAMES, WIRE_SAMPLE_RATE};
@@ -34,6 +38,145 @@ const STREAM_RESTART_GAP: std::time::Duration = std::time::Duration::from_millis
 /// How long the engine may stay silent before the partial frame it left in
 /// the reblocker is padded and sent: a few device callbacks.
 const STREAM_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Listeners are told about a scene / track change at most this often: a scene
+/// switch moves the scene, the playlist and the track within a few frames of
+/// the console, and one message with the final state is enough.
+pub const NOW_PLAYING_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Longest scene / track title sent to listeners, in characters.
+const NOW_PLAYING_MAX_CHARS: usize = 120;
+
+/// What the listeners are shown as "now playing": names only, never paths or
+/// library ids. `None` means silence (no scene / no music).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NowPlaying {
+    /// Name of the active scene.
+    pub scene: Option<String>,
+    /// "Artist - Title" (or the sound's name) of the music track.
+    pub track: Option<String>,
+}
+
+/// Control characters out, whitespace trimmed, length capped; empty -> `None`.
+fn clean_title(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(NOW_PLAYING_MAX_CHARS).collect())
+}
+
+impl NowPlaying {
+    /// A state from raw titles; they are cleaned for the wire.
+    pub fn new(scene: Option<&str>, track: Option<&str>) -> Self {
+        Self {
+            scene: scene.and_then(clean_title),
+            track: track.and_then(clean_title),
+        }
+    }
+
+    /// Whether nothing is announced.
+    pub fn is_silent(&self) -> bool {
+        self.scene.is_none() && self.track.is_none()
+    }
+
+    /// Read the state off a [`Director`]: the active scene's name and the
+    /// playlist's current track. `sound_name` maps a library sound id to its
+    /// display name (the label of a track without tags).
+    ///
+    /// A paused playlist keeps showing its track (it resumes); a stopped or
+    /// finished one does not.
+    pub fn from_director(director: &Director, sound_name: impl Fn(&str) -> Option<String>) -> Self {
+        let scene = director
+            .active_scene()
+            .and_then(|id| director.scene(id))
+            .map(|scene| scene.name.as_str());
+        let music = director.playlist_state();
+        let track = match (music.status, music.track.as_deref()) {
+            (PlaylistStatus::Playing | PlaylistStatus::Paused, Some(id)) => {
+                let fallback = sound_name(id).unwrap_or_else(|| "Unknown track".to_string());
+                Some(music.label(&fallback))
+            }
+            _ => None,
+        };
+        Self::new(scene, track.as_deref())
+    }
+
+    /// [`from_director`](Self::from_director) with sound names taken from the
+    /// saved library (what the headless server has).
+    pub fn from_director_with_library(director: &Director, library: &LibraryConfig) -> Self {
+        Self::from_director(director, |id| {
+            library.sounds.iter().find(|s| s.id == id).map(|entry| {
+                if entry.name.trim().is_empty() {
+                    std::path::Path::new(&entry.path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Sound")
+                        .to_string()
+                } else {
+                    entry.name.clone()
+                }
+            })
+        })
+    }
+
+    /// The text frame sent to listeners:
+    /// `{"type":"now_playing","scene":"…"|null,"track":"…"|null}`.
+    pub fn message(&self) -> String {
+        serde_json::json!({
+            "type": "now_playing",
+            "scene": self.scene,
+            "track": self.track,
+        })
+        .to_string()
+    }
+}
+
+/// The shared "now playing" state: the console (or the headless board)
+/// publishes into it, the broadcaster forwards changes to the listeners.
+/// Cloning shares the same state.
+#[derive(Debug, Clone)]
+pub struct NowPlayingFeed {
+    tx: Arc<watch::Sender<NowPlaying>>,
+}
+
+impl Default for NowPlayingFeed {
+    fn default() -> Self {
+        let (tx, _) = watch::channel(NowPlaying::default());
+        Self { tx: Arc::new(tx) }
+    }
+}
+
+impl NowPlayingFeed {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish a state; identical to the current one is a no-op. Never blocks.
+    pub fn publish(&self, state: NowPlaying) {
+        self.tx.send_if_modified(|current| {
+            if *current == state {
+                return false;
+            }
+            *current = state;
+            true
+        });
+    }
+
+    /// The state as published last.
+    pub fn current(&self) -> NowPlaying {
+        self.tx.borrow().clone()
+    }
+
+    /// Follow the state.
+    pub fn subscribe(&self) -> watch::Receiver<NowPlaying> {
+        self.tx.subscribe()
+    }
+}
 
 /// `AudioFormatInfo` announced to clients on connect / first frame.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -66,12 +209,16 @@ impl AudioFormatInfo {
 pub struct BroadcasterConfig {
     /// Channel capacity for incoming audio from engine
     pub engine_channel_capacity: usize,
+    /// Scene / track titles to forward to the listeners. Clones of the config
+    /// share it, so the producer keeps a clone of the feed.
+    pub now_playing: NowPlayingFeed,
 }
 
 impl Default for BroadcasterConfig {
     fn default() -> Self {
         Self {
             engine_channel_capacity: 500,
+            now_playing: NowPlayingFeed::default(),
         }
     }
 }
@@ -108,9 +255,21 @@ pub struct BroadcasterHandle {
     command_tx: mpsc::Sender<BroadcasterCommand>,
     /// Stream format established by the first mixed frame
     format_info: Arc<Mutex<Option<AudioFormatInfo>>>,
+    /// Scene / track titles shown to listeners
+    now_playing: NowPlayingFeed,
 }
 
 impl BroadcasterHandle {
+    /// Scene and track as listeners should see them right now.
+    pub fn now_playing(&self) -> NowPlaying {
+        self.now_playing.current()
+    }
+
+    /// The feed the listeners' "now playing" line follows.
+    pub fn now_playing_feed(&self) -> &NowPlayingFeed {
+        &self.now_playing
+    }
+
     /// Send mixed audio frame from audio engine
     /// Returns error if channel is full (backpressure - engine should drop frame)
     pub fn send_audio(&self, frame: AudioFrame) -> Result<(), BroadcastError> {
@@ -338,6 +497,14 @@ pub struct AudioBroadcaster {
     pending: std::collections::VecDeque<Vec<u8>>,
     /// When the last published block arrived, for gap detection.
     last_block_at: Option<std::time::Instant>,
+    /// The "now playing" feed (held here too, so it never closes under `run`).
+    now_playing_rx: watch::Receiver<NowPlaying>,
+    _now_playing: NowPlayingFeed,
+    /// What was last sent to the listeners, and when.
+    now_playing_sent: NowPlaying,
+    now_playing_sent_at: Option<tokio::time::Instant>,
+    /// A change is waiting for the throttle interval to pass.
+    now_playing_due: Option<tokio::time::Instant>,
 }
 
 impl AudioBroadcaster {
@@ -356,6 +523,7 @@ impl AudioBroadcaster {
             count_tx: count_tx.clone(),
             command_tx,
             format_info: format_info.clone(),
+            now_playing: config.now_playing.clone(),
         };
 
         let broadcaster = Self {
@@ -370,6 +538,11 @@ impl AudioBroadcaster {
             wire: std::sync::Mutex::new(WireEncoder::new()),
             pending: std::collections::VecDeque::new(),
             last_block_at: None,
+            now_playing_rx: config.now_playing.subscribe(),
+            now_playing_sent: config.now_playing.current(),
+            _now_playing: config.now_playing,
+            now_playing_sent_at: None,
+            now_playing_due: None,
         };
 
         (handle, broadcaster)
@@ -542,11 +715,40 @@ impl AudioBroadcaster {
         }
     }
 
+    /// A "now playing" change was seen: send it now, or once the throttle
+    /// interval since the last message has passed.
+    async fn on_now_playing_changed(&mut self) {
+        let now = tokio::time::Instant::now();
+        let ready_at = self
+            .now_playing_sent_at
+            .map(|at| at + NOW_PLAYING_MIN_INTERVAL)
+            .unwrap_or(now);
+        if ready_at > now {
+            self.now_playing_due = Some(ready_at);
+        } else {
+            self.send_now_playing().await;
+        }
+    }
+
+    /// Send the latest state to every listener unless it is what they have.
+    async fn send_now_playing(&mut self) {
+        self.now_playing_due = None;
+        let latest = self.now_playing_rx.borrow_and_update().clone();
+        if latest == self.now_playing_sent {
+            return;
+        }
+        self.now_playing_sent_at = Some(tokio::time::Instant::now());
+        let text = latest.message();
+        self.now_playing_sent = latest;
+        self.deliver(Message::Text(text)).await;
+    }
+
     /// Run the broadcaster main loop
     pub async fn run(mut self) {
         info!("Audio broadcaster started");
 
         loop {
+            let now_playing_due = self.now_playing_due;
             tokio::select! {
                 // Handle audio frames from engine
                 Some(frame) = self.audio_rx.recv() => {
@@ -556,6 +758,20 @@ impl AudioBroadcaster {
                 // sound ended, so send its tail instead of holding it.
                 _ = tokio::time::sleep(STREAM_FLUSH_DELAY), if self.has_partial_frame() => {
                     self.flush_partial_frame().await;
+                }
+                // The scene or track changed. While one change waits for the
+                // throttle interval, later ones only update the state it
+                // will send.
+                Ok(()) = self.now_playing_rx.changed(), if self.now_playing_due.is_none() => {
+                    self.on_now_playing_changed().await;
+                }
+                _ = async {
+                    match now_playing_due {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.send_now_playing().await;
                 }
                 // Handle control commands
                 Some(cmd) = self.command_rx.recv() => {
@@ -688,10 +904,58 @@ mod tests {
         assert!(ms_0 < 10_000, "fresh epoch must give a small stream time");
     }
 
+    #[test]
+    fn now_playing_titles_are_cleaned_and_capped() {
+        let np = NowPlaying::new(Some("  Storm\n\t"), Some(&"x".repeat(500)));
+        assert_eq!(np.scene.as_deref(), Some("Storm"));
+        assert_eq!(np.track.as_ref().map(|t| t.chars().count()), Some(120));
+        assert!(NowPlaying::new(Some("   "), Some("")).is_silent());
+        // Multi-byte titles are cut on a character boundary.
+        let cut = NowPlaying::new(Some(&"й".repeat(300)), None);
+        assert_eq!(cut.scene.map(|t| t.chars().count()), Some(120));
+    }
+
+    #[test]
+    fn now_playing_message_has_exactly_the_documented_shape() {
+        let value: serde_json::Value =
+            serde_json::from_str(&NowPlaying::new(Some("Storm"), None).message()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "now_playing", "scene": "Storm", "track": null})
+        );
+        let silent: serde_json::Value =
+            serde_json::from_str(&NowPlaying::default().message()).unwrap();
+        assert_eq!(
+            silent,
+            serde_json::json!({"type": "now_playing", "scene": null, "track": null})
+        );
+    }
+
+    #[test]
+    fn now_playing_feed_ignores_identical_states() {
+        let feed = NowPlayingFeed::new();
+        let mut rx = feed.subscribe();
+        feed.publish(NowPlaying::default());
+        assert!(!rx.has_changed().unwrap());
+        feed.publish(NowPlaying::new(Some("A"), None));
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+        feed.publish(NowPlaying::new(Some("A"), None));
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(feed.current(), NowPlaying::new(Some("A"), None));
+    }
+
+    #[test]
+    fn now_playing_without_a_scene_or_music_is_silent() {
+        let director = Director::new();
+        assert!(NowPlaying::from_director(&director, |_| None).is_silent());
+    }
+
     #[tokio::test]
     async fn test_backpressure() {
         let config = BroadcasterConfig {
             engine_channel_capacity: 2,
+            ..Default::default()
         };
         let (handle, broadcaster) = AudioBroadcaster::new(config);
         let _task = tokio::spawn(broadcaster.run());

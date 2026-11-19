@@ -456,14 +456,22 @@
             font-size: 14px;
             font-weight: 700;
             color: var(--phosphor);
-            overflow-wrap: anywhere;
+            /* One line each; a long title is cut with an ellipsis (the full
+               text is in the title attribute). */
+            max-width: 100%;
             min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         .now-playing-track {
             font-size: 12px;
             color: #b8e6c6;
-            overflow-wrap: anywhere;
+            max-width: 100%;
             min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         .now-playing-track[hidden] { display: none; }
 

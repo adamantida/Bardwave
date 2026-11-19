@@ -148,6 +148,12 @@ impl WebSocketSession {
             let _ = self.msg_tx.try_send(Message::Text(format_message(&info)));
         }
 
+        // The scene / track as they are now (null when silent), so a listener
+        // that joins mid-scene is not left with an empty "now playing" line
+        // until the next change.
+        let now_playing = self.broadcaster.now_playing();
+        let _ = self.msg_tx.try_send(Message::Text(now_playing.message()));
+
         // Note: axum's WebSocket doesn't have split() so we handle both in one loop
         let mut interval = tokio::time::interval(self.config.ping_interval);
         let mut revocation = self.revocation.take();
