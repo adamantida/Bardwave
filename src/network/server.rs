@@ -23,6 +23,22 @@ use crate::network::local_ip::{detect_for_bind, is_advertisable};
 use crate::network::websocket::{handle_websocket_upgrade, WebSocketConfig};
 
 // Embedded static files (compiled into binary)
+const MANIFEST_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/manifest.webmanifest"
+));
+const ICON_192_PNG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/icon-192.png"
+));
+const ICON_512_PNG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/icon-512.png"
+));
+const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/apple-touch-icon.png"
+));
 const INDEX_HTML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/network/static/index.html"
@@ -136,6 +152,10 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/app.js", get(serve_app_js))
         .route("/style.css", get(serve_style_css))
         .route("/opus-decoder.min.js", get(serve_opus_decoder_js))
+        .route("/manifest.webmanifest", get(serve_manifest))
+        .route("/icon-192.png", get(serve_icon_192))
+        .route("/icon-512.png", get(serve_icon_512))
+        .route("/apple-touch-icon.png", get(serve_apple_touch_icon))
         .route("/api/status", get(api_status))
         .route("/ws/audio", get(websocket_handler))
         .with_state(state)
@@ -339,6 +359,67 @@ pub async fn serve_opus_decoder_js() -> impl IntoResponse {
         axum::http::HeaderValue::from_static("application/javascript; charset=utf-8"),
     );
     (headers, OPUS_DECODER_JS)
+}
+
+/// The web app manifest that makes the listener page installable.
+///
+/// A home-screen shortcut opens the manifest's `start_url`, which would lose
+/// the access key of the shared link, so the page asks for the manifest with
+/// the same `?k=` and it is echoed into `start_url`. Only keys made of URL-safe
+/// characters are echoed; anything else falls back to the plain `/`.
+pub async fn serve_manifest(
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(MANIFEST_JSON).unwrap_or(serde_json::Value::Null);
+    if let Some(key) = query.get(KEY_PARAM) {
+        let url_safe = !key.is_empty()
+            && key.len() <= 64
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if url_safe {
+            manifest["start_url"] = serde_json::Value::String(format!("/?{KEY_PARAM}={key}"));
+        }
+    }
+    let body = serde_json::to_string(&manifest).unwrap_or_else(|_| MANIFEST_JSON.to_string());
+    (
+        [(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/manifest+json"),
+        )],
+        body,
+    )
+        .into_response()
+}
+
+fn png_response(bytes: &'static [u8]) -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("image/png"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("public, max-age=86400"),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+pub async fn serve_icon_192() -> Response {
+    png_response(ICON_192_PNG)
+}
+
+pub async fn serve_icon_512() -> Response {
+    png_response(ICON_512_PNG)
+}
+
+pub async fn serve_apple_touch_icon() -> Response {
+    png_response(APPLE_TOUCH_ICON_PNG)
 }
 
 /// WebSocket handler: GET /ws/audio
