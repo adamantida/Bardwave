@@ -709,7 +709,9 @@ fn caution(ui: &mut Ui, text: &str, color: egui::Color32) {
             RichText::new(text.to_uppercase())
                 .font(crate::gui::widgets::glyph_font(Metrics::MICRO_TINY))
                 .color(color)
-                .extra_letter_spacing(0.6),
+                .extra_letter_spacing(0.6)
+                // Wrapped notes need air between their lines.
+                .line_height(Some(Metrics::MICRO_TINY * 1.7)),
         )
         .wrap(),
     );
@@ -765,14 +767,14 @@ fn gm_link_block(ui: &mut Ui, state: &mut SoundSharedApp, base_url: Option<&str>
         }
     }
 
-    ui.add_space(Metrics::XS);
+    ui.add_space(Metrics::MD);
     caution(
         ui,
         "Do not share with players: this link controls the console",
         Palette::AMBER_400,
     );
     if !state.app_state.gm_panel_served {
-        ui.add_space(2.0);
+        ui.add_space(Metrics::SM);
         caution(
             ui,
             "This window does not serve the phone panel yet (it runs with --server-only)",
@@ -780,7 +782,7 @@ fn gm_link_block(ui: &mut Ui, state: &mut SoundSharedApp, base_url: Option<&str>
         );
     }
 
-    ui.add_space(Metrics::SM);
+    ui.add_space(Metrics::MD);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = Metrics::SM;
         let qr_label = if state.extras.gm.qr_visible {
@@ -875,7 +877,7 @@ fn gm_link_block(ui: &mut Ui, state: &mut SoundSharedApp, base_url: Option<&str>
                     }
                 });
             }
-            ui.add_space(Metrics::SM);
+            ui.add_space(Metrics::MD);
             match &state.extras.gm.qr {
                 Some(qr) => {
                     ui.vertical_centered(|ui| {

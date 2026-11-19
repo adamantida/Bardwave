@@ -1003,8 +1003,11 @@ fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, hei
             {
                 state.open_file_dialog();
             }
-            ui.add_space(Metrics::SM);
+            // The panel zeroes egui's implicit vertical spacing, so every gap
+            // between the stacked call-to-action pieces is placed here.
+            ui.add_space(Metrics::XL);
             ui.label(micro_label("…or drop in a YouTube link"));
+            ui.add_space(Metrics::MD);
             if ConsoleButton::ghost("YouTube")
                 .glyph(glyph::WAVE)
                 .width(150.0)
@@ -1015,7 +1018,7 @@ fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, hei
                 state.open_add_youtube();
             }
             if matches!(filter, GroupFilter::Group(_) | GroupFilter::Ungrouped) {
-                ui.add_space(Metrics::SM);
+                ui.add_space(Metrics::MD);
                 if ConsoleButton::ghost("Show All")
                     .glyph(glyph::FOLDER)
                     .width(150.0)
