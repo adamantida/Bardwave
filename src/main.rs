@@ -30,7 +30,8 @@ use soundshared::{
         },
         local_ip::detect_for_bind,
         server::{
-            build_router_with_control, listen_url, Router, ServerConfig, ServerHandle, ServerState,
+            build_router_with_control, listen_url_with_scheme, Router, ServerConfig, ServerHandle,
+            ServerState,
         },
         upnp::{self, PortMapping, UpnpStatus},
         websocket::WebSocketConfig,
@@ -112,6 +113,7 @@ async fn start_listener(
     bind_addr: std::net::IpAddr,
     bind_port: u16,
     shutdown_tx: &broadcast::Sender<()>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> std::result::Result<(String, tokio::task::JoinHandle<()>), String> {
     let addr = std::net::SocketAddr::new(bind_addr, bind_port);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -125,11 +127,21 @@ async fn start_listener(
     // displays and copies. The family follows the bind: a socket on 0.0.0.0
     // serves IPv4 and must not advertise an IPv6 address.
     let detected_ip = detect_for_bind(bind_addr);
-    let url = listen_url(bind_addr, actual_addr, detected_ip);
+    let url = listen_url_with_scheme(bind_addr, actual_addr, detected_ip, tls.is_some());
 
     let app_clone = app.clone();
     let mut shutdown_rx_for_server = shutdown_tx.subscribe();
     let task = tokio::spawn(async move {
+        if let Some(acceptor) = tls {
+            // HTTPS on the same port (server.tls); see network::tls.
+            soundshared::network::tls::serve(listener, app_clone, acceptor, async move {
+                let _ = shutdown_rx_for_server.recv().await;
+                info!("🌐 Shutdown signal received, stopping server...");
+            })
+            .await;
+            info!("🌐 Server task ended");
+            return;
+        }
         info!(
             "🌐 Server task started, beginning to serve on {}",
             actual_addr
@@ -173,6 +185,7 @@ async fn stop_listener(shutdown_tx: &broadcast::Sender<()>, task: tokio::task::J
 
 /// Server manager that runs the network server in a Tokio runtime
 /// Server does NOT auto-start - only starts when GUI sends Start command
+#[allow(clippy::too_many_arguments)]
 fn run_server_and_get_handle(
     config: ServerConfig,
     server_cmd_rx: Receiver<ServerCommand>,
@@ -181,6 +194,9 @@ fn run_server_and_get_handle(
     upnp_status: Arc<Mutex<UpnpStatus>>,
     network_notes: Arc<Mutex<Vec<String>>>,
     control: Option<soundshared::network::control::ControlContext>,
+    // Live config: `server.tls*` is read at every Start, so the GUI toggle
+    // applies without restarting the app.
+    app_config: Arc<Mutex<Config>>,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -273,8 +289,25 @@ fn run_server_and_get_handle(
                                 // Reported through the response channel, not by
                                 // bubbling up: a bind failure must not kill the
                                 // server thread.
-                                let started =
-                                    start_listener(&app, bind_addr, bind_port, &shutdown_tx).await;
+                                let tls_settings = soundshared::network::TlsSettings::from_config(
+                                    &app_config.lock().unwrap().server,
+                                );
+                                let tls_acceptor = if tls_settings.enabled {
+                                    match soundshared::network::tls::prepare(&tls_settings) {
+                                        Ok(acceptor) => Ok(Some(acceptor)),
+                                        Err(e) => Err(e.to_string()),
+                                    }
+                                } else {
+                                    soundshared::network::tls::set_active_info(None);
+                                    Ok(None)
+                                };
+                                let started = match tls_acceptor {
+                                    Ok(tls) => {
+                                        start_listener(&app, bind_addr, bind_port, &shutdown_tx, tls)
+                                            .await
+                                    }
+                                    Err(message) => Err(message),
+                                };
 
                                 match started {
                                     Ok((url, task)) => {
@@ -346,6 +379,7 @@ fn run_server_and_get_handle(
                                 }
 
                                 server_url = None;
+                                soundshared::network::tls::set_active_info(None);
                                 listener_count = 0;
                                 *handle.url.lock().await = None;
                                 let _ = listener_count_tx.send(0);
@@ -401,7 +435,16 @@ fn run_server_and_get_handle(
                 // at any time while the server runs.
                 _ = upnp_poll.tick(), if upnp_mapping.is_some() => {
                     if let Some(mapping) = &upnp_mapping {
-                        let next = mapping.status();
+                        let mut next = mapping.status();
+                        // The router mapping builds an http:// link; with
+                        // server.tls the same port speaks HTTPS.
+                        if soundshared::network::tls::active_info().is_some() {
+                            if let UpnpStatus::Mapped { url, .. } = &mut next {
+                                if let Some(rest) = url.strip_prefix("http://") {
+                                    *url = format!("https://{rest}");
+                                }
+                            }
+                        }
                         let mut current = upnp_status.lock().unwrap();
                         if *current != next {
                             match &next {
@@ -577,6 +620,7 @@ fn main() -> Result<()> {
         broadcaster_config: BroadcasterConfig::default(),
         websocket_config: WebSocketConfig::default(),
         access: access.clone(),
+        tls: soundshared::network::TlsSettings::from_config(&config.server),
     };
 
     // Create shared app state (for GUI)
@@ -595,6 +639,7 @@ fn main() -> Result<()> {
     let listener_count_tx_clone = listener_count_tx.clone();
     let server_cmd_rx_clone = server_cmd_rx.clone();
     let server_config_clone = server_config.clone();
+    let app_config_for_server = app_state.config.clone();
     let server_handle_tx_clone = server_handle_tx.clone();
     let upnp_status = app_state.upnp_status.clone();
     let network_notes = app_state.network_notes.clone();
@@ -626,6 +671,7 @@ fn main() -> Result<()> {
             upnp_status,
             network_notes,
             control_routes,
+            app_config_for_server,
         ) {
             error!("Server error: {}", e);
         }
