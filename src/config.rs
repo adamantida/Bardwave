@@ -158,6 +158,15 @@ pub struct GuiConfig {
     /// macOS and can steal keys from other programs.
     #[serde(default)]
     pub global_hotkeys: bool,
+
+    /// Folder session recordings (REC button) are saved to. `None` means
+    /// `recordings/` inside the data directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recordings_dir: Option<String>,
+
+    /// Record 32-bit float WAV instead of 16-bit PCM.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_float32: bool,
 }
 
 /// Persistent library + groups configuration

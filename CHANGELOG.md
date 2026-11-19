@@ -25,6 +25,10 @@ Read this before relying on the items below. They are implemented and covered by
 
 ### Added
 
+**Session recording**
+- REC button in the top bar saves the mix the players hear as a WAV file (48 kHz stereo, 16-bit PCM, or 32-bit float with `[gui] record_float32 = true`), with a time and size readout. Files are named `bardwave-YYYYMMDD-HHMMSS.wav` (UTC) in `recordings/` of the data directory, or in the folder chosen with the folder button (`[gui] recordings_dir`).
+- The WAV header is refreshed every second, so a file left by a crash is still playable; long sessions continue in `_part2.wav`, ... near 1.8 GB (a size warning appears at 1.5 GB); starting is refused when the disk is known to be almost full; frames lost to a slow disk are counted and reported. Unix only for the free-space check; not verified on Windows.
+
 **Scenes and transitions**
 - Scenes (`[[library.scenes]]`): named sets of sounds with per-item volume, loop, automatic/manual start and start delay, a button colour, `fade_in_ms` / `fade_out_ms`, `stop_others`.
 - Crossfade between scenes with equal-power or linear curves; re-activating a scene mid-transition continues from the current levels. The mixer fades are now parametrised (previously a fixed 10 ms click guard).

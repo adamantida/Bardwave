@@ -9,6 +9,7 @@ pub mod engine;
 pub mod loudness;
 pub mod mixer;
 pub mod playlist;
+pub mod recorder;
 pub mod stream_source;
 pub mod youtube;
 

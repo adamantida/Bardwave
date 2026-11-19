@@ -240,6 +240,8 @@ pub struct SoundSharedApp {
     /// Hotkeys, bus faders / ducking / normalization and the game-master link
     /// state (see `hotkeys_ui`, `settings_extras`, `server_panel`).
     pub(crate) extras: crate::gui::settings_extras::ConsoleExtras,
+    /// REC button of the top bar (session recording).
+    pub(crate) recorder: crate::gui::recorder_ui::RecorderUi,
 }
 
 /// Hand the Director the current scenes and the loaded library sounds.
@@ -426,6 +428,7 @@ impl SoundSharedApp {
             scenes: Default::default(),
             music: Default::default(),
             extras,
+            recorder: crate::gui::recorder_ui::RecorderUi::new(ctx.clone()),
         };
 
         // Request initial server status
@@ -1501,6 +1504,9 @@ impl SoundSharedApp {
         // Feed the engine the library files that did not fit the channel on
         // the previous pass.
         self.pump_pending_loads();
+
+        // Session recorder: start / stop answers, finished files
+        self.recorder.poll(&self.app_state.config);
 
         // Poll server status
         self.poll_server_status();

@@ -20,6 +20,7 @@ pub mod hotkeys_ui;
 pub mod library_ui;
 pub mod motion;
 pub mod music;
+pub mod recorder_ui;
 pub mod scenes;
 pub mod server_panel;
 pub mod settings_extras;
