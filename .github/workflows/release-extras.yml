@@ -1,0 +1,335 @@
+name: Release extras
+
+# Adds installers to a published GitHub release, on top of what release.yml
+# uploads (the zip / tar.gz):
+#   - Windows: Bardwave.exe and the Inno Setup installer (packaging/windows/bardwave.iss);
+#   - Linux: AppImage (packaging/linux/build-appimage.sh) and a .deb (cargo-deb,
+#     [package.metadata.deb] in Cargo.toml);
+#   - SHA256SUMS covering every file of the release (also the zip / tar.gz).
+#
+# Triggers:
+#   - release: published        - a release published by hand or by a personal token;
+#   - workflow_run (Release)    - a release created by release.yml. Events caused by the
+#                                 built-in GITHUB_TOKEN do NOT start other workflows, so
+#                                 "release: published" never fires for it. The tag is
+#                                 v<version in Cargo.toml> at the commit that was released;
+#   - workflow_dispatch         - run by hand for an existing tag (re-uploads, replacing files).
+# The code is always built from the release tag, not from the branch.
+on:
+  release:
+    types: [ published ]
+  workflow_run:
+    workflows: [ Release ]
+    types: [ completed ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to add the installers to, e.g. v1.4.0"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve:
+    name: Resolve release
+    runs-on: ubuntu-latest
+    # A failed Release run published nothing.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: Find the tag and check the release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            release) tag="$EVENT_RELEASE_TAG" ;;
+            workflow_dispatch) tag="$INPUT_TAG" ;;
+            workflow_run)
+              version=$(gh api -H "Accept: application/vnd.github.raw" \
+                "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$RUN_HEAD_SHA" \
+                | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)
+              tag="v$version"
+              ;;
+            *) echo "::error::Unexpected event $GITHUB_EVENT_NAME"; exit 1 ;;
+          esac
+
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$tag' is not a release tag like v1.4.0"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$GITHUB_EVENT_NAME" = "workflow_run" ]; then
+              # release.yml found the version already released and published nothing new.
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              echo "No release $tag, nothing to do." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::Release $tag does not exist"
+            exit 1
+          fi
+
+          # Every push to main runs release.yml; do not rebuild what is already attached.
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] \
+            && gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+              | grep -qx "Bardwave-$tag-windows-x86_64-setup.exe"; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "$tag already has the installers, nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          echo "Adding installers to $tag" >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: Windows installer
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: windows-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Checkout the release tag
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+
+      - name: Check that this tag has the installer sources
+        shell: pwsh
+        run: |
+          foreach ($f in 'packaging/windows/bardwave.iss', 'assets/icon.ico', 'LICENSE') {
+            if (-not (Test-Path $f)) { throw "$f is missing in $env:TAG; the installer needs a newer tag (run this workflow for a later release)" }
+          }
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed" }
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $version = $env:TAG.TrimStart('v')
+          # a.b.c.d for the version resource of setup.exe (no pre-release suffix there).
+          $numeric = (($version -split '-')[0]) + '.0'
+          $dist = Join-Path $PWD 'dist'
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe).Source }
+          & $iscc "/DMyAppVersion=$version" "/DMyAppNumVersion=$numeric" "/O$dist" packaging\windows\bardwave.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+          # The bare exe: no installer, no config next to it (portable use is described in packaging/README.txt).
+          Copy-Item target/release/soundshared.exe "$dist/Bardwave-$env:TAG-windows-x86_64.exe"
+          Get-ChildItem $dist
+
+      # Installs silently, checks the files and the firewall rule, uninstalls and checks again.
+      - name: Smoke-test the installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist -Filter '*-setup.exe' | Select-Object -First 1
+          $dir = Join-Path $env:RUNNER_TEMP 'bardwave-install'
+          $rule = 'Bardwave TCP 8080'
+
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$dir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "setup exited with $($p.ExitCode)" }
+          if (-not (Test-Path "$dir\Bardwave.exe")) { throw "Bardwave.exe was not installed" }
+          if (Test-Path "$dir\config.toml") { throw "config.toml must not be installed next to the exe (it would force portable mode)" }
+          netsh advfirewall firewall show rule name="$rule"
+          if ($LASTEXITCODE -ne 0) { throw "firewall rule '$rule' was not created" }
+
+          $uninstaller = Get-ChildItem $dir -Filter 'unins*.exe' | Select-Object -First 1
+          Start-Process -FilePath $uninstaller.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          # The uninstaller re-launches itself from a temp copy: wait for it to finish.
+          for ($i = 0; $i -lt 60 -and (Test-Path "$dir\Bardwave.exe"); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path "$dir\Bardwave.exe") { throw "Bardwave.exe is still there after uninstall" }
+          netsh advfirewall firewall show rule name="$rule"
+          if ($LASTEXITCODE -eq 0) { throw "firewall rule '$rule' was not removed" }
+          $global:LASTEXITCODE = 0
+
+      - name: Upload Windows assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: extras-windows
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux AppImage and .deb
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    # Oldest supported runner, so the binary runs on older glibc distros too.
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      # https://github.com/AppImage/appimagetool/releases
+      APPIMAGETOOL_VERSION: "1.9.0"
+    steps:
+      - name: Checkout the release tag
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+
+      - name: Check that this tag has the packaging sources
+        run: |
+          for f in packaging/linux/build-appimage.sh packaging/linux/bardwave.desktop assets/icon.png LICENSE; do
+            [ -f "$f" ] || { echo "::error::$f is missing in $TAG; the packaging needs a newer tag (run this workflow for a later release)"; exit 1; }
+          done
+          grep -q '^\[package.metadata.deb\]' Cargo.toml \
+            || { echo "::error::Cargo.toml in $TAG has no [package.metadata.deb]"; exit 1; }
+
+      # The CI build list, plus dpkg-dev (cargo-deb: $auto dependencies) and desktop-file-utils.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libgtk-3-dev libasound2-dev libxkbcommon-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev \
+            dpkg-dev binutils desktop-file-utils
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --version 3.8.0 --locked
+
+      - name: Build the .deb
+        run: |
+          mkdir -p dist
+          desktop-file-validate packaging/linux/bardwave.desktop
+          # Packages the binary built above; the name is bardwave_<version>-1_amd64.deb.
+          cargo deb --no-build --locked --output dist/
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+
+      - name: Build the AppImage
+        run: |
+          tool="$RUNNER_TEMP/appimagetool"
+          curl -fsSL -o "$tool" \
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          chmod +x "$tool"
+          packaging/linux/build-appimage.sh --tool "$tool" --version "$TAG" --output dist
+
+      # No FUSE and no display on the runner: unpack, check the layout and that
+      # every shared library the binary needs resolves; then install the .deb.
+      - name: Smoke-test the packages
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          appimage="$(ls dist/*.AppImage)"
+          cp "$appimage" "$work/bardwave.AppImage"
+          (cd "$work" && ./bardwave.AppImage --appimage-extract >/dev/null)
+          test -x "$work/squashfs-root/AppRun"
+          test -x "$work/squashfs-root/usr/bin/bardwave"
+          test -f "$work/squashfs-root/bardwave.desktop"
+          test -f "$work/squashfs-root/bardwave.png"
+          if ldd "$work/squashfs-root/usr/bin/bardwave" | grep 'not found'; then
+            echo "::error::AppImage binary has unresolved libraries"
+            exit 1
+          fi
+          rm -rf "$work"
+
+          sudo apt-get install -y ./dist/*.deb
+          test -x /usr/bin/bardwave
+          test -f /usr/share/applications/bardwave.desktop
+          if ldd /usr/bin/bardwave | grep 'not found'; then
+            echo "::error::.deb binary has unresolved libraries"
+            exit 1
+          fi
+
+      - name: Upload Linux assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: extras-linux
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Upload to the release
+    needs: [ resolve, windows, linux ]
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Download the new assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: extras-*
+          path: new
+          merge-multiple: true
+
+      # SHA256SUMS lists every file of the release (zip / tar.gz from release.yml
+      # included), so the file is rebuilt from scratch, not appended to.
+      - name: Compute SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir all
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir all \
+            --pattern '*' || echo "Release has no other assets yet."
+          rm -f all/SHA256SUMS
+          cp new/* all/
+          (cd all && LC_ALL=C sha256sum -- * | LC_ALL=C sort -k2 > ../SHA256SUMS)
+          cat SHA256SUMS
+
+      - name: Upload assets
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber new/* SHA256SUMS
+          # release-macos.yml attaches the .dmg on its own schedule and rebuilds
+          # SHA256SUMS the same way. If it added a file after the list above was
+          # computed, rebuild the list from what the release has now.
+          for attempt in 1 2 3 4 5; do
+            expected="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' | grep -vx 'SHA256SUMS' | LC_ALL=C sort)"
+            listed="$(awk '{print $2}' SHA256SUMS | LC_ALL=C sort)"
+            [ "$expected" = "$listed" ] && break
+            echo "An asset was added meanwhile (attempt $attempt); refreshing SHA256SUMS."
+            rm -rf all SHA256SUMS
+            mkdir all
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir all --pattern '*'
+            rm -f all/SHA256SUMS
+            (cd all && LC_ALL=C sha256sum -- * | LC_ALL=C sort -k2 > ../SHA256SUMS)
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS
+            sleep 15
+          done
+          {
+            echo "### Uploaded to $TAG"
+            ls -1 new
+            echo "SHA256SUMS"
+          } >> "$GITHUB_STEP_SUMMARY"

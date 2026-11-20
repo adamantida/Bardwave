@@ -23,7 +23,13 @@ it once as administrator). Test the internet link from a phone on mobile data.
 WITHOUT A WINDOW
   Bardwave.exe --server-only
 loads the saved library and prints two links: the one for the players and a
-control page (http://127.0.0.1:<port>/control) that works only on this PC.
+control page (http://127.0.0.1:<port>/control).
+On this PC the control page opens without a key. From another device it opens
+with the GM key: http://<address>:<port>/control?g=<gm_token>. The key is made
+on the first start and kept in config.toml ([server] gm_token); it is not the
+player key, which never opens the control page. So remote control is ON by
+default: anyone with the ?g= link can press the GM's buttons. To keep the
+control page on this PC only, set gm_token = "" in config.toml.
 
 LINUX
 Needs the usual desktop libraries: GTK 3, ALSA, libxkbcommon

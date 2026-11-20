@@ -29,7 +29,10 @@ use soundshared::{
             AudioBroadcaster, AudioFrame, BroadcastError, BroadcasterConfig, BroadcasterHandle,
         },
         local_ip::detect_for_bind,
-        server::{build_router, listen_url, Router, ServerConfig, ServerHandle, ServerState},
+        server::{
+            build_router_with_control, listen_url_with_scheme, Router, ServerConfig, ServerHandle,
+            ServerState,
+        },
         upnp::{self, PortMapping, UpnpStatus},
         websocket::WebSocketConfig,
     },
@@ -110,6 +113,7 @@ async fn start_listener(
     bind_addr: std::net::IpAddr,
     bind_port: u16,
     shutdown_tx: &broadcast::Sender<()>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> std::result::Result<(String, tokio::task::JoinHandle<()>), String> {
     let addr = std::net::SocketAddr::new(bind_addr, bind_port);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -123,11 +127,21 @@ async fn start_listener(
     // displays and copies. The family follows the bind: a socket on 0.0.0.0
     // serves IPv4 and must not advertise an IPv6 address.
     let detected_ip = detect_for_bind(bind_addr);
-    let url = listen_url(bind_addr, actual_addr, detected_ip);
+    let url = listen_url_with_scheme(bind_addr, actual_addr, detected_ip, tls.is_some());
 
     let app_clone = app.clone();
     let mut shutdown_rx_for_server = shutdown_tx.subscribe();
     let task = tokio::spawn(async move {
+        if let Some(acceptor) = tls {
+            // HTTPS on the same port (server.tls); see network::tls.
+            soundshared::network::tls::serve(listener, app_clone, acceptor, async move {
+                let _ = shutdown_rx_for_server.recv().await;
+                info!("🌐 Shutdown signal received, stopping server...");
+            })
+            .await;
+            info!("🌐 Server task ended");
+            return;
+        }
         info!(
             "🌐 Server task started, beginning to serve on {}",
             actual_addr
@@ -171,6 +185,7 @@ async fn stop_listener(shutdown_tx: &broadcast::Sender<()>, task: tokio::task::J
 
 /// Server manager that runs the network server in a Tokio runtime
 /// Server does NOT auto-start - only starts when GUI sends Start command
+#[allow(clippy::too_many_arguments)]
 fn run_server_and_get_handle(
     config: ServerConfig,
     server_cmd_rx: Receiver<ServerCommand>,
@@ -178,7 +193,10 @@ fn run_server_and_get_handle(
     server_handle_tx: Sender<ServerHandle>,
     upnp_status: Arc<Mutex<UpnpStatus>>,
     network_notes: Arc<Mutex<Vec<String>>>,
-    extra_routes: Option<Router>,
+    control: Option<soundshared::network::control::ControlContext>,
+    // Live config: `server.tls*` is read at every Start, so the GUI toggle
+    // applies without restarting the app.
+    app_config: Arc<Mutex<Config>>,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -214,10 +232,7 @@ fn run_server_and_get_handle(
             access: config.access.clone(),
         };
 
-        let app = match extra_routes {
-            Some(routes) => build_router(state).merge(routes),
-            None => build_router(state),
-        };
+        let app = build_router_with_control(state, control);
 
         // Create server handle (URL is None until Start command)
         let shutdown_tx_for_handle = shutdown_tx.clone();
@@ -274,8 +289,25 @@ fn run_server_and_get_handle(
                                 // Reported through the response channel, not by
                                 // bubbling up: a bind failure must not kill the
                                 // server thread.
-                                let started =
-                                    start_listener(&app, bind_addr, bind_port, &shutdown_tx).await;
+                                let tls_settings = soundshared::network::TlsSettings::from_config(
+                                    &app_config.lock().unwrap().server,
+                                );
+                                let tls_acceptor = if tls_settings.enabled {
+                                    match soundshared::network::tls::prepare(&tls_settings) {
+                                        Ok(acceptor) => Ok(Some(acceptor)),
+                                        Err(e) => Err(e.to_string()),
+                                    }
+                                } else {
+                                    soundshared::network::tls::set_active_info(None);
+                                    Ok(None)
+                                };
+                                let started = match tls_acceptor {
+                                    Ok(tls) => {
+                                        start_listener(&app, bind_addr, bind_port, &shutdown_tx, tls)
+                                            .await
+                                    }
+                                    Err(message) => Err(message),
+                                };
 
                                 match started {
                                     Ok((url, task)) => {
@@ -347,6 +379,7 @@ fn run_server_and_get_handle(
                                 }
 
                                 server_url = None;
+                                soundshared::network::tls::set_active_info(None);
                                 listener_count = 0;
                                 *handle.url.lock().await = None;
                                 let _ = listener_count_tx.send(0);
@@ -402,7 +435,16 @@ fn run_server_and_get_handle(
                 // at any time while the server runs.
                 _ = upnp_poll.tick(), if upnp_mapping.is_some() => {
                     if let Some(mapping) = &upnp_mapping {
-                        let next = mapping.status();
+                        let mut next = mapping.status();
+                        // The router mapping builds an http:// link; with
+                        // server.tls the same port speaks HTTPS.
+                        if soundshared::network::tls::active_info().is_some() {
+                            if let UpnpStatus::Mapped { url, .. } = &mut next {
+                                if let Some(rest) = url.strip_prefix("http://") {
+                                    *url = format!("https://{rest}");
+                                }
+                            }
+                        }
                         let mut current = upnp_status.lock().unwrap();
                         if *current != next {
                             match &next {
@@ -476,6 +518,43 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let server_only = args.iter().any(|a| a == "--server-only");
 
+    // `--profile <name>` selects a campaign profile (own config.toml and
+    // library under `profiles/<name>/`); without it the default profile is the
+    // root config, exactly as before. Decided before any path is used.
+    match soundshared::profiles::parse_profile_arg(&args) {
+        Ok(profile) => {
+            soundshared::paths::set_active_profile(profile.clone());
+            if let Err(message) = soundshared::paths::ensure_data_dir() {
+                if !server_only {
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Bardwave")
+                        .set_description(&message)
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                }
+                eprintln!("Error: {message}");
+                std::process::exit(2);
+            }
+            soundshared::profiles::record_launch(
+                &soundshared::paths::root_dir(),
+                profile.as_deref(),
+            );
+        }
+        Err(message) => {
+            if !server_only {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Bardwave")
+                    .set_description(&message)
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+            }
+            eprintln!("Error: {message}");
+            std::process::exit(2);
+        }
+    }
+
     attach_parent_console(server_only);
 
     // Load configuration. A broken config.toml used to end the process
@@ -518,12 +597,19 @@ fn main() -> Result<()> {
             warn!("Could not save the new access key to config.toml: {}", e);
         }
     }
+    // The remote game-master panel has its own key. Missing => generated and
+    // saved; `gm_token = ""` keeps the panel reachable from this PC only.
+    if config.server.ensure_gm_token() {
+        if let Err(e) = config.save() {
+            warn!("Could not save the new gm_token to config.toml: {}", e);
+        }
+    }
     let access = soundshared::network::AccessGuard::new(config.server.access_token.clone());
     if access.current().is_none() {
         warn!("Listener stream is open: access_token is empty in config.toml");
     }
 
-    info!("Starting SoundShared v{}", soundshared::VERSION);
+    info!("Starting Bardwave v{}", env!("CARGO_PKG_VERSION"));
 
     // Create channels for inter-component communication
     let (audio_cmd_tx, audio_cmd_rx) = bounded::<AudioCommand>(32);
@@ -551,12 +637,29 @@ fn main() -> Result<()> {
         &config.audio,
     ));
 
+    // `[audio] output_device` / `preview_device`: which sound cards play.
+    audio_engine.set_output_selection(soundshared::audio::OutputSelection::from_audio_config(
+        &config.audio,
+    ));
+
+    // Long files are streamed from disk instead of held in memory.
+    audio_engine.set_stream_threshold_secs(config.audio.stream_threshold_secs);
+
     // Get the broadcast output receiver for WebSocket streaming
-    let broadcast_output_rx = audio_engine.broadcast_output_receiver();
+    // The recorder taps the stream on its way to the players (a second reader
+    // of the mixer channel would steal frames from them).
+    let broadcast_output_rx = soundshared::audio::recorder::spawn_tee(
+        audio_engine.broadcast_output_receiver(),
+        soundshared::audio::recorder::global_tap(),
+    );
 
     // Wrap audio engine in Arc<Mutex> for sharing with GUI (main thread)
     #[allow(clippy::arc_with_non_send_sync)]
     let audio_engine_shared = Arc::new(Mutex::new(Some(audio_engine)));
+
+    // Scene / track titles for the listeners, published by the console (or by
+    // the headless board) and forwarded by the broadcaster.
+    let now_playing = soundshared::network::broadcast::NowPlayingFeed::new();
 
     // Create network server config. The listener page is embedded in the binary
     // (build_router), so there is no static directory to point at any more.
@@ -565,9 +668,13 @@ fn main() -> Result<()> {
         bind_addr: parse_bind_host(&config.server.host)
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))),
         upnp: config.server.upnp,
-        broadcaster_config: BroadcasterConfig::default(),
+        broadcaster_config: BroadcasterConfig {
+            now_playing: now_playing.clone(),
+            ..BroadcasterConfig::default()
+        },
         websocket_config: WebSocketConfig::default(),
         access: access.clone(),
+        tls: soundshared::network::TlsSettings::from_config(&config.server),
     };
 
     // Create shared app state (for GUI)
@@ -577,7 +684,8 @@ fn main() -> Result<()> {
         Arc::new(Mutex::new(0)),
         Arc::new(Mutex::new(config.clone())),
     )
-    .with_access(access.clone());
+    .with_access(access.clone())
+    .with_now_playing(now_playing.clone());
 
     // Spawn server thread (does NOT auto-start - waits for Start command from GUI).
     // The thread learns about process shutdown from its own Stop command / the
@@ -586,6 +694,7 @@ fn main() -> Result<()> {
     let listener_count_tx_clone = listener_count_tx.clone();
     let server_cmd_rx_clone = server_cmd_rx.clone();
     let server_config_clone = server_config.clone();
+    let app_config_for_server = app_state.config.clone();
     let server_handle_tx_clone = server_handle_tx.clone();
     let upnp_status = app_state.upnp_status.clone();
     let network_notes = app_state.network_notes.clone();
@@ -593,7 +702,29 @@ fn main() -> Result<()> {
     // local control page instead (see network::control).
     let (control_tx, control_rx) =
         crossbeam_channel::unbounded::<soundshared::network::control::ControlCommand>();
-    let control_routes = server_only.then(|| soundshared::network::control::router(control_tx));
+    // Remote access to it needs the game-master token (`gm_token`); without
+    // one the panel answers this PC only.
+    let gm_auth = soundshared::network::GmAuth::new(soundshared::network::GmGuard::new(
+        config.server.gm_token.clone(),
+    ));
+    let control_feed = soundshared::network::control::ControlFeed::new();
+    // Both modes serve the panel: `--server-only` runs the commands on the
+    // main thread, the console runs them in its own frame loop. The routes
+    // are part of the router, so they are reachable exactly while the server
+    // is started.
+    let control_routes = Some(soundshared::network::control::ControlContext::new(
+        control_tx,
+        gm_auth.clone(),
+        control_feed.clone(),
+    ));
+    // The console shows the game-master link and can replace the token.
+    let mut app_state = app_state.with_gm(gm_auth.guard().clone(), true);
+    if !server_only {
+        app_state = app_state.with_gm_panel(soundshared::gui::gm_bridge::GmPanelLink {
+            commands: control_rx.clone(),
+            feed: control_feed.clone(),
+        });
+    }
     thread::spawn(move || {
         if let Err(e) = run_server_and_get_handle(
             server_config_clone,
@@ -603,6 +734,7 @@ fn main() -> Result<()> {
             upnp_status,
             network_notes,
             control_routes,
+            app_config_for_server,
         ) {
             error!("Server error: {}", e);
         }
@@ -666,7 +798,13 @@ fn main() -> Result<()> {
         let mut board = {
             let guard = audio_engine_shared.lock().unwrap();
             let engine = guard.as_ref().expect("audio engine");
-            soundshared::network::control::Board::load(engine, &config.library)
+            let mut board = soundshared::network::control::Board::load(engine, &config.library);
+            board.attach_feed(engine, control_feed.clone());
+            // Ducking defaults; loudness measurement runs in the background
+            // when `audio.normalize` is on.
+            board.configure_audio(&config.audio);
+            board.normalize_missing(engine);
+            board
         };
         info!("Library loaded: {} sound(s)", board.len());
 
@@ -682,6 +820,10 @@ fn main() -> Result<()> {
                     info!("Listener server available at {}", access.share_url(&url));
                     if let Some(local) = soundshared::network::loopback_url(&url) {
                         info!("Control page (this PC only): {local}/control");
+                    }
+                    if gm_auth.guard().remote_enabled() {
+                        // The token itself is never logged: it is `gm_token` in config.toml.
+                        info!("Remote control: {url}/control?g=<gm_token from config.toml>");
                     }
                 }
                 Ok(Err(e)) => error!("Failed to start listener server: {}", e),
@@ -700,6 +842,13 @@ fn main() -> Result<()> {
         // Run control actions on this thread (the engine is not Send) until
         // Ctrl+C.
         loop {
+            // Wake up for the Director's next delayed scene start (or at
+            // least a few times a second).
+            let wait = board
+                .next_deadline()
+                .map(|due| due.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or(Duration::from_millis(250))
+                .min(Duration::from_millis(250));
             crossbeam_channel::select! {
                 recv(ctrlc_rx) -> _ => break,
                 recv(control_rx) -> command => {
@@ -710,6 +859,28 @@ fn main() -> Result<()> {
                         None => Err("audio engine stopped".to_string()),
                     };
                     let _ = command.reply.send(result);
+                }
+                recv(crossbeam_channel::after(wait)) -> _ => {}
+            }
+            if let Some(engine) = audio_engine_shared.lock().unwrap().as_ref() {
+                board.tick(engine);
+            }
+            now_playing.publish(
+                soundshared::network::broadcast::NowPlaying::from_director_with_library(
+                    board.director(),
+                    &config.library,
+                ),
+            );
+            // Gains measured in the background go into the saved library.
+            let updates = board.take_gain_updates();
+            if !updates.is_empty()
+                && soundshared::audio::director_audio::apply_gain_updates(
+                    &mut config.library,
+                    &updates,
+                )
+            {
+                if let Err(e) = config.save() {
+                    error!("Failed to save measured loudness: {}", e);
                 }
             }
         }
@@ -725,7 +896,7 @@ fn main() -> Result<()> {
             }
         }
 
-        info!("SoundShared stopped");
+        info!("Bardwave stopped");
         Ok(())
     } else {
         // Run the GUI (blocks until window closes)
@@ -748,7 +919,15 @@ fn main() -> Result<()> {
             }
         }
 
-        info!("SoundShared stopped");
+        info!("Bardwave stopped");
+
+        // A profile switch was requested in the GUI: start the new process now
+        // that this one has released its port and audio device.
+        match soundshared::profiles::launch_pending_switch() {
+            Some(Ok(target)) => info!("Started profile {:?}", target),
+            Some(Err(e)) => error!("Could not start the other profile: {}", e),
+            None => {}
+        }
         gui_result.map_err(|e| SoundSharedError::Other(e.to_string()))
     }
 }
@@ -769,24 +948,19 @@ fn stop_server_and_wait(server_cmd_tx: &Sender<ServerCommand>) {
 
 /// Initialize logging based on configuration
 ///
-/// With `logging.file_logging = true` the log also goes to `bardwave.log` next
-/// to the executable — the only way to read it from a release build, which
-/// has no console window.
+/// With `logging.file_logging = true` the log also goes to `bardwave.log` in
+/// the data directory (see `paths::data_dir`) — the only way to read it from a
+/// release build, which has no console window.
 fn init_logging(config: &Config) -> Result<()> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
 
     let log_file = if config.logging.file_logging {
-        std::env::current_exe()
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(soundshared::paths::log_path())
             .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("bardwave.log")))
-            .and_then(|path| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .ok()
-            })
     } else {
         None
     };

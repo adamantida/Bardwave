@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Bardwave runs an HTTP/WebSocket server for the players' browsers. -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <!-- UPnP port mapping, update check and outgoing connections. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <!-- No microphone: com.apple.security.device.audio-input is intentionally absent
+         (Bardwave only plays audio out). -->
+</dict>
+</plist>

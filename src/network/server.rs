@@ -1,4 +1,4 @@
-//! HTTP/WebSocket server for SoundShared
+//! HTTP/WebSocket server for Bardwave
 
 pub use axum::response::{Html, Response};
 pub use axum::{
@@ -23,6 +23,22 @@ use crate::network::local_ip::{detect_for_bind, is_advertisable};
 use crate::network::websocket::{handle_websocket_upgrade, WebSocketConfig};
 
 // Embedded static files (compiled into binary)
+const MANIFEST_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/manifest.webmanifest"
+));
+const ICON_192_PNG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/icon-192.png"
+));
+const ICON_512_PNG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/icon-512.png"
+));
+const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/apple-touch-icon.png"
+));
 const INDEX_HTML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/network/static/index.html"
@@ -56,6 +72,9 @@ pub struct ServerConfig {
     pub websocket_config: WebSocketConfig,
     /// Access key for the stream (open by default)
     pub access: AccessGuard,
+    /// Optional HTTPS on the same port (off by default), see
+    /// [`crate::network::tls`].
+    pub tls: crate::network::tls::TlsSettings,
 }
 
 impl Default for ServerConfig {
@@ -67,6 +86,7 @@ impl Default for ServerConfig {
             broadcaster_config: BroadcasterConfig::default(),
             websocket_config: WebSocketConfig::default(),
             access: AccessGuard::default(),
+            tls: crate::network::tls::TlsSettings::default(),
         }
     }
 }
@@ -136,10 +156,44 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/app.js", get(serve_app_js))
         .route("/style.css", get(serve_style_css))
         .route("/opus-decoder.min.js", get(serve_opus_decoder_js))
+        .route("/manifest.webmanifest", get(serve_manifest))
+        .route("/icon-192.png", get(serve_icon_192))
+        .route("/icon-512.png", get(serve_icon_512))
+        .route("/apple-touch-icon.png", get(serve_apple_touch_icon))
         .route("/api/status", get(api_status))
         .route("/ws/audio", get(websocket_handler))
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        // The default span records the whole URI, which would put the access
+        // key (`?k=`) and the game-master token (`?g=`) into the logs. Only the
+        // method and the path are kept.
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                )
+            }),
+        )
+}
+
+/// [`build_router`] plus the game-master panel (`/control`, `/api/control/*`,
+/// `/ws/control`), when there is one (`--server-only` today).
+///
+/// The panel's WebSocket sessions are tied to the server's shutdown signal, so
+/// Stop server closes them like it closes listeners.
+pub fn build_router_with_control(
+    state: ServerState,
+    control: Option<crate::network::control::ControlContext>,
+) -> Router {
+    match control {
+        Some(control) => {
+            let routes =
+                crate::network::control::routes(control.with_shutdown(state.shutdown_tx.clone()));
+            build_router(state).merge(routes)
+        }
+        None => build_router(state),
+    }
 }
 
 /// Errors that can occur in the server
@@ -188,6 +242,17 @@ impl NetworkServer {
         };
         let app = build_router(state);
 
+        // HTTPS: a certificate that cannot be read is an error before anything
+        // is bound, not a server that silently falls back to plain HTTP.
+        let tls_acceptor = if self.config.tls.enabled {
+            Some(
+                crate::network::tls::prepare(&self.config.tls)
+                    .map_err(|e| ServerError::Config(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
         // Bind to address
         let addr = SocketAddr::new(self.config.bind_addr, self.config.port);
         let listener = TcpListener::bind(addr).await?;
@@ -195,7 +260,12 @@ impl NetworkServer {
 
         // The URL follows the socket that was actually bound, so a bind to port
         // 0 advertises the port the OS picked rather than the requested one.
-        let server_url = listen_url(self.config.bind_addr, actual_addr, detected_ip);
+        let server_url = listen_url_with_scheme(
+            self.config.bind_addr,
+            actual_addr,
+            detected_ip,
+            tls_acceptor.is_some(),
+        );
         *url.lock().await = Some(server_url.clone());
 
         info!("Network server listening on {}", actual_addr);
@@ -207,6 +277,14 @@ impl NetworkServer {
         // Spawn server task
         let server_task = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
+            if let Some(acceptor) = tls_acceptor {
+                crate::network::tls::serve(listener, app, acceptor, async move {
+                    let _ = shutdown_rx.recv().await;
+                    info!("🌐 Shutdown signal received, stopping server...");
+                })
+                .await;
+                return Ok(());
+            }
             // Opus packets are ~100 bytes every 10 ms: with Nagle's algorithm
             // on, Windows holds them back and sends bursts, which drains the
             // listener's jitter buffer and makes the stream stutter.
@@ -287,6 +365,7 @@ pub async fn api_status(
 
     let status = serde_json::json!({
         "status": "running",
+        "name": "Bardwave",
         "listeners": listener_count,
         "version": env!("CARGO_PKG_VERSION"),
         "audio_format": {
@@ -341,6 +420,67 @@ pub async fn serve_opus_decoder_js() -> impl IntoResponse {
     (headers, OPUS_DECODER_JS)
 }
 
+/// The web app manifest that makes the listener page installable.
+///
+/// A home-screen shortcut opens the manifest's `start_url`, which would lose
+/// the access key of the shared link, so the page asks for the manifest with
+/// the same `?k=` and it is echoed into `start_url`. Only keys made of URL-safe
+/// characters are echoed; anything else falls back to the plain `/`.
+pub async fn serve_manifest(
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(MANIFEST_JSON).unwrap_or(serde_json::Value::Null);
+    if let Some(key) = query.get(KEY_PARAM) {
+        let url_safe = !key.is_empty()
+            && key.len() <= 64
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if url_safe {
+            manifest["start_url"] = serde_json::Value::String(format!("/?{KEY_PARAM}={key}"));
+        }
+    }
+    let body = serde_json::to_string(&manifest).unwrap_or_else(|_| MANIFEST_JSON.to_string());
+    (
+        [(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/manifest+json"),
+        )],
+        body,
+    )
+        .into_response()
+}
+
+fn png_response(bytes: &'static [u8]) -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("image/png"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("public, max-age=86400"),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+pub async fn serve_icon_192() -> Response {
+    png_response(ICON_192_PNG)
+}
+
+pub async fn serve_icon_512() -> Response {
+    png_response(ICON_512_PNG)
+}
+
+pub async fn serve_apple_touch_icon() -> Response {
+    png_response(APPLE_TOUCH_ICON_PNG)
+}
+
 /// WebSocket handler: GET /ws/audio
 pub async fn websocket_handler(
     ws: WebSocketUpgrade,
@@ -382,6 +522,17 @@ pub async fn websocket_handler(
 /// The actual address supplies the real port, so a bind to port 0 reports the
 /// port the OS picked rather than the one that was asked for.
 pub fn listen_url(bind_addr: IpAddr, actual: SocketAddr, detected: Option<IpAddr>) -> String {
+    listen_url_with_scheme(bind_addr, actual, detected, false)
+}
+
+/// [`listen_url`] with the scheme chosen by `https` (`server.tls`).
+pub fn listen_url_with_scheme(
+    bind_addr: IpAddr,
+    actual: SocketAddr,
+    detected: Option<IpAddr>,
+    https: bool,
+) -> String {
+    let scheme = if https { "https" } else { "http" };
     let advertise = if bind_addr.is_loopback() {
         bind_addr
     } else if bind_addr.is_unspecified() {
@@ -400,9 +551,9 @@ pub fn listen_url(bind_addr: IpAddr, actual: SocketAddr, detected: Option<IpAddr
     };
 
     match advertise {
-        IpAddr::V4(ip) => format!("http://{}:{}", ip, actual.port()),
+        IpAddr::V4(ip) => format!("{scheme}://{}:{}", ip, actual.port()),
         // IPv6 literals need brackets, otherwise the port reads as part of the address.
-        IpAddr::V6(ip) => format!("http://[{}]:{}", ip, actual.port()),
+        IpAddr::V6(ip) => format!("{scheme}://[{}]:{}", ip, actual.port()),
     }
 }
 
@@ -423,7 +574,14 @@ pub fn loopback_url(advertised: &str) -> Option<String> {
         .parse::<u16>()
         .ok()?;
 
-    Some(format!("http://127.0.0.1:{port}"))
+    // The scheme follows the advertised URL, so an HTTPS server's loopback
+    // link is HTTPS as well.
+    let scheme = if advertised.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    Some(format!("{scheme}://127.0.0.1:{port}"))
 }
 
 #[cfg(test)]

@@ -402,7 +402,9 @@ fn from_config_repairs_dangling_group_reference() {
             volume: 1.0,
             looped: false,
             group: Some(uuid::Uuid::new_v4().to_string()),
+            ..SoundConfigEntry::default()
         }],
+        ..LibraryConfig::default()
     };
 
     let lib = Library::from_config(&config);
@@ -435,6 +437,7 @@ fn from_config_drops_invalid_and_duplicate_group_ids() {
             },
         ],
         sounds: vec![],
+        ..LibraryConfig::default()
     };
 
     let lib = Library::from_config(&config);
@@ -453,6 +456,7 @@ fn from_config_drops_empty_paths_and_duplicate_paths() {
                 volume: 1.0,
                 looped: false,
                 group: None,
+                ..SoundConfigEntry::default()
             },
             SoundConfigEntry {
                 path: HIT.to_string(),
@@ -460,6 +464,7 @@ fn from_config_drops_empty_paths_and_duplicate_paths() {
                 volume: 1.0,
                 looped: false,
                 group: None,
+                ..SoundConfigEntry::default()
             },
             SoundConfigEntry {
                 path: HIT.to_string(),
@@ -467,8 +472,10 @@ fn from_config_drops_empty_paths_and_duplicate_paths() {
                 volume: 0.2,
                 looped: false,
                 group: None,
+                ..SoundConfigEntry::default()
             },
         ],
+        ..LibraryConfig::default()
     };
 
     let lib = Library::from_config(&config);

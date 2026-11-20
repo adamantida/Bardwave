@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Bardwave
+GenericName=Tabletop soundboard
+Comment=Ambience, music and sound effects for your table, streamed to the players' browsers
+Exec=bardwave
+Icon=bardwave
+Terminal=false
+Categories=AudioVideo;Audio;Player;Game;
+Keywords=ttrpg;rpg;soundboard;ambience;music;dnd;

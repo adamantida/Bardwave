@@ -2,9 +2,10 @@
 //! High-level API for sound management and playback
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -19,9 +20,28 @@ use uuid::Uuid;
 
 use self::device_adapter::{DeviceAdapter, StreamResampler};
 use crate::audio::decoder::{
-    AudioDecoder, DecodedAudio, DecoderError, TARGET_CHANNELS, TARGET_SAMPLE_RATE,
+    AudioDecoder, DecodedAudio, DecoderError, TrackMeta, TARGET_CHANNELS, TARGET_SAMPLE_RATE,
 };
-use crate::audio::mixer::{AudioMixer, MixedOutput, MixerConfig};
+use crate::audio::devices::{
+    self, pick_output_device, plan_preview_route, DevicePick, OutputSelection, PreviewPlan,
+};
+use crate::audio::mixer::{AudioMixer, Bus, DuckSettings, FadeCurve, MixedOutput, MixerConfig};
+use crate::audio::stream_source::{
+    should_stream, StreamEvent, StreamSource, DEFAULT_STREAM_THRESHOLD_SECS,
+};
+
+/// How long starting a streamed track waits for its first audio to be decoded
+/// (normally a few milliseconds), so the first callbacks do not underrun.
+const STREAM_START_WAIT: Duration = Duration::from_millis(30);
+
+/// A long file that is not held in memory: every play opens it afresh and
+/// decodes it on the fly (see [`StreamSource`]).
+#[derive(Debug, Clone)]
+struct StreamSound {
+    path: PathBuf,
+    meta: TrackMeta,
+    duration_secs: f32,
+}
 
 /// Sample rate of the mix pipeline: what the mixer produces, what the network
 /// forwarder publishes and what every web listener receives. The local device
@@ -436,11 +456,19 @@ pub(crate) struct AudioEngineInner {
     mixer: Arc<AudioMixer>,
     /// Loaded sounds: SoundId -> Arc<DecodedAudio>
     sounds: RwLock<HashMap<SoundId, Arc<DecodedAudio>>>,
+    /// Loaded sounds that are streamed from disk instead of held in memory
+    stream_sounds: RwLock<HashMap<SoundId, StreamSound>>,
+    /// Files longer than this many seconds are streamed (0 = never)
+    stream_threshold_secs: AtomicU32,
     /// Per-sound volume, applied to tracks of that sound as they are created
     /// and to the ones already playing
-    sound_volumes: RwLock<HashMap<SoundId, f32>>,
+    pub(crate) sound_volumes: RwLock<HashMap<SoundId, f32>>,
+    /// Per-sound pan, applied to new tracks of that sound like the volume
+    sound_pans: RwLock<HashMap<SoundId, f32>>,
+    /// Per-sound bus, applied to new tracks of that sound like the volume
+    sound_buses: RwLock<HashMap<SoundId, Bus>>,
     /// Active tracks: track_id -> SoundId
-    active_tracks: RwLock<HashMap<Uuid, SoundId>>,
+    pub(crate) active_tracks: RwLock<HashMap<Uuid, SoundId>>,
     /// CPAL output stream
     stream: Mutex<Option<cpal::Stream>>,
     /// Engine running state
@@ -454,6 +482,12 @@ pub(crate) struct AudioEngineInner {
     next_track_id: AtomicU64,
     /// How `[audio]` wants the local device opened (read at `start_output`).
     device_prefs: parking_lot::Mutex<DevicePrefs>,
+    /// Which devices `[audio]` selects (read at `start_output`).
+    output_selection: parking_lot::Mutex<OutputSelection>,
+    /// Stream of the separate preview device (headphones), when one is open.
+    preview_stream: Mutex<Option<cpal::Stream>>,
+    /// State of the preview output; shared with its stream callbacks.
+    preview_output: Arc<parking_lot::RwLock<LocalOutputStatus>>,
 }
 
 // Manual Debug implementation since cpal::Stream doesn't implement Debug
@@ -513,7 +547,7 @@ impl AudioEngineInner {
 /// High-level audio engine
 #[derive(Clone)]
 pub struct AudioEngine {
-    inner: Arc<AudioEngineInner>,
+    pub(crate) inner: Arc<AudioEngineInner>,
 }
 
 impl AudioEngine {
@@ -527,7 +561,11 @@ impl AudioEngine {
         let inner = Arc::new(AudioEngineInner {
             mixer,
             sounds: RwLock::new(HashMap::new()),
+            stream_sounds: RwLock::new(HashMap::new()),
+            stream_threshold_secs: AtomicU32::new(DEFAULT_STREAM_THRESHOLD_SECS),
             sound_volumes: RwLock::new(HashMap::new()),
+            sound_pans: RwLock::new(HashMap::new()),
+            sound_buses: RwLock::new(HashMap::new()),
             active_tracks: RwLock::new(HashMap::new()),
             stream: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
@@ -535,6 +573,9 @@ impl AudioEngine {
             master_volume: Arc::new(parking_lot::Mutex::new(1.0)),
             next_track_id: AtomicU64::new(0),
             device_prefs: parking_lot::Mutex::new(DevicePrefs::default()),
+            output_selection: parking_lot::Mutex::new(OutputSelection::default()),
+            preview_stream: Mutex::new(None),
+            preview_output: Arc::new(parking_lot::RwLock::new(LocalOutputStatus::stopped())),
         });
 
         Ok(Self { inner })
@@ -543,6 +584,18 @@ impl AudioEngine {
     /// Choose how the local device is opened by the next `start_output`.
     pub fn set_device_prefs(&self, prefs: DevicePrefs) {
         *self.inner.device_prefs.lock() = prefs;
+    }
+
+    /// Choose the output and preview devices used by the next `start_output`
+    /// (or by [`apply_output_selection`](Self::apply_output_selection) on a
+    /// running engine).
+    pub fn set_output_selection(&self, selection: OutputSelection) {
+        *self.inner.output_selection.lock() = selection;
+    }
+
+    /// The device selection currently in force.
+    pub fn output_selection(&self) -> OutputSelection {
+        self.inner.output_selection.lock().clone()
     }
 
     /// Create a new audio engine with custom mixer config and broadcast channel
@@ -554,7 +607,11 @@ impl AudioEngine {
         let inner = Arc::new(AudioEngineInner {
             mixer,
             sounds: RwLock::new(HashMap::new()),
+            stream_sounds: RwLock::new(HashMap::new()),
+            stream_threshold_secs: AtomicU32::new(DEFAULT_STREAM_THRESHOLD_SECS),
             sound_volumes: RwLock::new(HashMap::new()),
+            sound_pans: RwLock::new(HashMap::new()),
+            sound_buses: RwLock::new(HashMap::new()),
             active_tracks: RwLock::new(HashMap::new()),
             stream: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
@@ -562,6 +619,9 @@ impl AudioEngine {
             master_volume: Arc::new(parking_lot::Mutex::new(1.0)),
             next_track_id: AtomicU64::new(0),
             device_prefs: parking_lot::Mutex::new(DevicePrefs::default()),
+            output_selection: parking_lot::Mutex::new(OutputSelection::default()),
+            preview_stream: Mutex::new(None),
+            preview_output: Arc::new(parking_lot::RwLock::new(LocalOutputStatus::stopped())),
         });
 
         Ok(Self { inner })
@@ -585,25 +645,217 @@ impl AudioEngine {
     /// device that merely lacks a 48 kHz mode used to fail here, which silently
     /// degraded the app to headless mode — the browser kept playing while the
     /// desktop stayed silent.
+    ///
+    /// The device comes from [`set_output_selection`](Self::set_output_selection):
+    /// `None` is the system default; a named device that is missing or cannot be
+    /// opened falls back to the default and the status `reason` says so. A
+    /// configured preview device is opened as a second stream (see
+    /// [`preview_output_status`](Self::preview_output_status)).
     pub fn start_output(&self) -> Result<(), EngineError> {
         if self.inner.running.load(Ordering::Acquire) {
             warn!("Audio engine already running");
             return Ok(());
         }
 
-        let host = cpal::default_host();
-        let device = match host.default_output_device() {
-            Some(device) => device,
-            None => {
-                self.record_local_output_failure(None, 0, 0, "none", "no default output device");
-                return Err(EngineError::NoDevice);
-            }
+        let selection = self.inner.output_selection.lock().clone();
+        let prefs = *self.inner.device_prefs.lock();
+
+        // Enumerating devices is only needed when a device is picked by name;
+        // the plain "system default" path stays as light as it always was.
+        let enumerated = (selection.output.is_some() || selection.preview.is_some())
+            .then(devices::output_devices_by_name);
+        let pick = match &enumerated {
+            Some((_, infos)) => pick_output_device(infos, selection.output.as_deref()),
+            None => DevicePick::Default,
         };
 
-        let device_name = device
-            .name()
-            .unwrap_or_else(|_| "<unknown device>".to_string());
-        info!("Using audio device: {device_name}");
+        // Attempts in order: the named device (when found), then the system
+        // default. A device that cannot be opened falls back like a missing one.
+        let mut fallback_note = pick.fallback_message();
+        let named_index = match pick {
+            DevicePick::Named(index) => Some(index),
+            _ => None,
+        };
+        let default_device = cpal::default_host().default_output_device();
+        let mut attempts: Vec<(&cpal::Device, bool)> = Vec::new();
+        if let (Some(index), Some((devices, _))) = (named_index, &enumerated) {
+            attempts.push((&devices[index], false));
+        }
+        if let Some(device) = default_device.as_ref() {
+            attempts.push((device, true));
+        }
+        if attempts.is_empty() {
+            self.record_local_output_failure(None, 0, 0, "none", "no default output device");
+            return Err(EngineError::NoDevice);
+        }
+
+        let mut opened = None;
+        let mut last_failure = None;
+        let attempt_count = attempts.len();
+        for (index, (device, is_default)) in attempts.into_iter().enumerate() {
+            match self.open_stream(device, &prefs, StreamRole::Main) {
+                Ok(stream) => {
+                    opened = Some(stream);
+                    break;
+                }
+                Err(failure) => {
+                    warn!(
+                        "Could not open output device {}: {}",
+                        failure.device_name, failure.error
+                    );
+                    if index + 1 < attempt_count && !is_default {
+                        fallback_note = Some(format!(
+                            "could not open \"{}\" ({}); using the system default",
+                            failure.device_name, failure.error
+                        ));
+                    }
+                    last_failure = Some(failure);
+                }
+            }
+        }
+        let Some(OpenedStream {
+            stream,
+            device_name,
+            adapter,
+            sample_format,
+            reason,
+        }) = opened
+        else {
+            let failure = last_failure.expect("at least one attempt was made");
+            self.record_local_output_failure(
+                Some(failure.device_name),
+                failure.sample_rate,
+                failure.channels,
+                &failure.sample_format,
+                failure.error.to_string(),
+            );
+            return Err(failure.error);
+        };
+
+        // Mark the engine running before starting the stream so the first
+        // callback already mixes instead of emitting one silent buffer.
+        self.inner.running.store(true, Ordering::Release);
+        if let Err(e) = stream.play() {
+            self.inner.running.store(false, Ordering::Release);
+            self.record_local_output_failure(
+                Some(device_name),
+                adapter.sample_rate,
+                adapter.channels,
+                &sample_format.to_string(),
+                format!("failed to start the output stream: {e}"),
+            );
+            return Err(e.into());
+        }
+
+        *self.inner.stream.lock().unwrap() = Some(stream);
+
+        *self.inner.local_output.write() = LocalOutputStatus {
+            state: LocalOutputState::Running,
+            device: Some(device_name.clone()),
+            sample_rate: adapter.sample_rate,
+            channels: adapter.channels,
+            sample_format: sample_format.to_string(),
+            reason: join_reasons(fallback_note, reason),
+        };
+
+        self.route_preview(&selection, enumerated.as_ref(), &device_name, &prefs);
+
+        info!("Audio engine started successfully (device-driven mixer)");
+        Ok(())
+    }
+
+    /// Open the preview device (headphones) when one is configured and differs
+    /// from the main output; otherwise previews stay on the main output.
+    ///
+    /// Never fails the engine: a missing or broken preview device is recorded in
+    /// [`preview_output_status`](Self::preview_output_status) and previews play
+    /// on the main output as before.
+    fn route_preview(
+        &self,
+        selection: &OutputSelection,
+        enumerated: Option<&EnumeratedDevices>,
+        main_name: &str,
+        prefs: &DevicePrefs,
+    ) {
+        self.inner.mixer.set_preview_external(false);
+        *self.inner.preview_output.write() = LocalOutputStatus::stopped();
+        let Some((devices, infos)) = enumerated else {
+            return;
+        };
+        if selection.preview.is_none() {
+            return;
+        }
+
+        let failed = |name: Option<String>, message: String| {
+            warn!("Preview output unavailable: {message}");
+            *self.inner.preview_output.write() = LocalOutputStatus {
+                state: LocalOutputState::Failed(message.clone()),
+                device: name,
+                reason: Some(message),
+                ..LocalOutputStatus::stopped()
+            };
+        };
+
+        let index = match plan_preview_route(infos, main_name, selection.preview.as_deref()) {
+            PreviewPlan::SharedWithMain => return,
+            PreviewPlan::Unavailable(message) => {
+                failed(selection.preview.clone(), message);
+                return;
+            }
+            PreviewPlan::Separate(index) => index,
+        };
+
+        match self.open_stream(&devices[index], prefs, StreamRole::Preview) {
+            Ok(opened) => {
+                // The main callback stops rendering previews before the second
+                // device starts doing it.
+                self.inner.mixer.set_preview_external(true);
+                if let Err(e) = opened.stream.play() {
+                    self.inner.mixer.set_preview_external(false);
+                    failed(
+                        Some(opened.device_name),
+                        format!(
+                            "could not start the preview stream: {e}; previews play on the main output"
+                        ),
+                    );
+                    return;
+                }
+                *self.inner.preview_stream.lock().unwrap() = Some(opened.stream);
+                *self.inner.preview_output.write() = LocalOutputStatus {
+                    state: LocalOutputState::Running,
+                    device: Some(opened.device_name),
+                    sample_rate: opened.adapter.sample_rate,
+                    channels: opened.adapter.channels,
+                    sample_format: opened.sample_format.to_string(),
+                    reason: opened.reason,
+                };
+            }
+            Err(failure) => failed(
+                Some(failure.device_name),
+                format!(
+                    "could not open the preview device: {}; previews play on the main output",
+                    failure.error
+                ),
+            ),
+        }
+    }
+
+    /// Plan and build a stream on `device` (not yet playing).
+    fn open_stream(
+        &self,
+        device: &cpal::Device,
+        prefs: &DevicePrefs,
+        role: StreamRole,
+    ) -> Result<OpenedStream, OpenFailure> {
+        let device_name = devices::name_of(device);
+        info!("Using audio device ({role:?}): {device_name}");
+        let fail = |sample_rate, channels, format: &str, error: EngineError| OpenFailure {
+            device_name: device_name.clone(),
+            sample_rate,
+            channels,
+            sample_format: format.to_string(),
+            error,
+        };
 
         // An enumeration failure is not fatal: the device default config below
         // is still usable, and the policy below handles an empty list.
@@ -615,14 +867,8 @@ impl AudioEngine {
             }
         };
 
-        let prefs = *self.inner.device_prefs.lock();
-        let (chosen, reason) = match Self::choose_output_config(&device, &supported, &prefs) {
-            Ok(chosen) => chosen,
-            Err(e) => {
-                self.record_local_output_failure(Some(device_name), 0, 0, "none", e.to_string());
-                return Err(e);
-            }
-        };
+        let (chosen, reason) = Self::choose_output_config(device, &supported, prefs)
+            .map_err(|e| fail(0, 0, "none", e))?;
 
         let sample_format = chosen.sample_format();
         let adapter = DeviceAdapter::new(chosen.sample_rate().0, chosen.channels());
@@ -651,128 +897,71 @@ impl AudioEngine {
         // stereo staging buffer, publishes that exact buffer to the network
         // forwarder and then converts it for the device. No intermediate 10 ms
         // channel and no `thread::sleep` timing, both of which caused underruns.
-        let mixer = Arc::clone(&self.inner.mixer);
-        let running = Arc::clone(&self.inner.running);
-        let status = Arc::clone(&self.inner.local_output);
-
-        let stream = match sample_format {
-            SampleFormat::F32 => build_adapted_stream::<f32>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::I16 => build_adapted_stream::<i16>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::U16 => build_adapted_stream::<u16>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::I32 => build_adapted_stream::<i32>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::I8 => {
-                build_adapted_stream::<i8>(&device, &stream_config, adapter, mixer, running, status)
-            }
-            SampleFormat::U8 => {
-                build_adapted_stream::<u8>(&device, &stream_config, adapter, mixer, running, status)
-            }
-            SampleFormat::I64 => build_adapted_stream::<i64>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::U64 => build_adapted_stream::<u64>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::U32 => build_adapted_stream::<u32>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            SampleFormat::F64 => build_adapted_stream::<f64>(
-                &device,
-                &stream_config,
-                adapter,
-                mixer,
-                running,
-                status,
-            ),
-            other => Err(EngineError::UnsupportedFormat(format!(
-                "device sample format {other} is not supported by this build"
-            ))),
+        let status = match role {
+            StreamRole::Main => Arc::clone(&self.inner.local_output),
+            StreamRole::Preview => Arc::clone(&self.inner.preview_output),
         };
-
-        let stream = match stream {
-            Ok(stream) => stream,
-            Err(e) => {
-                self.record_local_output_failure(
-                    Some(device_name),
-                    adapter.sample_rate,
-                    adapter.channels,
-                    &sample_format.to_string(),
-                    e.to_string(),
-                );
-                return Err(e);
-            }
-        };
-
-        // Mark the engine running before starting the stream so the first
-        // callback already mixes instead of emitting one silent buffer.
-        self.inner.running.store(true, Ordering::Release);
-        if let Err(e) = stream.play() {
-            self.inner.running.store(false, Ordering::Release);
-            self.record_local_output_failure(
-                Some(device_name),
+        let stream = build_stream_for_format(
+            device,
+            &stream_config,
+            sample_format,
+            adapter,
+            Arc::clone(&self.inner.mixer),
+            Arc::clone(&self.inner.running),
+            status,
+            role,
+        )
+        .map_err(|e| {
+            fail(
                 adapter.sample_rate,
                 adapter.channels,
                 &sample_format.to_string(),
-                format!("failed to start the output stream: {e}"),
-            );
-            return Err(e.into());
+                e,
+            )
+        })?;
+
+        Ok(OpenedStream {
+            stream,
+            device_name,
+            adapter,
+            sample_format,
+            reason,
+        })
+    }
+
+    /// Switch the output (and preview) device of a running engine without
+    /// restarting the application.
+    ///
+    /// The streams are stopped and opened again on the new selection; tracks,
+    /// their positions and volumes live in the mixer and carry on. A device that
+    /// is gone falls back to the system default, and when no device opens at all
+    /// the engine continues headless (network only). The outcome is in the
+    /// returned status (its `reason` says what fell back); `Err` is returned only
+    /// when not even the headless loop can start.
+    ///
+    /// On an engine that has not been started this just stores the selection.
+    pub fn apply_output_selection(
+        &self,
+        selection: OutputSelection,
+    ) -> Result<LocalOutputStatus, EngineError> {
+        self.set_output_selection(selection);
+        if !self.is_running() {
+            return Ok(self.local_output_status());
         }
 
-        *self.inner.stream.lock().unwrap() = Some(stream);
+        self.stop_output()?;
+        if let Err(e) = self.start_output() {
+            let reason = format!("local output unavailable: {e}");
+            self.start_headless_output_with_reason(reason)?;
+        }
+        Ok(self.local_output_status())
+    }
 
-        *self.inner.local_output.write() = LocalOutputStatus {
-            state: LocalOutputState::Running,
-            device: Some(device_name),
-            sample_rate: adapter.sample_rate,
-            channels: adapter.channels,
-            sample_format: sample_format.to_string(),
-            reason,
-        };
-
-        info!("Audio engine started successfully (device-driven mixer)");
-        Ok(())
+    /// State of the separate preview output: `Running` on its own device,
+    /// `Failed` when the configured device could not be used (previews then play
+    /// on the main output), `Stopped` when previews share the main output.
+    pub fn preview_output_status(&self) -> LocalOutputStatus {
+        self.inner.preview_output.read().clone()
     }
 
     /// Ask the device what it offers, then apply the pure selection policy.
@@ -869,6 +1058,17 @@ impl AudioEngine {
             reason,
         };
 
+        // A preview device can still work without a main one.
+        let selection = self.inner.output_selection.lock().clone();
+        if selection.preview.is_some() {
+            let prefs = *self.inner.device_prefs.lock();
+            let enumerated = devices::output_devices_by_name();
+            self.route_preview(&selection, Some(&enumerated), "", &prefs);
+        } else {
+            self.inner.mixer.set_preview_external(false);
+            *self.inner.preview_output.write() = LocalOutputStatus::stopped();
+        }
+
         Ok(())
     }
 
@@ -887,8 +1087,11 @@ impl AudioEngine {
             // Drop the stream to stop it (pause() returns PauseStreamError not in EngineError)
             drop(stream);
         }
+        drop(self.inner.preview_stream.lock().unwrap().take());
+        self.inner.mixer.set_preview_external(false);
 
         *self.inner.local_output.write() = LocalOutputStatus::stopped();
+        *self.inner.preview_output.write() = LocalOutputStatus::stopped();
 
         info!("Audio engine stopped");
         Ok(())
@@ -907,9 +1110,121 @@ impl AudioEngine {
         self.inner.running.load(Ordering::Acquire)
     }
 
-    /// Load a sound from a file path
+    /// Files longer than `secs` seconds are streamed from disk by
+    /// [`load_sound`](Self::load_sound) instead of being decoded into memory.
+    /// `0` turns streaming off. Sounds already loaded are not affected.
+    pub fn set_stream_threshold_secs(&self, secs: u32) {
+        self.inner
+            .stream_threshold_secs
+            .store(secs, Ordering::Relaxed);
+    }
+
+    /// The current streaming threshold, in seconds.
+    pub fn stream_threshold_secs(&self) -> u32 {
+        self.inner.stream_threshold_secs.load(Ordering::Relaxed)
+    }
+
+    /// Load a sound from a file path.
+    ///
+    /// A file longer than the streaming threshold (see
+    /// [`set_stream_threshold_secs`](Self::set_stream_threshold_secs)) is not
+    /// decoded: only its header is read, and every play decodes it on the fly.
+    /// Short files are decoded into memory, as before.
     pub fn load_sound<P: AsRef<Path>>(&self, path: P) -> Result<SoundId, EngineError> {
-        let decoded = AudioDecoder::decode_file(path.as_ref())?;
+        let path = path.as_ref();
+        let threshold = self.stream_threshold_secs();
+        if threshold > 0 {
+            // A file the header probe cannot read falls through to the full
+            // decode, which reports the real error.
+            if let Ok(probe) = AudioDecoder::probe_file(path) {
+                let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                if should_stream(probe.duration_secs, bytes, threshold) {
+                    return Ok(self.register_stream_sound(path, probe.meta, probe.duration_secs));
+                }
+            }
+        }
+        self.load_sound_decoded(path)
+    }
+
+    /// Load a sound as a stream regardless of its length.
+    pub fn load_sound_streaming<P: AsRef<Path>>(&self, path: P) -> Result<SoundId, EngineError> {
+        let probe = AudioDecoder::probe_file(path.as_ref())?;
+        Ok(self.register_stream_sound(path.as_ref(), probe.meta, probe.duration_secs))
+    }
+
+    pub fn register_stream_sound(
+        &self,
+        path: &Path,
+        meta: TrackMeta,
+        duration_secs: Option<f64>,
+    ) -> SoundId {
+        let sound_id = SoundId::new();
+        info!(
+            "Loaded sound {} as a stream: {} ({})",
+            sound_id.0,
+            path.display(),
+            duration_secs.map_or("unknown length".to_string(), |d| format!("{d:.1}s"))
+        );
+        self.inner.stream_sounds.write().insert(
+            sound_id,
+            StreamSound {
+                path: path.to_path_buf(),
+                meta,
+                duration_secs: duration_secs.unwrap_or(0.0) as f32,
+            },
+        );
+        sound_id
+    }
+
+    /// Whether a sound is streamed from disk (not held in memory).
+    pub fn is_sound_streamed(&self, sound_id: SoundId) -> bool {
+        self.inner.stream_sounds.read().contains_key(&sound_id)
+    }
+
+    /// Title / artist / album of a streamed sound (`None` for sounds held in
+    /// memory, which do not keep their tags).
+    pub fn sound_meta(&self, sound_id: SoundId) -> Option<TrackMeta> {
+        self.inner
+            .stream_sounds
+            .read()
+            .get(&sound_id)
+            .map(|s| s.meta.clone())
+    }
+
+    /// Whether a sound of any kind is loaded.
+    fn has_sound(&self, sound_id: SoundId) -> bool {
+        self.inner.sounds.read().contains_key(&sound_id)
+            || self.inner.stream_sounds.read().contains_key(&sound_id)
+    }
+
+    /// Events of streamed tracks (a track played to its end), for playlists.
+    pub fn stream_events(&self) -> Receiver<StreamEvent> {
+        self.inner.mixer.stream_events()
+    }
+
+    /// Tracks that played out and were pruned by a later start since the last
+    /// call (see [`AudioMixer::take_pruned_ended`]).
+    pub fn take_pruned_ended(&self) -> Vec<Uuid> {
+        self.inner.mixer.take_pruned_ended()
+    }
+
+    /// Playback position of a track, in milliseconds.
+    pub fn track_position_ms(&self, track_id: Uuid) -> Result<u64, EngineError> {
+        Ok(self.inner.mixer.track_position_ms(track_id)?)
+    }
+
+    /// Jump to a position (milliseconds) in a track.
+    pub fn seek_track_ms(&self, track_id: Uuid, ms: u64) -> Result<(), EngineError> {
+        Ok(self.inner.mixer.seek_track_ms(track_id, ms)?)
+    }
+
+    /// Length of a track in milliseconds, when known.
+    pub fn track_duration_ms(&self, track_id: Uuid) -> Result<Option<u64>, EngineError> {
+        Ok(self.inner.mixer.track_duration_ms(track_id)?)
+    }
+
+    fn load_sound_decoded(&self, path: &Path) -> Result<SoundId, EngineError> {
+        let decoded = AudioDecoder::decode_file(path)?;
         let sound_id = SoundId::new();
         let audio = Arc::new(decoded);
 
@@ -920,6 +1235,13 @@ impl AudioEngine {
 
         self.inner.sounds.write().insert(sound_id, audio);
         Ok(sound_id)
+    }
+
+    /// The decoded PCM of a sound held in memory (`None` for a streamed or
+    /// unknown sound). Shared, not copied: loudness measurement reads it from a
+    /// background thread.
+    pub fn sound_audio(&self, sound_id: SoundId) -> Option<Arc<DecodedAudio>> {
+        self.inner.sounds.read().get(&sound_id).cloned()
     }
 
     /// Load a sound from raw decoded audio data
@@ -944,12 +1266,67 @@ impl AudioEngine {
         sound_id: SoundId,
         looped: bool,
     ) -> Result<TrackHandle, EngineError> {
-        let audio = {
-            let sounds = self.inner.sounds.read();
-            sounds
-                .get(&sound_id)
-                .cloned()
-                .ok_or(EngineError::SoundNotFound(sound_id))?
+        self.start_track(sound_id, looped, None, false)
+    }
+
+    /// Play a loaded sound, fading it in over `fade_in_ms` along `curve`.
+    ///
+    /// The fade ends at the sound's volume (see
+    /// [`set_sound_volume`](Self::set_sound_volume)). A zero or very short time
+    /// still gets the 10 ms click-protection ramp.
+    pub fn play_sound_fade(
+        &self,
+        sound_id: SoundId,
+        looped: bool,
+        fade_in_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<TrackHandle, EngineError> {
+        self.start_track(sound_id, looped, Some((fade_in_ms, curve)), false)
+    }
+
+    /// Play a sound as a **local preview**: heard on this machine's output
+    /// only, never sent to the players' stream.
+    ///
+    /// The track is not registered with the sound, so
+    /// [`stop_sound`](Self::stop_sound), [`stop_all`](Self::stop_all) and
+    /// [`is_sound_playing`](Self::is_sound_playing) do not see it; control it
+    /// through the returned handle (or [`stop_track`](Self::stop_track)). It
+    /// ignores the sound's remembered pan and bus.
+    pub fn play_preview(
+        &self,
+        sound_id: SoundId,
+        looped: bool,
+    ) -> Result<TrackHandle, EngineError> {
+        self.start_track(sound_id, looped, None, true)
+    }
+
+    /// The one place a track is created and started.
+    ///
+    /// `fade_in`: fade from silence instead of starting at full gain.
+    /// `preview`: local-only track that is not registered as an active track.
+    fn start_track(
+        &self,
+        sound_id: SoundId,
+        looped: bool,
+        fade_in: Option<(u32, FadeCurve)>,
+        preview: bool,
+    ) -> Result<TrackHandle, EngineError> {
+        let memory = self.inner.sounds.read().get(&sound_id).cloned();
+        let stream = match memory {
+            Some(_) => None,
+            None => {
+                let sound = self
+                    .inner
+                    .stream_sounds
+                    .read()
+                    .get(&sound_id)
+                    .cloned()
+                    .ok_or(EngineError::SoundNotFound(sound_id))?;
+                let source = StreamSource::open(&sound.path)?;
+                // A moment for the first audio to be decoded; not under any lock.
+                source.wait_ready(STREAM_START_WAIT);
+                Some(source)
+            }
         };
 
         // Forget tracks that finished or were stopped earlier, so neither the
@@ -962,7 +1339,11 @@ impl AudioEngine {
                 .retain(|track_id, _| mixer.has_track(*track_id));
         }
 
-        let track_id = self.inner.mixer.add_track(audio, looped);
+        let track_id = match (memory, stream) {
+            (Some(audio), _) => self.inner.mixer.add_track(audio, looped),
+            (None, Some(source)) => self.inner.mixer.add_stream_track(source, looped),
+            (None, None) => return Err(EngineError::SoundNotFound(sound_id)),
+        };
 
         // A sound's volume outlives its tracks: a track created later must pick
         // up the volume the user already chose for that sound.
@@ -977,12 +1358,34 @@ impl AudioEngine {
             self.inner.mixer.set_track_volume(track_id, sound_volume)?;
         }
 
+        if preview {
+            self.inner.mixer.set_track_local_only(track_id, true)?;
+        } else {
+            // Pan and bus are remembered per sound, like the volume.
+            let pan = self.inner.sound_pans.read().get(&sound_id).copied();
+            if let Some(pan) = pan {
+                self.inner.mixer.set_track_pan(track_id, pan)?;
+            }
+            let bus = self.inner.sound_buses.read().get(&sound_id).copied();
+            if let Some(bus) = bus {
+                self.inner.mixer.set_track_bus(track_id, bus)?;
+            }
+        }
+
         // Start playback — the central mix loop will read audio directly from
         // the track's decoded samples, no feeder thread needed.
-        self.inner.mixer.play_track(track_id)?;
+        match fade_in {
+            Some((ms, curve)) => self
+                .inner
+                .mixer
+                .play_track_with_fade_in(track_id, ms, curve)?,
+            None => self.inner.mixer.play_track(track_id)?,
+        }
 
         // Register active track
-        self.inner.active_tracks.write().insert(track_id, sound_id);
+        if !preview {
+            self.inner.active_tracks.write().insert(track_id, sound_id);
+        }
 
         let handle = TrackHandle {
             sound_id,
@@ -991,14 +1394,14 @@ impl AudioEngine {
         };
 
         debug!(
-            "Started {}playback of sound {} on track {}",
+            "Started {}{}playback of sound {} on track {}",
+            if preview { "preview " } else { "" },
             if looped { "looped " } else { "" },
             sound_id.0,
             track_id
         );
         Ok(handle)
     }
-
     /// Play a sound with looping enabled
     pub fn play_loop(&self, sound_id: SoundId) -> Result<TrackHandle, EngineError> {
         self.play_with_loop(sound_id, true)
@@ -1033,7 +1436,7 @@ impl AudioEngine {
             ));
         }
 
-        if !self.inner.sounds.read().contains_key(&sound_id) {
+        if !self.has_sound(sound_id) {
             return Err(EngineError::SoundNotFound(sound_id));
         }
 
@@ -1047,9 +1450,27 @@ impl AudioEngine {
         Ok(())
     }
 
+    /// Multiply the volume of a sound by `ratio` (clamped to `0.0..=1.0`)
+    /// without cutting a fade of a running track short, see
+    /// [`AudioMixer::scale_track_volume`].
+    pub fn scale_sound_volume(&self, sound_id: SoundId, ratio: f32) -> Result<(), EngineError> {
+        if !self.has_sound(sound_id) {
+            return Err(EngineError::SoundNotFound(sound_id));
+        }
+        {
+            let mut volumes = self.inner.sound_volumes.write();
+            let volume = volumes.entry(sound_id).or_insert(1.0);
+            *volume = (*volume * ratio).clamp(0.0, 1.0);
+        }
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.inner.mixer.scale_track_volume(track_id, ratio)?;
+        }
+        Ok(())
+    }
+
     /// Volume most recently set for a sound, or 1.0 when none was ever set.
     pub fn sound_volume(&self, sound_id: SoundId) -> Result<f32, EngineError> {
-        if !self.inner.sounds.read().contains_key(&sound_id) {
+        if !self.has_sound(sound_id) {
             return Err(EngineError::SoundNotFound(sound_id));
         }
 
@@ -1118,6 +1539,194 @@ impl AudioEngine {
         }
 
         Ok(())
+    }
+
+    /// Fade every active track of a sound to `target_gain` (0.0 - 1.0) over
+    /// `duration_ms` along `curve`.
+    ///
+    /// A fade started in the middle of another one continues from the gain the
+    /// track has at that moment, so there is no jump. The tracks keep playing
+    /// (silently for 0.0). The sound's remembered volume is left alone, so a
+    /// fade-out does not mute the next play of the sound.
+    pub fn fade_sound(
+        &self,
+        sound_id: SoundId,
+        target_gain: f32,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.inner
+                .mixer
+                .fade_track_to(track_id, target_gain, duration_ms, curve)?;
+        }
+        Ok(())
+    }
+
+    /// Fade one track to `target_gain`; see [`fade_sound`](Self::fade_sound).
+    pub fn fade_track(
+        &self,
+        track_id: Uuid,
+        target_gain: f32,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .mixer
+            .fade_track_to(track_id, target_gain, duration_ms, curve)?;
+        Ok(())
+    }
+
+    /// Stop every track of a sound after a fade-out of `duration_ms`.
+    ///
+    /// The sound reports as stopped at once while the tail still sounds; the
+    /// mixer drops the tracks once they are silent. Safe to call again during
+    /// the fade-out.
+    pub fn stop_sound_fade(
+        &self,
+        sound_id: SoundId,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.stop_track_fade(track_id, duration_ms, curve)?;
+        }
+        Ok(())
+    }
+
+    /// Stop one track after a fade-out of `duration_ms`.
+    pub fn stop_track_fade(
+        &self,
+        track_id: Uuid,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .mixer
+            .stop_track_with_fade_out(track_id, duration_ms, curve)?;
+        self.inner.active_tracks.write().remove(&track_id);
+        Ok(())
+    }
+
+    /// Stop all playback with a fade-out of `duration_ms`.
+    pub fn stop_all_fade(&self, duration_ms: u32, curve: FadeCurve) -> Result<(), EngineError> {
+        let track_ids: Vec<Uuid> = self.inner.active_tracks.read().keys().copied().collect();
+        for track_id in track_ids {
+            self.stop_track_fade(track_id, duration_ms, curve)?;
+        }
+        Ok(())
+    }
+
+    /// Pause one track after a fade-out of `duration_ms`; the position is kept
+    /// for [`resume_track`](Self::resume_track).
+    pub fn pause_track_fade(
+        &self,
+        track_id: Uuid,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .mixer
+            .pause_track_with_fade_out(track_id, duration_ms, curve)?;
+        Ok(())
+    }
+
+    /// Resume a paused track, fading in over `duration_ms`.
+    pub fn resume_track_fade(
+        &self,
+        track_id: Uuid,
+        duration_ms: u32,
+        curve: FadeCurve,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .mixer
+            .resume_track_with_fade_in(track_id, duration_ms, curve)?;
+        Ok(())
+    }
+
+    /// Pan a sound, -1.0 (left) ..= 1.0 (right), 0.0 = centre (untouched).
+    ///
+    /// Applies to the sound's active tracks and is remembered for tracks
+    /// created later, like the volume. Sources are stereo, so this is a
+    /// balance with an equal-power law (see `mixer::pan_gains`).
+    pub fn set_sound_pan(&self, sound_id: SoundId, pan: f32) -> Result<(), EngineError> {
+        if !(-1.0..=1.0).contains(&pan) {
+            return Err(EngineError::Mixer(
+                crate::audio::mixer::MixerError::InvalidPan(pan),
+            ));
+        }
+        if !self.has_sound(sound_id) {
+            return Err(EngineError::SoundNotFound(sound_id));
+        }
+        self.inner.sound_pans.write().insert(sound_id, pan);
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.inner.mixer.set_track_pan(track_id, pan)?;
+        }
+        Ok(())
+    }
+
+    /// Pan most recently set for a sound, or 0.0.
+    pub fn sound_pan(&self, sound_id: SoundId) -> f32 {
+        self.inner
+            .sound_pans
+            .read()
+            .get(&sound_id)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Put a sound on a mixing bus (default [`Bus::Ambience`]).
+    ///
+    /// Applies to the sound's active tracks and is remembered for tracks
+    /// created later.
+    pub fn set_sound_bus(&self, sound_id: SoundId, bus: Bus) -> Result<(), EngineError> {
+        if !self.has_sound(sound_id) {
+            return Err(EngineError::SoundNotFound(sound_id));
+        }
+        self.inner.sound_buses.write().insert(sound_id, bus);
+        for track_id in self.active_track_ids_of(sound_id) {
+            self.inner.mixer.set_track_bus(track_id, bus)?;
+        }
+        Ok(())
+    }
+
+    /// Bus a sound plays on.
+    pub fn sound_bus(&self, sound_id: SoundId) -> Bus {
+        self.inner
+            .sound_buses
+            .read()
+            .get(&sound_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Set the volume of a bus (0.0 - 1.0); applied before the master limiter.
+    pub fn set_bus_volume(&self, bus: Bus, volume: f32) -> Result<(), EngineError> {
+        self.inner.mixer.set_bus_volume(bus, volume)?;
+        Ok(())
+    }
+
+    /// Volume of a bus.
+    pub fn bus_volume(&self, bus: Bus) -> f32 {
+        self.inner.mixer.bus_volume(bus)
+    }
+
+    /// Duck a bus (turn it down under something else); see [`DuckSettings`].
+    /// With `hold_ms: None` it stays down until
+    /// [`release_duck`](Self::release_duck).
+    pub fn duck_bus(&self, bus: Bus, settings: DuckSettings) {
+        self.inner.mixer.duck_bus(bus, settings);
+    }
+
+    /// Bring a ducked bus back to its full volume.
+    pub fn release_duck(&self, bus: Bus) {
+        self.inner.mixer.release_duck(bus);
+    }
+
+    /// Gain currently applied to a track (volume and fades, before bus, pan
+    /// and master), as of the last mixed block. For tests and meters.
+    pub fn track_gain(&self, track_id: Uuid) -> Result<f32, EngineError> {
+        Ok(self.inner.mixer.track_gain(track_id)?)
     }
 
     /// Set master volume (0.0 - 1.0)
@@ -1189,6 +1798,9 @@ impl AudioEngine {
 
     /// Get a loaded sound's metadata
     pub fn sound_info(&self, sound_id: SoundId) -> Result<(f32, u32, u32), EngineError> {
+        if let Some(stream) = self.inner.stream_sounds.read().get(&sound_id) {
+            return Ok((stream.duration_secs, TARGET_SAMPLE_RATE, TARGET_CHANNELS));
+        }
         let sounds = self.inner.sounds.read();
         let audio = sounds
             .get(&sound_id)
@@ -1198,14 +1810,19 @@ impl AudioEngine {
 
     /// List all loaded sound IDs
     pub fn list_sounds(&self) -> Vec<SoundId> {
-        self.inner.sounds.read().keys().copied().collect()
+        let mut ids: Vec<SoundId> = self.inner.sounds.read().keys().copied().collect();
+        ids.extend(self.inner.stream_sounds.read().keys().copied());
+        ids
     }
 
     /// Remove a sound from memory (stops any playing tracks first)
     pub fn unload_sound(&self, sound_id: SoundId) -> Result<(), EngineError> {
         self.stop_sound(sound_id)?;
         self.inner.sounds.write().remove(&sound_id);
+        self.inner.stream_sounds.write().remove(&sound_id);
         self.inner.sound_volumes.write().remove(&sound_id);
+        self.inner.sound_pans.write().remove(&sound_id);
+        self.inner.sound_buses.write().remove(&sound_id);
         Ok(())
     }
 
@@ -1217,7 +1834,7 @@ impl AudioEngine {
     /// Get mixer statistics
     pub fn stats(&self) -> EngineStats {
         EngineStats {
-            loaded_sounds: self.inner.sounds.read().len(),
+            loaded_sounds: self.inner.sounds.read().len() + self.inner.stream_sounds.read().len(),
             active_tracks: self.inner.active_tracks.read().len(),
             mixer_tracks: self.inner.mixer.track_count(),
             running: self.inner.running.load(Ordering::Acquire),
@@ -1229,10 +1846,46 @@ impl AudioEngine {
     }
 }
 
-/// Rate to try first for a stereo f32 device that cannot run at 48 kHz.
-///
-/// The device's own default rate is preferred when the range allows it; the
-/// closest in-range rate to 48 kHz is the fallback.
+/// Which output a cpal stream feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamRole {
+    /// The main output: mixes, publishes to the network, plays previews unless a
+    /// second device has them.
+    Main,
+    /// The headphone device: plays only the previews.
+    Preview,
+}
+
+/// Devices of the host with their names (parallel lists).
+type EnumeratedDevices = (Vec<cpal::Device>, Vec<devices::OutputDeviceInfo>);
+
+/// A stream built on a device, not yet playing.
+struct OpenedStream {
+    stream: cpal::Stream,
+    device_name: String,
+    adapter: DeviceAdapter,
+    sample_format: SampleFormat,
+    /// Why the device format differs from the mix, when it does.
+    reason: Option<String>,
+}
+
+/// Why a stream could not be built, with what is known about the attempt.
+struct OpenFailure {
+    device_name: String,
+    sample_rate: u32,
+    channels: u16,
+    sample_format: String,
+    error: EngineError,
+}
+
+/// Join two optional status notes with `"; "`.
+fn join_reasons(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    }
+}
+
 /// What the `[audio]` section asks of the local output device.
 ///
 /// The mix and the network stream are always 48 kHz stereo (that is the wire
@@ -1310,6 +1963,10 @@ impl DevicePrefs {
     }
 }
 
+/// Rate to try first for a stereo f32 device that cannot run at 48 kHz.
+///
+/// The device's own default rate is preferred when the range allows it; the
+/// closest in-range rate to 48 kHz is the fallback.
 fn preferred_rate(
     range: &SupportedStreamConfigRange,
     device_default: Option<&SupportedStreamConfig>,
@@ -1430,6 +2087,17 @@ trait MixWriter: cpal::SizedSample + FromSample<f32> {
         data: &mut [Self],
         adapter: DeviceAdapter,
     ) -> bool;
+
+    /// Fill `data` with the previews alone, for the headphone device. Nothing is
+    /// published: players never hear previews.
+    fn mix_preview(
+        mixer: &AudioMixer,
+        resampler: &mut StreamResampler,
+        data: &mut [Self],
+        adapter: DeviceAdapter,
+    ) -> bool {
+        resampler.render(data, adapter, |fresh| mixer.mix_preview_into(fresh))
+    }
 }
 
 impl MixWriter for f32 {
@@ -1446,7 +2114,9 @@ impl MixWriter for f32 {
             if playing {
                 mixer.publish_broadcast(data);
             }
-            return playing;
+            // Previews are added after the broadcast copy was taken.
+            let previewing = mixer.mix_local_into(data);
+            return playing || previewing;
         }
 
         converted_mix(mixer, resampler, data, adapter)
@@ -1491,8 +2161,44 @@ where
         if playing {
             mixer.publish_broadcast(fresh);
         }
-        playing
+        // Previews are added after the broadcast copy was taken.
+        let previewing = mixer.mix_local_into(fresh);
+        playing || previewing
     })
+}
+
+/// Build the stream for the sample format the device was opened with.
+#[allow(clippy::too_many_arguments)]
+fn build_stream_for_format(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    adapter: DeviceAdapter,
+    mixer: Arc<AudioMixer>,
+    running: Arc<AtomicBool>,
+    status: Arc<parking_lot::RwLock<LocalOutputStatus>>,
+    role: StreamRole,
+) -> Result<cpal::Stream, EngineError> {
+    macro_rules! build {
+        ($ty:ty) => {
+            build_adapted_stream::<$ty>(device, config, adapter, mixer, running, status, role)
+        };
+    }
+    match sample_format {
+        SampleFormat::F32 => build!(f32),
+        SampleFormat::I16 => build!(i16),
+        SampleFormat::U16 => build!(u16),
+        SampleFormat::I32 => build!(i32),
+        SampleFormat::I8 => build!(i8),
+        SampleFormat::U8 => build!(u8),
+        SampleFormat::I64 => build!(i64),
+        SampleFormat::U64 => build!(u64),
+        SampleFormat::U32 => build!(u32),
+        SampleFormat::F64 => build!(f64),
+        other => Err(EngineError::UnsupportedFormat(format!(
+            "device sample format {other} is not supported by this build"
+        ))),
+    }
 }
 
 /// Build the output stream for one device sample format.
@@ -1507,12 +2213,14 @@ fn build_adapted_stream<T>(
     mixer: Arc<AudioMixer>,
     running: Arc<AtomicBool>,
     status: Arc<parking_lot::RwLock<LocalOutputStatus>>,
+    role: StreamRole,
 ) -> Result<cpal::Stream, EngineError>
 where
     T: MixWriter,
 {
     let build = |config: &StreamConfig| -> Result<cpal::Stream, cpal::BuildStreamError> {
         let mixer = Arc::clone(&mixer);
+        let error_mixer = Arc::clone(&mixer);
         let running = Arc::clone(&running);
         let status = Arc::clone(&status);
 
@@ -1530,13 +2238,26 @@ where
                     return;
                 }
 
-                T::mix_and_publish(&mixer, &mut resampler, data, adapter);
+                match role {
+                    StreamRole::Main => {
+                        T::mix_and_publish(&mixer, &mut resampler, data, adapter);
+                    }
+                    StreamRole::Preview => {
+                        T::mix_preview(&mixer, &mut resampler, data, adapter);
+                    }
+                }
             },
             move |err| {
                 // A stream error ends local audio for good: record it, so the UI
                 // can show it instead of the app going quietly mute.
-                let message = err.to_string();
-                error!("Audio stream error: {message}");
+                let mut message = err.to_string();
+                error!("Audio stream error ({role:?}): {message}");
+                if role == StreamRole::Preview {
+                    // The headphones went away: hand previews back to the main
+                    // output so they are not silently lost.
+                    error_mixer.set_preview_external(false);
+                    message = format!("{message}; previews play on the main output");
+                }
                 let mut guard = status.write();
                 guard.reason = Some(message.clone());
                 guard.state = LocalOutputState::Failed(message);
@@ -1602,6 +2323,21 @@ impl TrackHandle {
     /// Check if this track is playing
     pub fn is_playing(&self) -> Result<bool, EngineError> {
         self.engine.is_track_playing(self.track_id)
+    }
+
+    /// Playback position in milliseconds
+    pub fn position_ms(&self) -> Result<u64, EngineError> {
+        Ok(self.engine.mixer.track_position_ms(self.track_id)?)
+    }
+
+    /// Jump to a position in milliseconds
+    pub fn seek_ms(&self, ms: u64) -> Result<(), EngineError> {
+        Ok(self.engine.mixer.seek_track_ms(self.track_id, ms)?)
+    }
+
+    /// Length of the track in milliseconds, when known
+    pub fn duration_ms(&self) -> Result<Option<u64>, EngineError> {
+        Ok(self.engine.mixer.track_duration_ms(self.track_id)?)
     }
 
     /// Get the sound ID for this track
@@ -1741,6 +2477,7 @@ mod tests {
             sample_rate: 1,
             channels: 0,
             master_volume: 0.8,
+            ..crate::config::AudioConfig::default()
         };
         assert_eq!(
             DevicePrefs::from_audio_config(&audio),
@@ -2196,5 +2933,269 @@ mod tests {
         assert_eq!(status.channels, 2);
         assert_eq!(status.sample_format, "i16");
         assert!(status.summary().contains("failed"));
+    }
+}
+
+/// Facade tests for fades, pan, buses and previews.
+#[cfg(test)]
+mod mixer_facade_tests {
+    use super::*;
+
+    fn engine_with_sound(value: f32) -> (AudioEngine, SoundId) {
+        let engine = AudioEngine::new().unwrap();
+        let sound =
+            engine.load_sound_from_data(DecodedAudio::new(vec![value; 48_000 * 2], 48_000, 2));
+        (engine, sound)
+    }
+
+    /// One device callback: mix, publish, add previews. Returns the device buffer.
+    fn callback(engine: &AudioEngine, frames: usize) -> Vec<f32> {
+        let mixer = &engine.inner.mixer;
+        let mut out = vec![0.0f32; frames * 2];
+        if mixer.mix_into(&mut out) {
+            mixer.publish_broadcast(&out);
+        }
+        mixer.mix_local_into(&mut out);
+        out
+    }
+
+    #[test]
+    fn play_sound_fade_ramps_up_to_the_sound_volume() {
+        let (engine, sound) = engine_with_sound(0.5);
+        engine.set_sound_volume(sound, 0.8).unwrap();
+        let handle = engine
+            .play_sound_fade(sound, true, 100, FadeCurve::Linear)
+            .unwrap();
+        let out = callback(&engine, 480);
+        assert!(out[0] < 0.01);
+        assert!(engine.track_gain(handle.track_id()).unwrap() < 0.8);
+        callback(&engine, 4320);
+        assert_eq!(engine.track_gain(handle.track_id()).unwrap(), 0.8);
+    }
+
+    #[test]
+    fn stop_sound_fade_reports_stopped_then_drops_the_track() {
+        let (engine, sound) = engine_with_sound(0.5);
+        let handle = engine.play_loop(sound).unwrap();
+        callback(&engine, 480);
+        engine
+            .stop_sound_fade(sound, 100, FadeCurve::EqualPower)
+            .unwrap();
+        assert!(!engine.is_sound_playing(sound).unwrap());
+        // Once stopped it is no longer registered, so a repeat is a no-op.
+        engine
+            .stop_sound_fade(sound, 100, FadeCurve::EqualPower)
+            .unwrap();
+        let out = callback(&engine, 2400);
+        assert!(out[0] > 0.3, "the tail is still audible");
+        callback(&engine, 2400);
+        assert_eq!(engine.inner.mixer.prune_finished(), 1);
+        assert!(!engine.inner.mixer.has_track(handle.track_id()));
+    }
+
+    #[test]
+    fn fade_sound_does_not_change_the_remembered_volume() {
+        let (engine, sound) = engine_with_sound(0.5);
+        let handle = engine.play_loop(sound).unwrap();
+        engine
+            .fade_sound(sound, 0.0, 100, FadeCurve::Linear)
+            .unwrap();
+        callback(&engine, 4800);
+        assert_eq!(engine.track_gain(handle.track_id()).unwrap(), 0.0);
+        assert_eq!(engine.sound_volume(sound).unwrap(), 1.0);
+        assert!(engine
+            .fade_sound(sound, 1.5, 100, FadeCurve::Linear)
+            .is_err());
+    }
+
+    #[test]
+    fn sound_pan_and_bus_apply_to_playing_and_later_tracks() {
+        let (engine, sound) = engine_with_sound(0.5);
+        let first = engine.play_loop(sound).unwrap();
+        engine.set_sound_pan(sound, -1.0).unwrap();
+        engine.set_sound_bus(sound, Bus::Music).unwrap();
+        callback(&engine, 1000);
+        let out = callback(&engine, 480);
+        assert_eq!((out[0], out[1]), (0.5, 0.0));
+        assert_eq!(engine.sound_pan(sound), -1.0);
+        assert_eq!(engine.sound_bus(sound), Bus::Music);
+
+        let second = engine.play(sound).unwrap();
+        let mixer = &engine.inner.mixer;
+        assert_eq!(mixer.track_pan(second.track_id()).unwrap(), -1.0);
+        assert_eq!(mixer.track_bus(second.track_id()).unwrap(), Bus::Music);
+        assert_eq!(mixer.track_bus(first.track_id()).unwrap(), Bus::Music);
+
+        assert!(engine.set_sound_pan(sound, 2.0).is_err());
+        assert!(engine.set_sound_pan(SoundId::new(), 0.0).is_err());
+    }
+
+    #[test]
+    fn bus_volume_and_ducking_through_the_facade() {
+        let (engine, sound) = engine_with_sound(0.4);
+        engine.set_sound_bus(sound, Bus::Music).unwrap();
+        engine.play_loop(sound).unwrap();
+        callback(&engine, 480);
+
+        engine.set_bus_volume(Bus::Music, 0.5).unwrap();
+        assert_eq!(engine.bus_volume(Bus::Music), 0.5);
+        callback(&engine, 960);
+        assert!((callback(&engine, 480)[0] - 0.2).abs() < 1e-6);
+
+        engine.duck_bus(
+            Bus::Music,
+            DuckSettings {
+                target: 0.5,
+                attack_ms: 20,
+                release_ms: 20,
+                hold_ms: None,
+            },
+        );
+        callback(&engine, 4800);
+        assert!((callback(&engine, 480)[0] - 0.1).abs() < 1e-6);
+        engine.release_duck(Bus::Music);
+        callback(&engine, 4800);
+        assert!((callback(&engine, 480)[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn preview_is_heard_locally_but_not_broadcast() {
+        let (engine, sound) = engine_with_sound(0.5);
+        let rx = engine.broadcast_output_receiver();
+        let preview = engine.play_preview(sound, true).unwrap();
+
+        let out = callback(&engine, 480);
+        assert!(out.iter().all(|s| (*s - 0.5).abs() < 1e-6));
+        assert!(rx.try_recv().is_err(), "nothing for the players");
+        // Not registered with the sound: stop_sound / is_sound_playing ignore it.
+        assert!(!engine.is_sound_playing(sound).unwrap());
+
+        // A real track alongside: the broadcast carries only that one, the
+        // device hears both (limited to the ceiling).
+        engine.play_loop(sound).unwrap();
+        let out = callback(&engine, 480);
+        assert!((out[0] - 0.97).abs() < 1e-6);
+        let published = rx.try_recv().unwrap();
+        assert!(published.buffer.iter().all(|s| (*s - 0.5).abs() < 1e-6));
+
+        preview.stop().unwrap();
+        callback(&engine, 960);
+    }
+
+    #[test]
+    fn device_callback_path_keeps_previews_out_of_the_broadcast() {
+        use super::device_adapter::DeviceAdapter;
+        use cpal::Sample;
+        let (engine, sound) = engine_with_sound(0.25);
+        engine.play_preview(sound, true).unwrap();
+        let rx = engine.broadcast_output_receiver();
+
+        // Converted (44.1 kHz u16) and identity (48 kHz f32) paths.
+        let mut resampler = StreamResampler::new();
+        let mut dev = vec![0u16; 441 * 2];
+        let playing = <u16 as MixWriter>::mix_and_publish(
+            &engine.inner.mixer,
+            &mut resampler,
+            &mut dev,
+            DeviceAdapter::new(44_100, 2),
+        );
+        assert!(playing, "the preview keeps the callback marked as playing");
+        assert_eq!(dev[0], u16::from_sample(0.25f32), "audible on the device");
+
+        let mut resampler = StreamResampler::new();
+        let mut dev = vec![0.0f32; 480 * 2];
+        <f32 as MixWriter>::mix_and_publish(
+            &engine.inner.mixer,
+            &mut resampler,
+            &mut dev,
+            DeviceAdapter::new(48_000, 2),
+        );
+        assert!(dev.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn short_sound(engine: &AudioEngine, frames: usize) -> SoundId {
+        engine.load_sound_from_data(DecodedAudio::new(vec![0.25; frames * 2], 48_000, 2))
+    }
+
+    fn mix(engine: &AudioEngine, frames: usize) {
+        callback(engine, frames);
+    }
+
+    /// The track ended, then another `play` pruned it from the engine before
+    /// the player's next tick: the player must still move on to the next
+    /// track instead of stopping.
+    #[test]
+    fn a_pruned_ended_track_still_advances_the_playlist() {
+        let engine = AudioEngine::new().unwrap();
+        let (a, b, sfx) = (
+            short_sound(&engine, 2_000),
+            short_sound(&engine, 20_000),
+            short_sound(&engine, 500),
+        );
+        let catalog = vec![
+            crate::audio::director::CatalogSound::new("a", a),
+            crate::audio::director::CatalogSound::new("b", b),
+            crate::audio::director::CatalogSound::new("sfx", sfx),
+        ];
+        let config = crate::config::PlaylistConfig {
+            id: "pl".into(),
+            name: "pl".into(),
+            items: vec!["a".into(), "b".into()],
+            shuffle: false,
+            repeat: crate::config::RepeatMode::Off,
+            crossfade_ms: 0,
+            bus: crate::config::Bus::Music,
+        };
+        let mut player = crate::audio::playlist::PlaylistPlayer::with_seed(1);
+        player.start(&engine, &catalog, config, 0).unwrap();
+        assert_eq!(player.current_sound(), Some(a));
+
+        // The first track plays out ...
+        mix(&engine, 4_000);
+        // ... and a stinger starts before the player has ticked: that play
+        // prunes the finished track out of the engine.
+        engine.play(sfx).unwrap();
+        assert!(
+            !engine.inner.active_tracks.read().values().any(|s| *s == a),
+            "the ended track is gone"
+        );
+
+        player.tick(&engine, &catalog, std::time::Instant::now());
+        assert_eq!(
+            player.status(),
+            crate::audio::playlist::PlaylistStatus::Playing
+        );
+        assert_eq!(player.current_sound(), Some(b));
+    }
+
+    /// A track stopped by somebody else (not ended) still halts the player.
+    #[test]
+    fn a_stopped_track_does_not_count_as_ended() {
+        let engine = AudioEngine::new().unwrap();
+        let (a, b) = (short_sound(&engine, 480_000), short_sound(&engine, 480_000));
+        let catalog = vec![
+            crate::audio::director::CatalogSound::new("a", a),
+            crate::audio::director::CatalogSound::new("b", b),
+        ];
+        let config = crate::config::PlaylistConfig {
+            id: "pl".into(),
+            name: "pl".into(),
+            items: vec!["a".into(), "b".into()],
+            shuffle: false,
+            repeat: crate::config::RepeatMode::Off,
+            crossfade_ms: 0,
+            bus: crate::config::Bus::Music,
+        };
+        let mut player = crate::audio::playlist::PlaylistPlayer::with_seed(1);
+        player.start(&engine, &catalog, config, 0).unwrap();
+        mix(&engine, 1_000);
+        engine.stop_sound(a).unwrap();
+        mix(&engine, 1_000);
+        player.tick(&engine, &catalog, std::time::Instant::now());
+        assert_ne!(
+            player.status(),
+            crate::audio::playlist::PlaylistStatus::Playing
+        );
     }
 }

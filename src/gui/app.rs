@@ -1,19 +1,50 @@
 //! GUI application state and logic
 
-use crate::audio::{AudioDecoder, AudioEngine, DecodedAudio, LocalOutputStatus, SoundId};
+use crate::audio::{
+    AudioDecoder, AudioEngine, DecodedAudio, Director, DuckMode, LocalOutputStatus, MixControl,
+    SoundId,
+};
 use crate::gui::groups::{GroupFilter, GroupId, Library};
 use crate::gui::types::{
     AppState, AudioCommand, ServerCommand, ServerStatus as AppServerStatus, SoundInfo,
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use egui::Context;
-use rfd::FileDialog;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+/// Slots of the audio command channel that library loads never use, so an
+/// operator command always finds room even in the middle of a library restore.
+const LOAD_HEADROOM: usize = 12;
+
+/// Library loads handed to the audio thread per frame.
+const LOAD_BATCH: usize = 8;
+
+/// Most operator commands parked while the audio command channel is full.
+const USER_QUEUE_LIMIT: usize = 256;
+
+/// Park `cmd` in the retry queue, evicting the oldest non-stop-all command
+/// when the queue is at its limit. A stop-all is never evicted; a non-stop-all
+/// newcomer is dropped if the queue holds nothing but stop-alls.
+fn push_user_command(queue: &mut VecDeque<AudioCommand>, cmd: AudioCommand) {
+    if queue.len() >= USER_QUEUE_LIMIT {
+        let evict = queue
+            .iter()
+            .position(|c| !matches!(c, AudioCommand::StopAll { .. }));
+        match evict {
+            Some(i) => {
+                queue.remove(i);
+            }
+            None if !matches!(cmd, AudioCommand::StopAll { .. }) => return,
+            None => {}
+        }
+    }
+    queue.push_back(cmd);
+}
 
 /// Sound entry in the library (for GUI display)
 #[derive(Debug, Clone)]
@@ -57,6 +88,23 @@ pub enum Dialog {
     /// its validation error; the download itself runs on a worker thread and
     /// reports into [`SoundSharedApp::youtube_result_rx`].
     AddYouTube { url: String, error: Option<String> },
+    /// Save the mix that plays now as a scene (name field and its error).
+    SaveMixAsScene { name: String, error: Option<String> },
+    /// Create or edit a scene (see [`crate::gui::scenes`]).
+    EditScene(Box<crate::gui::scenes::SceneForm>),
+    /// Confirm deletion of a scene.
+    DeleteScene { id: crate::gui::groups::SceneId },
+    /// Playlist manager (see [`crate::gui::music`]); its in-progress state
+    /// lives in [`SoundSharedApp::music`].
+    Music,
+    /// Emitters and music layer of one scene ("Emitters & music…").
+    EditEmitters(crate::gui::groups::SceneId),
+    /// Hotkey bindings. The editor state lives in
+    /// [`ConsoleExtras`](crate::gui::settings_extras::ConsoleExtras).
+    Hotkeys,
+    /// Session timers (see [`crate::gui::timeline`]); the editor state lives
+    /// in [`ConsoleExtras`](crate::gui::settings_extras::ConsoleExtras).
+    Timers,
 }
 
 /// How long the library may stay unsaved before it is flushed to disk.
@@ -125,23 +173,27 @@ pub struct ServerState {
 /// Main GUI application state
 pub struct SoundSharedApp {
     // Reference to shared app state
-    app_state: AppState,
+    pub(crate) app_state: AppState,
 
     // Audio engine (must stay on main thread due to cpal::Stream not being Send)
-    audio_engine: Arc<Mutex<Option<AudioEngine>>>,
+    pub(crate) audio_engine: Arc<Mutex<Option<AudioEngine>>>,
 
     // Audio command receiver (for processing commands on main thread)
     audio_cmd_rx: Receiver<AudioCommand>,
 
+    /// The control core shared with the headless `/control` page: scenes,
+    /// stingers and every playback command go through it.
+    pub(crate) director: Director,
+
     // Local sound cache (synced from audio engine)
-    sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
-    sound_order: Arc<Mutex<Vec<SoundId>>>,
+    pub(crate) sounds: Arc<Mutex<HashMap<SoundId, SoundEntry>>>,
+    pub(crate) sound_order: Arc<Mutex<Vec<SoundId>>>,
 
     // Master volume cache
-    master_volume: Arc<Mutex<f32>>,
+    pub(crate) master_volume: Arc<Mutex<f32>>,
 
     // Server state cache
-    server_state: Arc<Mutex<ServerState>>,
+    pub(crate) server_state: Arc<Mutex<ServerState>>,
 
     // UI feedback
     copied_feedback: Arc<Mutex<bool>>,
@@ -155,22 +207,32 @@ pub struct SoundSharedApp {
     /// every start.
     pending_loads: VecDeque<PathBuf>,
 
+    /// Operator commands (play, stop, stop-all, volume...) that found the audio
+    /// command channel full. They are re-sent first on every frame, before any
+    /// library load, in the order they were issued. See
+    /// [`Self::send_user_command`].
+    pending_user: Mutex<VecDeque<AudioCommand>>,
+
     // Channel for receiving server status updates
     server_status_rx: Receiver<AppServerStatus>,
     server_status_tx: Sender<AppServerStatus>,
 
     // Sound library + groups (the operator's saved collection)
-    library: Library,
+    pub(crate) library: Library,
+    /// Search, tag filter, dialogs and previews of the library panel.
+    pub(crate) lib_ui: crate::gui::library_ui::LibraryUi,
+    /// Profile menu and dialogs.
+    pub(crate) profiles_ui: crate::gui::profiles_ui::ProfilesUi,
     /// Which group the library panel is filtered to.
     group_filter: GroupFilter,
     /// Name shown in the group-name field of the currently open modal.
-    dialog: Dialog,
+    pub(crate) dialog: Dialog,
     /// Set when the library changed and needs writing to config.toml.
-    library_dirty: bool,
+    pub(crate) library_dirty: bool,
     /// Last time the library was flushed to disk.
     last_persist: Instant,
     /// Master volume stashed while muted.
-    muted: Option<f32>,
+    pub(crate) muted: Option<f32>,
 
     /// Last known state of the desktop output (`Running`, `Headless`, `Failed`).
     ///
@@ -211,16 +273,91 @@ pub struct SoundSharedApp {
     youtube_busy: bool,
     /// MASTER OUTPUT meter position (0..1, dB scale with peak decay).
     output_meter: f32,
+    /// State of the scene deck: pending replies, transition display, notices.
+    pub(crate) scenes: crate::gui::scenes::SceneUi,
+    /// Music panel, playlist manager and emitters dialog state.
+    pub(crate) music: crate::gui::music::MusicUi,
+    /// Hotkeys, bus faders / ducking / normalization and the game-master link
+    /// state (see `hotkeys_ui`, `settings_extras`, `server_panel`).
+    pub(crate) extras: crate::gui::settings_extras::ConsoleExtras,
+    /// The phone panel's end of the console, when this process serves it.
+    pub(crate) gm: Option<crate::gui::gm_bridge::GmBridge>,
+    /// REC button of the top bar (session recording).
+    pub(crate) recorder: crate::gui::recorder_ui::RecorderUi,
+    /// First-run wizard card.
+    pub(crate) onboarding: crate::gui::onboarding::OnboardingUi,
 }
 
-/// One file for the background decoder: the path and where to report.
-type DecodeJob = (String, Sender<anyhow::Result<SoundInfo>>);
-/// A finished decode: the job plus the decoded PCM (or the error text).
+/// Hand the Director the current scenes and the loaded library sounds.
+pub(crate) fn sync_director(
+    director: &mut Director,
+    library: &Library,
+    sounds: &Mutex<HashMap<SoundId, SoundEntry>>,
+) {
+    let by_path: HashMap<PathBuf, SoundId> = sounds
+        .lock()
+        .unwrap()
+        .values()
+        .map(|entry| (entry.path.clone(), entry.id))
+        .collect();
+    crate::audio::director::sync_from_library(director, library, |path| by_path.get(path).copied());
+}
+
+/// Copy "is it playing" from the engine into the rows: scenes and delayed
+/// starts start sounds without going through the row's Play button.
+pub(crate) fn mirror_playing(sounds: &Mutex<HashMap<SoundId, SoundEntry>>, engine: &AudioEngine) {
+    for entry in sounds.lock().unwrap().values_mut() {
+        entry.playing = engine.is_sound_playing(entry.id).unwrap_or(false);
+    }
+}
+
+/// One file for the background decoder: the path, where to report, and the
+/// engine's streaming threshold in seconds (0 disables streaming).
+type DecodeJob = (String, Sender<anyhow::Result<SoundInfo>>, u32);
+/// A finished decode: the job plus how the file is to be held (or the error).
 type DecodedJob = (
     String,
     Sender<anyhow::Result<SoundInfo>>,
-    Result<DecodedAudio, String>,
+    Result<LoadedFile, String>,
 );
+
+/// How the decoder worker prepared a file.
+enum LoadedFile {
+    /// A short file, fully decoded into memory.
+    Pcm(DecodedAudio),
+    /// A long file: only its header was read, playback decodes it on the fly.
+    Stream {
+        meta: crate::audio::decoder::TrackMeta,
+        duration_secs: Option<f64>,
+    },
+}
+
+/// Prepare a file for the engine, as [`AudioEngine::load_sound`] does: a file
+/// longer than `threshold_secs` is only probed (never decoded into RAM, which
+/// would cost hundreds of MB for a long music track and block the single
+/// decoder queue); a short one is fully decoded.
+fn prepare_file(path: &str, threshold_secs: u32) -> Result<LoadedFile, String> {
+    if threshold_secs > 0 {
+        // A file the probe cannot read falls through to the full decode,
+        // which reports the real error.
+        if let Ok(probe) = AudioDecoder::probe_file(path) {
+            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if crate::audio::stream_source::should_stream(
+                probe.duration_secs,
+                bytes,
+                threshold_secs,
+            ) {
+                return Ok(LoadedFile::Stream {
+                    meta: probe.meta,
+                    duration_secs: probe.duration_secs,
+                });
+            }
+        }
+    }
+    AudioDecoder::decode_file(path)
+        .map(LoadedFile::Pcm)
+        .map_err(|e| e.to_string())
+}
 
 /// One finished YouTube download: the file ready for the decoder, or the reason.
 type YouTubeJob = Result<PathBuf, String>;
@@ -236,8 +373,8 @@ fn spawn_decoder(ctx: egui::Context) -> (Sender<DecodeJob>, Receiver<DecodedJob>
     std::thread::Builder::new()
         .name("decoder".into())
         .spawn(move || {
-            for (path, response) in job_rx {
-                let result = AudioDecoder::decode_file(&path).map_err(|e| e.to_string());
+            for (path, response, threshold) in job_rx {
+                let result = prepare_file(&path, threshold);
                 if done_tx.send((path, response, result)).is_err() {
                     break;
                 }
@@ -256,7 +393,17 @@ impl SoundSharedApp {
         audio_cmd_rx: Receiver<AudioCommand>,
         cc: &eframe::CreationContext<'_>,
     ) -> Self {
-        let (decode_tx, decoded_rx) = spawn_decoder(cc.egui_ctx.clone());
+        Self::with_context(&cc.egui_ctx, app_state, audio_engine, audio_cmd_rx)
+    }
+
+    /// [`SoundSharedApp::new`] from a bare egui context (headless tests).
+    pub fn with_context(
+        ctx: &egui::Context,
+        app_state: AppState,
+        audio_engine: Arc<Mutex<Option<AudioEngine>>>,
+        audio_cmd_rx: Receiver<AudioCommand>,
+    ) -> Self {
+        let (decode_tx, decoded_rx) = spawn_decoder(ctx.clone());
         // Create channels for receiving updates from background threads
         let (server_status_tx, server_status_rx) = bounded(1);
         let (bind_result_tx, bind_result_rx) = bounded(4);
@@ -268,17 +415,23 @@ impl SoundSharedApp {
             let config = app_state.config.lock().unwrap();
             (
                 config.audio.master_volume,
-                Library::from_config(&config.library),
+                Library::from_full_config(&config),
                 config.server.host.clone(),
                 config.server.port,
                 crate::gui::motion::reduced_motion(config.gui.reduce_motion),
             )
         };
 
+        // Hotkeys: the bindings come with the library; the system-wide service
+        // starts here because eframe creates the app on the main thread.
+        let extras = crate::gui::settings_extras::ConsoleExtras::new(ctx, &app_state, &library);
+        let gm_link = app_state.gm_panel.clone();
+
         let mut app = Self {
             app_state,
             audio_engine,
             audio_cmd_rx,
+            director: Director::new(),
             sounds: Arc::new(Mutex::new(HashMap::new())),
             sound_order: Arc::new(Mutex::new(Vec::new())),
             master_volume: Arc::new(Mutex::new(initial_master_vol)),
@@ -294,9 +447,12 @@ impl SoundSharedApp {
             copied_feedback: Arc::new(Mutex::new(false)),
             copied_feedback_timer: Arc::new(Mutex::new(None)),
             pending_loads: VecDeque::new(),
+            pending_user: Mutex::new(VecDeque::new()),
             server_status_rx,
             server_status_tx,
             library,
+            lib_ui: crate::gui::library_ui::LibraryUi::new(ctx.clone()),
+            profiles_ui: Default::default(),
             group_filter: GroupFilter::All,
             dialog: Dialog::None,
             library_dirty: false,
@@ -316,6 +472,12 @@ impl SoundSharedApp {
             youtube_status: Arc::new(Mutex::new(String::new())),
             youtube_busy: false,
             output_meter: 0.0,
+            scenes: Default::default(),
+            music: Default::default(),
+            extras,
+            gm: gm_link.map(|link| crate::gui::gm_bridge::GmBridge::attach(ctx, link)),
+            recorder: crate::gui::recorder_ui::RecorderUi::new(ctx.clone()),
+            onboarding: Default::default(),
         };
 
         // Request initial server status
@@ -331,24 +493,93 @@ impl SoundSharedApp {
 
     /// Queue a sound file to be handed to the audio engine.
     ///
-    /// The command is dropped in immediately when the channel has room; a full
-    /// channel (the startup restore of a large library) parks the path in
-    /// [`Self::pending_loads`] and [`Self::pump_pending_loads`] feeds it as soon
-    /// as the main thread has drained a slot.
+    /// Loads are bulk traffic and must never crowd out operator commands, so
+    /// they are sent only while the channel keeps [`LOAD_HEADROOM`] free slots.
+    /// Otherwise (the startup restore of a large library, a big folder import)
+    /// the path waits in [`Self::pending_loads`] and
+    /// [`Self::pump_pending_loads`] feeds it in small batches, frame by frame.
     pub fn request_load_sound(&mut self, path: PathBuf) {
+        if !self.pending_loads.is_empty() || !self.load_has_room() {
+            self.pending_loads.push_back(path);
+            return;
+        }
+        if let Err(path) = self.try_send_load(path) {
+            self.pending_loads.push_back(path);
+        }
+    }
+
+    /// True while the audio command channel has room for a load and still
+    /// leaves [`LOAD_HEADROOM`] slots for operator commands.
+    fn load_has_room(&self) -> bool {
+        let tx = &self.app_state.audio_cmd_tx;
+        tx.capacity()
+            .is_none_or(|cap| tx.len() + LOAD_HEADROOM < cap)
+    }
+
+    /// Send one `LoadSound`; hands the path back when the channel is full.
+    fn try_send_load(&self, path: PathBuf) -> Result<(), PathBuf> {
         let (response_tx, response_rx) = bounded(1);
         let cmd = AudioCommand::LoadSound {
             path: path.to_string_lossy().to_string(),
             response: response_tx,
         };
-
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            debug!("Load channel full, queueing {}: {}", path.display(), e);
-            self.pending_loads.push_back(path);
-            return;
+        match self.app_state.audio_cmd_tx.try_send(cmd) {
+            Ok(()) => {
+                self.await_load_response(response_rx);
+                Ok(())
+            }
+            Err(e) => {
+                debug!("Load channel full, queueing {}: {}", path.display(), e);
+                Err(path)
+            }
         }
+    }
 
-        self.await_load_response(response_rx);
+    /// Send an operator command (play, stop, stop-all, volume...) to the audio
+    /// thread without ever blocking the GUI and without silently dropping it.
+    ///
+    /// A full channel parks the command in [`Self::pending_user`]; the queue is
+    /// drained at the start of every frame ([`Self::pump_user_commands`]). While
+    /// anything is parked, newer commands queue behind it so the order is kept.
+    /// The queue is bounded by [`USER_QUEUE_LIMIT`]; when it overflows the
+    /// oldest command that is not a stop-all goes first, and a stop-all is
+    /// never discarded. Returns false only when the receiver is gone.
+    fn send_user_command(&self, cmd: AudioCommand, what: &str) -> bool {
+        let mut queue = self.pending_user.lock().unwrap();
+        let cmd = if queue.is_empty() {
+            match self.app_state.audio_cmd_tx.try_send(cmd) {
+                Ok(()) => return true,
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    error!("Failed to send {what} command: audio thread is gone");
+                    return false;
+                }
+                Err(crossbeam_channel::TrySendError::Full(cmd)) => cmd,
+            }
+        } else {
+            cmd
+        };
+        debug!("Audio command channel full, queueing {what}");
+        push_user_command(&mut queue, cmd);
+        true
+    }
+
+    /// Re-send the parked operator commands, oldest first, while the channel
+    /// has room.
+    fn pump_user_commands(&self) {
+        let mut queue = self.pending_user.lock().unwrap();
+        while let Some(cmd) = queue.pop_front() {
+            match self.app_state.audio_cmd_tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(cmd)) => {
+                    queue.push_front(cmd);
+                    break;
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    queue.clear();
+                    break;
+                }
+            }
+        }
     }
 
     /// Report the outcome of one `LoadSound` command without blocking the GUI.
@@ -365,25 +596,22 @@ impl SoundSharedApp {
         });
     }
 
-    /// Feed queued library files to the engine while the channel has room.
+    /// Feed queued library files to the engine, at most [`LOAD_BATCH`] per
+    /// call and only while the channel keeps its headroom for operator
+    /// commands.
     fn pump_pending_loads(&mut self) {
-        while let Some(path) = self.pending_loads.pop_front() {
-            let (response_tx, response_rx) = bounded(1);
-            let cmd = AudioCommand::LoadSound {
-                path: path.to_string_lossy().to_string(),
-                response: response_tx,
+        for _ in 0..LOAD_BATCH {
+            if !self.load_has_room() {
+                break;
+            }
+            let Some(path) = self.pending_loads.pop_front() else {
+                break;
             };
-            if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
+            if let Err(path) = self.try_send_load(path) {
                 // Still full: put it back and try again on a later frame.
-                debug!(
-                    "Load channel still full, {} stays queued: {}",
-                    path.display(),
-                    e
-                );
                 self.pending_loads.push_front(path);
                 break;
             }
-            self.await_load_response(response_rx);
         }
     }
 
@@ -422,8 +650,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send play sound command (channel full): {}", e);
+        if !self.send_user_command(cmd, "play sound") {
             return;
         }
 
@@ -449,8 +676,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send stop sound command (channel full): {}", e);
+        if !self.send_user_command(cmd, "stop sound") {
             return;
         }
 
@@ -478,8 +704,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send set volume command (channel full): {}", e);
+        if !self.send_user_command(cmd, "set volume") {
             return;
         }
 
@@ -507,12 +732,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!(
-                "Failed to send set master volume command (channel full): {}",
-                e
-            );
-        }
+        self.send_user_command(cmd, "set master volume");
     }
 
     /// Get master volume
@@ -530,8 +750,7 @@ impl SoundSharedApp {
             response: response_tx,
         };
 
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send remove sound command (channel full): {}", e);
+        if !self.send_user_command(cmd, "remove sound") {
             return;
         }
 
@@ -953,13 +1172,9 @@ impl SoundSharedApp {
 
     /// Open native file dialog to add sound
     pub fn open_file_dialog(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac", "opus"])
-            .set_title("Select Audio File")
-            .pick_file()
-        {
-            self.request_load_sound(path);
-        }
+        // The chooser runs off the frame (see `library_ui::tasks`); the
+        // files come back as a library event.
+        self.open_add_files();
     }
 
     // ===== YouTube links =====
@@ -1234,14 +1449,14 @@ impl SoundSharedApp {
 
     /// Stop every playing sound at once (the command-bar panic control).
     pub fn stop_all_sounds(&mut self) {
+        crate::gui::library_ui::stop_preview(self);
         let (response_tx, _response_rx) = bounded(1);
         let cmd = AudioCommand::StopAll {
             response: response_tx,
         };
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send stop all command (channel full): {}", e);
-            return;
-        }
+        // Never lost: a full channel parks the command and it is re-sent first
+        // thing next frame. The rows go dark either way.
+        self.send_user_command(cmd, "stop all");
         for entry in self.sounds.lock().unwrap().values_mut() {
             entry.playing = false;
         }
@@ -1274,9 +1489,7 @@ impl SoundSharedApp {
             looped,
             response: response_tx,
         };
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send set loop command (channel full): {}", e);
-        }
+        self.send_user_command(cmd, "set loop");
     }
 
     /// True while anything needs a repaint to animate (pulse, breathing dot).
@@ -1317,7 +1530,8 @@ impl SoundSharedApp {
         let sounds = snapshot.sounds.len();
 
         let mut config = self.app_state.config.lock().unwrap();
-        config.library = snapshot;
+        // `[library]` and `[[hotkeys]]` together.
+        self.library.write_config(&mut config);
         if let Err(e) = config.save() {
             error!("Failed to save library to config.toml: {}", e);
             return;
@@ -1349,10 +1563,15 @@ impl SoundSharedApp {
 
     /// Update function called each frame - process audio commands on main thread
     pub fn update(&mut self, ctx: &Context) {
+        // Keyboard shortcuts first, before any widget can see the key events.
+        self.poll_hotkeys(ctx);
+
         // Process pending audio commands (runs on main thread where AudioEngine lives)
         self.process_audio_commands();
         self.finish_decoded();
         self.poll_youtube_results();
+        crate::gui::library_ui::poll(self, ctx);
+        crate::updates::frame(self, ctx);
 
         // Auto-detect tracks that finished playing (mixer marks them stopped but keeps them)
         // so the GUI button switches from "Stop" back to "Play" and the sound can be removed.
@@ -1380,9 +1599,28 @@ impl SoundSharedApp {
             }
         }
 
-        // Feed the engine the library files that did not fit the channel on
-        // the previous pass.
+        // Delayed scene starts, and the rows of sounds a scene started.
+        self.run_director();
+
+        // Session timers that fired (see `gui::timeline`).
+        self.run_timers();
+
+        // Scene deck: replies to its commands, the active scene, its repaints.
+        self.scene_frame(ctx);
+
+        // Phone panel: run its commands on this thread, publish the state.
+        self.gm_frame();
+
+        // Operator commands first, then the library files that did not fit the
+        // channel on the previous pass (a few per frame).
+        self.pump_user_commands();
         self.pump_pending_loads();
+        if !self.pending_loads.is_empty() || !self.pending_user.lock().unwrap().is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+
+        // Session recorder: start / stop answers, finished files
+        self.recorder.poll(&self.app_state.config);
 
         // Poll server status
         self.poll_server_status();
@@ -1402,13 +1640,57 @@ impl SoundSharedApp {
         let animating = self.output_meter > 0.0
             || self.youtube_busy
             || self.sounds.lock().unwrap().values().any(|s| s.playing);
-        ctx.request_repaint_after(Duration::from_millis(if self.youtube_busy {
+        let mut wait = Duration::from_millis(if self.youtube_busy {
             200
         } else if animating {
             33
         } else {
             500
-        }));
+        });
+        // Wake up for the next delayed scene start.
+        if let Some(due) = self.director.next_deadline() {
+            let until = due.saturating_duration_since(Instant::now());
+            wait = wait.min(until.max(Duration::from_millis(5)));
+        }
+        wait = wait.min(self.music.repaint_hint(&self.dialog));
+        wait = wait.min(self.timers_repaint_hint());
+        ctx.request_repaint_after(wait);
+    }
+
+    /// Run the Director's timers and mirror what it started into the rows.
+    fn run_director(&mut self) {
+        let guard = self.audio_engine.lock().unwrap();
+        let Some(engine) = guard.as_ref() else {
+            return;
+        };
+        let audio_cfg = self.app_state.config.lock().unwrap().audio.clone();
+        self.director.configure_audio(&audio_cfg);
+        self.director.tick(engine);
+        mirror_playing(&self.sounds, engine);
+        self.music.observe(&self.director, Instant::now());
+        // Scene and track names for the listeners' page.
+        let library = &self.library;
+        self.app_state
+            .now_playing
+            .publish(crate::network::broadcast::NowPlaying::from_director(
+                &self.director,
+                |id| {
+                    let id = uuid::Uuid::parse_str(id).ok()?;
+                    library.sound_by_id(id).map(crate::gui::music::sound_label)
+                },
+            ));
+        // Loudness measured in the background: store the gains in the library.
+        for update in self.director.take_gain_updates() {
+            let path = uuid::Uuid::parse_str(&update.library_id)
+                .ok()
+                .and_then(|id| self.library.sound_by_id(id))
+                .map(|sound| sound.path.clone());
+            if let Some(path) = path {
+                if self.library.set_gain_db(&path, update.gain_db) {
+                    self.library_dirty = true;
+                }
+            }
+        }
     }
 
     /// Register the files the decoder worker has finished.
@@ -1420,8 +1702,18 @@ impl SoundSharedApp {
                 continue;
             };
             match decoded {
-                Ok(audio) => {
-                    let sound_id = engine.load_sound_from_data(audio);
+                Ok(loaded) => {
+                    let sound_id = match loaded {
+                        LoadedFile::Pcm(audio) => engine.load_sound_from_data(audio),
+                        LoadedFile::Stream {
+                            meta,
+                            duration_secs,
+                        } => engine.register_stream_sound(
+                            std::path::Path::new(&path),
+                            meta,
+                            duration_secs,
+                        ),
+                    };
                     let (duration, sample_rate, _) =
                         engine.sound_info(sound_id).unwrap_or((0.0, 48000, 2));
                     // YouTube downloads arrive as `<title> [<id>]` on disk;
@@ -1439,7 +1731,14 @@ impl SoundSharedApp {
                         .sound(&path_buf)
                         .map(|sound| sound.volume)
                         .unwrap_or(1.0);
-                    if let Err(e) = engine.set_sound_volume(sound_id, saved_volume) {
+                    let saved_gain = self
+                        .library
+                        .sound(&path_buf)
+                        .map(|sound| sound.gain_db)
+                        .unwrap_or(0.0);
+                    let saved_level =
+                        crate::audio::director_audio::level_for(saved_volume, saved_gain);
+                    if let Err(e) = engine.set_sound_volume(sound_id, saved_level) {
                         warn!(
                             "Could not apply saved volume {:.2} to {}: {}",
                             saved_volume,
@@ -1492,9 +1791,20 @@ impl SoundSharedApp {
                     };
                     self.sounds.lock().unwrap().insert(sound_id, entry);
                     self.sound_order.lock().unwrap().push(sound_id);
+                    // Loudness normalization (off by default): a sound without
+                    // a gain is measured in the background.
+                    let audio_cfg = self.app_state.config.lock().unwrap().audio.clone();
+                    self.director.configure_audio(&audio_cfg);
+                    if audio_cfg.normalize {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        self.director.normalize_sound(engine, sound_id);
+                    }
                     let _ = response.send(Ok(info));
                 }
                 Err(e) => {
+                    // A file the decoder rejects frees its import slot at once,
+                    // so a few bad files cannot stall the rest of the queue.
+                    self.lib_ui.load_in_flight.remove(Path::new(&path));
                     let _ = response.send(Err(anyhow::anyhow!("{path}: {e}")));
                 }
             }
@@ -1502,15 +1812,18 @@ impl SoundSharedApp {
     }
 
     /// Process pending audio commands on the main thread
-    fn process_audio_commands(&mut self) {
+    pub(crate) fn process_audio_commands(&mut self) {
         // Try to get commands without blocking
         while let Ok(cmd) = self.audio_cmd_rx.try_recv() {
             if let Some(engine) = self.audio_engine.lock().unwrap().as_mut() {
                 match cmd {
                     AudioCommand::LoadSound { path, response } => {
                         // Decoded off the GUI thread; finished in `finish_decoded`.
-                        if let Err(e) = self.decode_tx.send((path, response)) {
-                            let (_, response) = e.into_inner();
+                        if let Err(e) =
+                            self.decode_tx
+                                .send((path, response, engine.stream_threshold_secs()))
+                        {
+                            let (_, response, _) = e.into_inner();
                             let _ = response.send(Err(anyhow::anyhow!("decoder stopped")));
                         }
                     }
@@ -1524,18 +1837,17 @@ impl SoundSharedApp {
                             .get(&id)
                             .map(|entry| entry.looped)
                             .unwrap_or(false);
-                        let result = engine.play_with_loop(id, looped);
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        let result = self.director.play_sound(&*engine, id, looped);
                         if result.is_ok() {
                             if let Some(entry) = self.sounds.lock().unwrap().get_mut(&id) {
                                 entry.playing = true;
                             }
                         }
-                        // Convert TrackHandle to () for response
-                        let response_result = result.map(|_| ()).map_err(|e| e.into());
-                        let _ = response.send(response_result);
+                        let _ = response.send(result.map_err(|e| e.into()));
                     }
                     AudioCommand::StopSound { id, response } => {
-                        let result = engine.stop_sound(id);
+                        let result = self.director.stop_sound(&*engine, id);
                         if result.is_ok() {
                             if let Some(entry) = self.sounds.lock().unwrap().get_mut(&id) {
                                 entry.playing = false;
@@ -1551,7 +1863,7 @@ impl SoundSharedApp {
                         // Per-sound level: it scales this sound only. Routing it to
                         // `set_master_volume` made one row's slider drag the whole
                         // mix, so the other sounds moved with it.
-                        let result = engine.set_sound_volume(id, volume);
+                        let result = self.director.set_sound_volume(&*engine, id, volume);
                         if result.is_ok() {
                             if let Some(entry) = self.sounds.lock().unwrap().get_mut(&id) {
                                 entry.volume = volume;
@@ -1559,8 +1871,17 @@ impl SoundSharedApp {
                         }
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
+                    AudioCommand::SetPan { id, pan, response } => {
+                        let result = self.director.set_sound_pan(&*engine, id, pan);
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::SyncPans { response } => {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        self.director.apply_pans(&*engine);
+                        let _ = response.send(Ok(()));
+                    }
                     AudioCommand::SetMasterVolume { volume, response } => {
-                        let result = engine.set_master_volume(volume);
+                        let result = self.director.set_master_volume(&*engine, volume);
                         if result.is_ok() {
                             *self.master_volume.lock().unwrap() = volume;
                         }
@@ -1573,7 +1894,7 @@ impl SoundSharedApp {
                     } => {
                         // Applies to the live track, so flipping the toggle on a
                         // sound that is already playing takes effect immediately.
-                        let result = engine.set_sound_looped(id, looped);
+                        let result = self.director.set_sound_looped(&*engine, id, looped);
                         if result.is_ok() {
                             if let Some(entry) = self.sounds.lock().unwrap().get_mut(&id) {
                                 entry.looped = looped;
@@ -1590,6 +1911,7 @@ impl SoundSharedApp {
                             .map(|entry| entry.path.clone());
                         let result = engine.unload_sound(id);
                         if result.is_ok() {
+                            self.director.unregister_sound(id);
                             self.sounds.lock().unwrap().remove(&id);
                             self.sound_order.lock().unwrap().retain(|&x| x != id);
                             if let Some(path) = path {
@@ -1601,7 +1923,8 @@ impl SoundSharedApp {
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
                     AudioCommand::StopAll { response } => {
-                        let result = engine.stop_all();
+                        self.lib_ui.stop_preview_on(&*engine);
+                        let result = self.director.stop_all(&*engine);
                         if result.is_ok() {
                             for entry in self.sounds.lock().unwrap().values_mut() {
                                 entry.playing = false;
@@ -1609,6 +1932,145 @@ impl SoundSharedApp {
                         }
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
+                    AudioCommand::StopAllFade { fade_ms, response } => {
+                        self.lib_ui.stop_preview_on(&*engine);
+                        let result = self.director.stop_all_with_fade(&*engine, fade_ms);
+                        mirror_playing(&self.sounds, engine);
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::ActivateScene { id, response } => {
+                        if let Ok(scene) = id.parse::<crate::gui::groups::SceneId>() {
+                            // Stats files: keep it off the render thread.
+                            let _ = self.library.spawn_log_scene_warnings(scene);
+                        }
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        crate::gui::scenes::patch_director(
+                            &mut self.director,
+                            self.scenes.override_ms(),
+                        );
+                        let result = self.director.activate_scene(&*engine, &id);
+                        mirror_playing(&self.sounds, engine);
+                        let _ = response.send(match result {
+                            Ok(report) => {
+                                for problem in &report.errors {
+                                    warn!("Scene {id}: {problem}");
+                                }
+                                Ok(())
+                            }
+                            Err(e) => Err(e.into()),
+                        });
+                    }
+                    AudioCommand::StopScene { response } => {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        crate::gui::scenes::patch_director(
+                            &mut self.director,
+                            self.scenes.override_ms(),
+                        );
+                        let result = self.director.stop_scene(&*engine);
+                        mirror_playing(&self.sounds, engine);
+                        let _ = response.send(result.map(|_| ()).map_err(|e| e.into()));
+                    }
+                    AudioCommand::SnapshotScene { name, response } => {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        let result = self
+                            .director
+                            .snapshot_to_scene(&*engine, &name)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|scene| {
+                                crate::audio::director::import_scene(&mut self.library, &scene)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("a scene named \"{}\" already exists", name)
+                                    })
+                            });
+                        if result.is_ok() {
+                            self.library_dirty = true;
+                        }
+                        // The Director holds the library's version of the scene.
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        let _ = response.send(result);
+                    }
+                    AudioCommand::PlayStinger { id, response } => {
+                        sync_director(&mut self.director, &self.library, &self.sounds);
+                        let result = self.director.play_stinger(&*engine, id);
+                        mirror_playing(&self.sounds, engine);
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::SetBusVolume {
+                        bus,
+                        volume,
+                        response,
+                    } => {
+                        let result = self.director.set_bus_volume(&*engine, bus, volume);
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::Duck {
+                        target,
+                        amount,
+                        attack_ms,
+                        release_ms,
+                        response,
+                    } => {
+                        let result = self.director.run_mix_control(
+                            &*engine,
+                            MixControl::Duck {
+                                target,
+                                mode: DuckMode::On,
+                                amount,
+                                attack_ms,
+                                release_ms,
+                            },
+                        );
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::DuckRelease { target, response } => {
+                        let result = self.director.duck_release(&*engine, target);
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::DuckHold {
+                        target,
+                        active,
+                        response,
+                    } => {
+                        let result = if active {
+                            self.director.duck_start(&*engine, target)
+                        } else {
+                            self.director.duck_end(&*engine, target)
+                        };
+                        let _ = response.send(result.map_err(|e| e.into()));
+                    }
+                    AudioCommand::DuckToggle { target, response } => {
+                        let result = self.director.duck_toggle(&*engine, target);
+                        let _ = response.send(result.map(|_| ()).map_err(|e| e.into()));
+                    }
+                    AudioCommand::SetNormalize {
+                        enabled,
+                        target_lufs,
+                        response,
+                    } => {
+                        let target = target_lufs
+                            .unwrap_or_else(|| self.director.normalization().target_lufs);
+                        {
+                            let mut config = self.app_state.config.lock().unwrap();
+                            config.audio.normalize = enabled;
+                            config.audio.normalize_target_lufs = target;
+                        }
+                        self.director.set_normalize(enabled, target);
+                        self.library_dirty = true;
+                        if enabled {
+                            sync_director(&mut self.director, &self.library, &self.sounds);
+                            self.director.normalize_catalog(&*engine);
+                        }
+                        let _ = response.send(Ok(()));
+                    }
+                    cmd => match cmd.into_playlist() {
+                        Ok((command, response)) => {
+                            sync_director(&mut self.director, &self.library, &self.sounds);
+                            let result = self.director.playlist_command(&*engine, command);
+                            mirror_playing(&self.sounds, engine);
+                            let _ = response.send(result.map_err(|e| e.into()));
+                        }
+                        Err(other) => warn!("Unhandled audio command: {other:?}"),
+                    },
                 }
             } else {
                 // Engine not available - handle each variant separately due to different response types
@@ -1637,8 +2099,275 @@ impl SoundSharedApp {
                     AudioCommand::StopAll { response } => {
                         let _ = response.send(Ok(()));
                     }
+                    AudioCommand::StopAllFade { response, .. } => {
+                        let _ = response.send(Ok(()));
+                    }
+                    AudioCommand::StopScene { response } => {
+                        let _ = response.send(Ok(()));
+                    }
+                    AudioCommand::ActivateScene { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                    }
+                    AudioCommand::SnapshotScene { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                    }
+                    AudioCommand::PlayStinger { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                    }
+                    AudioCommand::SetPan { response, .. }
+                    | AudioCommand::SyncPans { response }
+                    | AudioCommand::SetBusVolume { response, .. }
+                    | AudioCommand::Duck { response, .. }
+                    | AudioCommand::DuckRelease { response, .. }
+                    | AudioCommand::DuckHold { response, .. }
+                    | AudioCommand::DuckToggle { response, .. }
+                    | AudioCommand::SetNormalize { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                    }
+                    cmd => {
+                        if let Ok((_, response)) = cmd.into_playlist() {
+                            let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
+                        }
+                    }
                 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_load_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::gui::hotkeys_ui::test_support::harness;
+
+    /// A silent 16-bit mono 8 kHz WAV of `secs` seconds in a fresh temp dir.
+    fn silent_wav(tag: &str, secs: u32) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bardwave-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("track.wav");
+        let data_len = secs * 8_000 * 2;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000u32.to_le_bytes());
+        bytes.extend_from_slice(&16_000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize(bytes.len() + data_len as usize, 0);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn prepare_file_streams_long_and_decodes_short() {
+        let path = silent_wav("prepare", 3);
+        let p = path.to_string_lossy();
+        assert!(matches!(prepare_file(&p, 1), Ok(LoadedFile::Stream { .. })));
+        assert!(matches!(prepare_file(&p, 10), Ok(LoadedFile::Pcm(_))));
+        // A zero threshold disables streaming.
+        assert!(matches!(prepare_file(&p, 0), Ok(LoadedFile::Pcm(_))));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The console's load path (decoder worker -> `finish_decoded`) must hand a
+    /// file above the threshold to the engine as a stream, not decode it.
+    #[test]
+    fn console_load_streams_a_long_file_and_decodes_a_short_one() {
+        let long = silent_wav("console-long", 3);
+        let short = silent_wav("console-short", 1);
+        let mut h = harness(Config::default(), true);
+        {
+            let guard = h.app.audio_engine.lock().unwrap();
+            guard.as_ref().unwrap().set_stream_threshold_secs(2);
+        }
+        let mut loaded = Vec::new();
+        for path in [&long, &short] {
+            let (tx, rx) = bounded(1);
+            h.app
+                .app_state
+                .audio_cmd_tx
+                .send(AudioCommand::LoadSound {
+                    path: path.to_string_lossy().to_string(),
+                    response: tx,
+                })
+                .unwrap();
+            h.app.process_audio_commands();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let info = loop {
+                h.app.finish_decoded();
+                if let Ok(result) = rx.try_recv() {
+                    break result.expect("load succeeds");
+                }
+                assert!(Instant::now() < deadline, "decoder never finished");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            loaded.push(info.id);
+        }
+        let guard = h.app.audio_engine.lock().unwrap();
+        let engine = guard.as_ref().unwrap();
+        assert!(engine.is_sound_streamed(loaded[0]), "long file must stream");
+        assert!(
+            !engine.is_sound_streamed(loaded[1]),
+            "short file is decoded"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(long.parent().unwrap());
+        let _ = std::fs::remove_dir_all(short.parent().unwrap());
+    }
+
+    fn filler() -> AudioCommand {
+        let (response, _rx) = bounded(1);
+        AudioCommand::SetMasterVolume {
+            volume: 0.5,
+            response,
+        }
+    }
+
+    fn stop_all_cmd() -> AudioCommand {
+        let (response, _rx) = bounded(1);
+        AudioCommand::StopAll { response }
+    }
+
+    fn drain(h: &crate::gui::hotkeys_ui::test_support::Harness) -> Vec<AudioCommand> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = h.audio_rx.try_recv() {
+            out.push(cmd);
+        }
+        out
+    }
+
+    #[test]
+    fn stop_all_survives_a_full_command_channel() {
+        let mut h = harness(Config::default(), false);
+        while h.app.app_state.audio_cmd_tx.try_send(filler()).is_ok() {}
+        h.app.stop_all_sounds();
+        h.app.set_master_volume(0.3);
+        assert_eq!(h.app.pending_user.lock().unwrap().len(), 2);
+
+        // Nothing is re-sent while the channel is still full.
+        h.app.pump_user_commands();
+        assert_eq!(h.app.pending_user.lock().unwrap().len(), 2);
+
+        // Once the audio side drains, the next frame delivers both, in order.
+        let _ = drain(&h);
+        h.app.pump_user_commands();
+        assert!(h.app.pending_user.lock().unwrap().is_empty());
+        let got = drain(&h);
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got[0], AudioCommand::StopAll { .. }));
+        assert!(matches!(got[1], AudioCommand::SetMasterVolume { .. }));
+    }
+
+    #[test]
+    fn commands_keep_their_order_behind_a_parked_one() {
+        let h = harness(Config::default(), false);
+        while h.app.app_state.audio_cmd_tx.try_send(filler()).is_ok() {}
+        h.app.send_user_command(stop_all_cmd(), "stop all");
+        // Room appears, but a parked command still goes first.
+        let _ = drain(&h);
+        h.app.send_user_command(filler(), "volume");
+        assert!(
+            drain(&h).is_empty(),
+            "must queue behind the parked stop-all"
+        );
+        h.app.pump_user_commands();
+        let got = drain(&h);
+        assert!(matches!(got[0], AudioCommand::StopAll { .. }));
+        assert!(matches!(got[1], AudioCommand::SetMasterVolume { .. }));
+    }
+
+    #[test]
+    fn the_retry_queue_is_bounded_but_never_drops_a_stop_all() {
+        let mut queue = VecDeque::new();
+        queue.push_back(stop_all_cmd());
+        for _ in 0..USER_QUEUE_LIMIT + 50 {
+            push_user_command(&mut queue, filler());
+        }
+        assert_eq!(queue.len(), USER_QUEUE_LIMIT);
+        assert!(matches!(queue[0], AudioCommand::StopAll { .. }));
+        push_user_command(&mut queue, stop_all_cmd());
+        assert_eq!(queue.len(), USER_QUEUE_LIMIT);
+        assert!(matches!(
+            queue.back().unwrap(),
+            AudioCommand::StopAll { .. }
+        ));
+
+        // A queue of nothing but stop-alls refuses a plain command and still
+        // takes another stop-all.
+        let mut only_stops: VecDeque<AudioCommand> =
+            (0..USER_QUEUE_LIMIT).map(|_| stop_all_cmd()).collect();
+        push_user_command(&mut only_stops, filler());
+        assert!(only_stops
+            .iter()
+            .all(|c| matches!(c, AudioCommand::StopAll { .. })));
+        push_user_command(&mut only_stops, stop_all_cmd());
+        assert_eq!(only_stops.len(), USER_QUEUE_LIMIT + 1);
+    }
+
+    #[test]
+    fn library_loads_leave_headroom_and_go_out_in_batches() {
+        let mut h = harness(Config::default(), false);
+        let cap = h.app.app_state.audio_cmd_tx.capacity().unwrap();
+        for i in 0..cap * 3 {
+            h.app
+                .request_load_sound(PathBuf::from(format!("/nowhere/{i}.wav")));
+        }
+        assert!(
+            h.audio_rx.len() + LOAD_HEADROOM <= cap,
+            "loads must keep the headroom free"
+        );
+        assert!(!h.app.pending_loads.is_empty());
+        // An operator command still finds room at once.
+        h.app.stop_all_sounds();
+        assert!(h.app.pending_user.lock().unwrap().is_empty());
+
+        // Each frame hands over at most one batch.
+        let _ = drain(&h);
+        let before = h.app.pending_loads.len();
+        h.app.pump_pending_loads();
+        assert_eq!(before - h.app.pending_loads.len(), LOAD_BATCH);
+        assert_eq!(h.audio_rx.len(), LOAD_BATCH);
+    }
+
+    #[test]
+    fn a_file_that_fails_to_decode_frees_its_load_slot_at_once() {
+        let dir = std::env::temp_dir().join(format!("bardwave-badload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("broken.wav");
+        std::fs::write(&bad, b"this is not audio").unwrap();
+        let mut h = harness(Config::default(), true);
+        h.app
+            .lib_ui
+            .load_in_flight
+            .insert(bad.clone(), Instant::now());
+        let (tx, rx) = bounded(1);
+        h.app
+            .app_state
+            .audio_cmd_tx
+            .send(AudioCommand::LoadSound {
+                path: bad.to_string_lossy().to_string(),
+                response: tx,
+            })
+            .unwrap();
+        h.app.process_audio_commands();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let result = loop {
+            h.app.finish_decoded();
+            if let Ok(result) = rx.try_recv() {
+                break result;
+            }
+            assert!(Instant::now() < deadline, "decoder never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(result.is_err());
+        assert!(h.app.lib_ui.load_in_flight.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

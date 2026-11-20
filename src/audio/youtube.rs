@@ -2,7 +2,7 @@
 //!
 //! The operator pastes a YouTube video / music link into the console; the audio
 //! stream is downloaded once with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp),
-//! stored in `bardwave-library/` next to the executable (so the saved library
+//! stored in `bardwave-library/` in the data directory (so the saved library
 //! keeps working after a restart) and then played back exactly like any local
 //! file — the existing Symphonia decoder handles the result.
 //!
@@ -111,12 +111,14 @@ fn id_from_start(text: &str) -> Option<&str> {
 /// Where download progress lines go (the GUI updates a status label).
 pub type StatusSink = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// Locate an external tool: next to the executable, then in the user's
-/// app-data tools folder, then on `PATH`.
+/// Locate an external tool: next to the executable, then on `PATH`, then in the
+/// folders Bardwave downloads into (a copy the operator installed always beats
+/// one we fetched).
 ///
 /// Bardwave is a portable single binary, so shipping the tool next to it works;
 /// installing it system-wide (winget adds it to `PATH`) works too — and when
-/// neither holds, [`ensure_yt_dlp`] fetches it into one of the first two.
+/// neither holds, [`ensure_yt_dlp`] fetches it into the data directory's
+/// `tools/` folder.
 fn find_tool(name: &str) -> Option<PathBuf> {
     let names = if cfg!(windows) {
         vec![format!("{name}.exe"), name.to_string()]
@@ -124,49 +126,45 @@ fn find_tool(name: &str) -> Option<PathBuf> {
         vec![name.to_string()]
     };
 
-    for dir in tool_dirs() {
-        for candidate in &names {
-            let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
-        }
+    let in_dirs = |dirs: &[PathBuf]| -> Option<PathBuf> {
+        dirs.iter()
+            .flat_map(|dir| names.iter().map(move |candidate| dir.join(candidate)))
+            .find(|path| path.is_file())
+    };
+
+    // Next to the executable — where v1.4.0 put downloaded copies too.
+    let exe_dirs: Vec<PathBuf> = crate::paths::exe_dir().into_iter().collect();
+    if let Some(path) = in_dirs(&exe_dirs) {
+        return Some(path);
     }
 
     // Somewhere on PATH.
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        for candidate in &names {
-            let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+        if let Some(path) = in_dirs(&dirs) {
+            return Some(path);
         }
     }
-    None
+
+    // Downloaded by Bardwave itself.
+    in_dirs(&download_dirs())
 }
 
-/// Directories the external tools may live in, in priority order.
-fn tool_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    // Next to the executable — the same place config.toml lives. In a dev
-    // checkout that is the project's `target/<profile>/` folder; in a portable
-    // layout it is whatever folder the operator runs the binary from.
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    {
-        dirs.push(dir);
-    }
-    // The user's app-data tools folder: the fallback when the executable
-    // directory is not writable (installed into Program Files, say).
+/// Folders Bardwave downloads tools into, in priority order: the data
+/// directory's `tools/` folder, then the legacy per-user tools folder that
+/// earlier builds fell back to when the executable directory was read-only.
+fn download_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![crate::paths::tools_dir()];
     if let Ok(dir) = user_tools_dir() {
-        dirs.push(dir);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
     }
     dirs
 }
 
-/// Per-user tools folder (`%LOCALAPPDATA%\Bardwave\tools` on Windows,
+/// Legacy per-user tools folder, still searched for copies that older builds
+/// downloaded (`%LOCALAPPDATA%\Bardwave\tools` on Windows,
 /// `~/.local/share/Bardwave/tools` on Linux/macOS, or `$XDG_DATA_HOME`).
 fn user_tools_dir() -> Result<PathBuf, String> {
     let base = if cfg!(windows) {
@@ -336,7 +334,7 @@ fn yt_dlp_asset() -> Option<(&'static str, &'static str)> {
 /// accept `create_dir_all` (the folder already exists) but silently drop any
 /// new file without elevation.
 fn writable_tool_dir(name: &str) -> Result<PathBuf, String> {
-    for dir in tool_dirs() {
+    for dir in download_dirs() {
         let probe = dir.join(name);
         if std::fs::create_dir_all(&dir).is_ok() {
             match std::fs::File::create(&probe) {
@@ -351,8 +349,8 @@ fn writable_tool_dir(name: &str) -> Result<PathBuf, String> {
         }
     }
     Err(
-        "Neither the executable folder nor the app-data folder is writable for \
-             the yt-dlp download"
+        "Neither the Bardwave data folder nor the app-data tools folder is writable \
+             for the tool download"
             .to_string(),
     )
 }
@@ -446,15 +444,12 @@ fn make_executable(path: &Path) {
 
 /// Where downloaded audio is stored.
 ///
-/// The folder sits next to `config.toml` (next to the executable), so a library
+/// The folder sits next to `config.toml` (in the data directory, see
+/// [`crate::paths::data_dir`]), so a library
 /// entry keeps pointing at an existing file after a restart, exactly like local
 /// sounds the operator added from their own disk.
 pub fn downloads_dir() -> Result<PathBuf, String> {
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .ok_or_else(|| "Could not locate the executable directory".to_string())?
-        .join("bardwave-library");
+    let dir = crate::paths::library_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Could not create {}: {}", dir.display(), e))?;
     Ok(dir)
@@ -913,12 +908,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_dirs_end_in_the_user_tools_folder() {
-        let dirs = tool_dirs();
-        assert!(
-            !dirs.is_empty(),
-            "the executable directory should always resolve"
-        );
+    fn download_dirs_start_in_the_data_dir_and_end_in_the_user_tools_folder() {
+        let dirs = download_dirs();
+        assert_eq!(dirs[0], crate::paths::tools_dir());
         // Both roots end in the same two segments, whichever base was chosen.
         let user = user_tools_dir().expect("env provides one of the data roots");
         assert!(user.ends_with(Path::new("Bardwave").join("tools")));

@@ -98,12 +98,27 @@
         // UI refresh interval for meter and stats (ms). ~15 fps keeps the
         // main thread from fighting the audio thread on the active tab.
         uiUpdateInterval: 66,
+        // Reconnect backoff: 1 s, 2 s, 4 s, 8 s, then 15 s, each scaled by a
+        // random factor in [1 - jitter, 1].
         reconnect: {
             initialDelay: 1000,
-            maxDelay: 30000,
-            factor: 1.8,
+            maxDelay: 15000,
+            factor: 2,
             jitter: 0.3,
-            maxAttempts: Infinity
+            maxAttempts: Infinity,
+            // A link counts as stable (backoff restarts) after this long.
+            stableMs: 10000,
+            // A WebSocket handshake that takes longer is abandoned.
+            connectTimeoutMs: 10000
+        },
+        // Liveness check: ping every `intervalMs`, drop the link after
+        // `timeoutMs` without any message from the server.
+        heartbeat: {
+            tickMs: 5000,
+            intervalMs: 10000,
+            timeoutMs: 30000,
+            // A gap between ticks this long means the timers were suspended.
+            suspendGapMs: 15000
         }
     };
 
@@ -570,6 +585,24 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         reconnectTimer: null,
         isConnecting: false,
         shouldReconnect: false,
+        // True from the first lost link until a connection is open again.
+        reconnecting: false,
+        // Bumped on every attempt and on manual disconnect, so the results of
+        // an abandoned attempt (fetch, handshake) are ignored.
+        connectSeq: 0,
+        countdownTimer: null,
+        connectTimer: null,
+        stableTimer: null,
+        heartbeatTimer: null,
+        lastRxAt: 0,
+        lastPingAt: 0,
+        lastBeatTick: 0,
+
+        // Scene announced by the server ({"type":"now_playing"}).
+        nowPlaying: { scene: '', track: '' },
+        // Smoothed arrival lateness against the fastest packets (latency
+        // estimate).
+        ageEmaMs: 0,
 
         // Audio graph
         audioContext: null,
@@ -687,6 +720,17 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         els.statsUnderruns = document.getElementById('statsUnderruns');
         els.statsOverruns = document.getElementById('statsOverruns');
         els.statsLost = document.getElementById('statsLost');
+
+        els.nowPlaying = document.getElementById('nowPlaying');
+        els.nowPlayingScene = document.getElementById('nowPlayingScene');
+        els.nowPlayingTrack = document.getElementById('nowPlayingTrack');
+
+        els.qualityLabel = document.getElementById('qualityLabel');
+        els.qualityLatency = document.getElementById('qualityLatency');
+        els.qualityBuffer = document.getElementById('qualityBuffer');
+        els.qualityLoss = document.getElementById('qualityLoss');
+        els.qualityHint = document.getElementById('qualityHint');
+        els.wakeLockState = document.getElementById('wakeLockState');
     }
 
     // =========================================================================
@@ -749,7 +793,11 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         els.btnLoader.hidden = true;
         els.btnIcon.hidden = false;
 
-        if (mode === 'connected') {
+        if (mode === 'reconnecting') {
+            // Still clickable: gives up the retry loop.
+            els.btnText.textContent = 'Stop Retrying';
+            els.btnIcon.setAttribute('icon', 'lucide:power');
+        } else if (mode === 'connected') {
             els.btnText.textContent = 'Terminate Link';
             els.btnIcon.setAttribute('icon', 'lucide:power');
         } else {
@@ -1276,6 +1324,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             state.minResidualMs = residual;
         }
         const ageMs = residual - state.minResidualMs;
+        state.ageEmaMs = state.ageEmaMs * 0.95 + Math.min(ageMs, 2000) * 0.05;
 
         // ----- Adaptive target (arrival jitter tracking) -----
         if (state.lastPacketMs !== null) {
@@ -1465,6 +1514,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         // underrun fade handle the gap silently. The legacy PCM path (no
         // longer produced by the server) keeps silence insertion so
         // mixed-version clients don't lose timeline alignment.
+        let lostNow = 0;
         if (state.lastSeqNo !== null) {
             const gap = (seq - state.lastSeqNo) >>> 0;
 
@@ -1472,9 +1522,13 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
                 return; // duplicate packet
             }
 
-            if (gap > 1) {
+            if (gap > SEQ_DISCONTINUITY) {
+                // The counter jumped (restart or reordering): not a loss.
+                log('Sequence discontinuity, not counted as loss:', gap);
+            } else if (gap > 1) {
                 const missed = gap - 1;
                 state.missedFrames += missed;
+                lostNow = missed;
                 if (state.streamCodec !== 'opus') {
                     // Legacy PCM: fill the gap with silence so the playback
                     // timeline stays aligned. Opus does not do this вЂ” hard
@@ -1493,6 +1547,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         }
 
         state.lastSeqNo = seq;
+        qualityRecord(1, lostNow, now);
         state.lastPacketFrames = frames;
         state.packetsReceived++;
         state.framesReceived += frames;
@@ -1514,7 +1569,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     }
 
     function handleControlMessage(msg) {
-        if (!msg || typeof msg.type !== 'string') return;
+        if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') return;
 
         switch (msg.type) {
             case 'format':
@@ -1529,6 +1584,14 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
                 log('Welcome from server:', msg.data);
                 break;
 
+            case 'pong':
+                // Heartbeat answer; arrival alone is what counts (onWsMessage).
+                break;
+
+            case 'now_playing':
+                setNowPlaying(msg.scene, msg.track);
+                break;
+
             case 'error':
                 showMessage(msg.message || 'Server error', 'error');
                 break;
@@ -1538,7 +1601,9 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
                 break;
 
             default:
-                log('Unknown control message:', msg.type);
+                // Message types this page does not know are ignored on purpose:
+                // newer servers may send more than an older cached page knows.
+                break;
         }
     }
 
@@ -1566,15 +1631,37 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         return protocol + '//' + host + '/ws/audio' + keyQuery();
     }
 
-    // The link has no valid key (missing, mistyped, or replaced by the GM):
-    // say so and stop, instead of retrying forever.
-    function accessDenied() {
-        state.shouldReconnect = false;
-        state.isConnecting = false;
+    // Every pending timer of the connection state machine.
+    function clearConnectionTimers() {
         if (state.reconnectTimer) {
             clearTimeout(state.reconnectTimer);
             state.reconnectTimer = null;
         }
+        if (state.countdownTimer) {
+            clearInterval(state.countdownTimer);
+            state.countdownTimer = null;
+        }
+        if (state.connectTimer) {
+            clearTimeout(state.connectTimer);
+            state.connectTimer = null;
+        }
+        if (state.stableTimer) {
+            clearTimeout(state.stableTimer);
+            state.stableTimer = null;
+        }
+    }
+
+    // The link has no valid key (missing, mistyped, or replaced by the GM):
+    // say so and stop, instead of retrying forever.
+    function accessDenied() {
+        state.shouldReconnect = false;
+        state.reconnecting = false;
+        state.isConnecting = false;
+        state.connectSeq++;
+        clearConnectionTimers();
+        stopHeartbeat();
+        releaseWakeLock();
+        stopMediaSession();
         setStatus('error', 'Access Denied');
         setButtonState('idle');
         setSystemToast('Access key rejected.', false, 'lucide:alert-triangle');
@@ -1599,69 +1686,230 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.wsUrl = buildWsUrl();
         updateWsUrlUI();
         state.shouldReconnect = true;
+        state.reconnecting = false;
         state.reconnectAttempt = 0;
+        clearConnectionTimers();
         doConnect();
     }
 
     function doConnect() {
         if (!state.shouldReconnect) return;
 
+        clearConnectionTimers();
         state.isConnecting = true;
-        setStatus('connecting', 'Linking...');
-        setButtonState('connecting');
-        setSystemToast('Negotiating WebSocket handshake...', false, 'lucide:radio-tower');
-        hideMessage();
+        const token = ++state.connectSeq;
+
+        if (state.reconnecting) {
+            setStatus('reconnecting', 'Reconnecting #' + state.reconnectAttempt);
+            setButtonState('reconnecting');
+            setSystemToast(
+                'Reconnecting (attempt ' + state.reconnectAttempt + ')...',
+                false,
+                'lucide:radio-tower'
+            );
+        } else {
+            setStatus('connecting', 'Linking...');
+            setButtonState('connecting');
+            setSystemToast('Negotiating WebSocket handshake...', false, 'lucide:radio-tower');
+            hideMessage();
+        }
 
         log('Connecting to', state.wsUrl.split('?')[0]);
 
         // A browser WebSocket cannot see the HTTP status of a refused
         // upgrade, so the key is checked against the status API first: a 401
-        // there means the link is wrong, not that the server is down.
-        fetch('/api/status' + keyQuery(), { cache: 'no-store' })
+        // there means the link is wrong, not that the server is down. A server
+        // that does not answer must not stall the retry loop either.
+        let controller = null;
+        let abortTimer = null;
+        try {
+            if (typeof AbortController === 'function') {
+                controller = new AbortController();
+                abortTimer = setTimeout(function () { controller.abort(); }, 5000);
+            }
+        } catch (e) {
+            controller = null;
+        }
+        const options = { cache: 'no-store' };
+        if (controller) options.signal = controller.signal;
+
+        fetch('/api/status' + keyQuery(), options)
             .then((res) => {
+                if (abortTimer) clearTimeout(abortTimer);
+                if (token !== state.connectSeq) return;
                 if (res.status === 401) {
                     accessDenied();
                     return;
                 }
-                openSocket();
+                openSocket(token);
             })
-            .catch(() => openSocket());
+            .catch(() => {
+                if (abortTimer) clearTimeout(abortTimer);
+                if (token !== state.connectSeq) return;
+                openSocket(token);
+            });
     }
 
-    function openSocket() {
-        if (!state.shouldReconnect) return;
+    function openSocket(token) {
+        if (!state.shouldReconnect || token !== state.connectSeq) return;
         try {
             const ws = new WebSocket(state.wsUrl);
             ws.binaryType = 'arraybuffer';
-            ws.onopen = onWsOpen;
-            ws.onmessage = onWsMessage;
-            ws.onclose = onWsClose;
-            ws.onerror = onWsError;
+            // Events of a socket that was already replaced or dropped are
+            // ignored, so a late `close` cannot tear down its successor.
+            ws.onopen = (e) => { if (state.ws === ws) onWsOpen(e); };
+            ws.onmessage = (e) => { if (state.ws === ws) onWsMessage(e); };
+            ws.onclose = (e) => { if (state.ws === ws) onWsClose(e); };
+            ws.onerror = (e) => { if (state.ws === ws) onWsError(e); };
             state.ws = ws;
+
+            // A handshake that never completes (captive Wi-Fi, a dead route)
+            // is abandoned instead of waiting for the OS timeout.
+            state.connectTimer = setTimeout(function () {
+                state.connectTimer = null;
+                if (state.ws === ws && ws.readyState === WebSocket.CONNECTING) {
+                    log('WebSocket handshake timed out');
+                    dropSocket(ws, 'Handshake timed out');
+                }
+            }, CONFIG.reconnect.connectTimeoutMs);
         } catch (e) {
             handleConnectionError(e);
         }
     }
 
+    function sendJson(obj) {
+        const ws = state.ws;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+        try {
+            ws.send(JSON.stringify(obj));
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Abandon a socket that will not report its own end (dead TCP, stalled
+    // handshake) and run the normal close handling right away.
+    function dropSocket(ws, reason) {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        try {
+            ws.close();
+        } catch (e) {
+            // Ignore close errors.
+        }
+        if (state.ws === ws) {
+            onWsClose({ code: 1006, reason: reason || 'Connection lost' });
+        }
+    }
+
+    // Heartbeat: a client ping every few seconds; any message at all (audio,
+    // pong, text) counts as proof of life. A link that stays silent for
+    // `timeoutMs` is dropped so the reconnect logic can replace it. Phones
+    // lose the connection silently when Wi-Fi roams or the screen locks, and
+    // the browser would otherwise show "connected" for minutes.
+    function startHeartbeat() {
+        stopHeartbeat();
+        const now = performance.now();
+        state.lastRxAt = now;
+        state.lastPingAt = now;
+        state.lastBeatTick = now;
+        state.heartbeatTimer = setInterval(heartbeatTick, CONFIG.heartbeat.tickMs);
+    }
+
+    function stopHeartbeat() {
+        if (state.heartbeatTimer) {
+            clearInterval(state.heartbeatTimer);
+            state.heartbeatTimer = null;
+        }
+    }
+
+    function heartbeatTick() {
+        const ws = state.ws;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const now = performance.now();
+
+        // Timers of a hidden tab are throttled or frozen. After such a gap
+        // the silence says nothing about the network: grant a fresh grace
+        // period, and let the pong to the ping below prove the link.
+        if (now - state.lastBeatTick > CONFIG.heartbeat.suspendGapMs) {
+            state.lastRxAt = now;
+        }
+        state.lastBeatTick = now;
+
+        if (now - state.lastRxAt > CONFIG.heartbeat.timeoutMs) {
+            log('No data from the server for', Math.round(now - state.lastRxAt), 'ms; dropping the link');
+            dropSocket(ws, 'Connection timed out');
+            return;
+        }
+        if (now - state.lastPingAt >= CONFIG.heartbeat.intervalMs) {
+            state.lastPingAt = now;
+            sendJson({ type: 'ping' });
+        }
+    }
+
     function onWsOpen() {
         log('WebSocket connected');
+        const wasReconnect = state.reconnecting;
+        if (state.connectTimer) {
+            clearTimeout(state.connectTimer);
+            state.connectTimer = null;
+        }
+        if (state.countdownTimer) {
+            clearInterval(state.countdownTimer);
+            state.countdownTimer = null;
+        }
         state.isConnecting = false;
-        state.reconnectAttempt = 0;
+        state.reconnecting = false;
+
+        // The backoff restarts only once the link has proven stable: a server
+        // that accepts and immediately drops would otherwise be hammered at
+        // the shortest delay forever.
+        if (state.stableTimer) clearTimeout(state.stableTimer);
+        state.stableTimer = setTimeout(function () {
+            state.stableTimer = null;
+            state.reconnectAttempt = 0;
+        }, CONFIG.reconnect.stableMs);
 
         setStatus('connected', 'Node Online');
         setButtonState('connected');
-        setSystemToast('Link established. Waiting for audio frames.', true, 'lucide:radio');
+        setSystemToast(
+            wasReconnect
+                ? 'Link restored. Waiting for audio frames.'
+                : 'Link established. Waiting for audio frames.',
+            true,
+            'lucide:radio'
+        );
+        hideMessage();
 
+        // The audio context and decoder stay as they are; only the per-
+        // connection counters restart.
         resetAudioPipeline();
+        qualityReset();
+        startHeartbeat();
+
+        // After a reconnect the server may be mid-stream: ask for the format
+        // again instead of waiting for the next frame to announce it.
+        sendJson({ type: 'get_format' });
+
+        acquireWakeLock();
+        updateMediaSession();
     }
 
     function onWsMessage(event) {
+        state.lastRxAt = performance.now();
+
         if (typeof event.data === 'string') {
+            let msg = null;
             try {
-                handleControlMessage(JSON.parse(event.data));
+                msg = JSON.parse(event.data);
             } catch (e) {
                 log('Text message from server:', event.data);
+                return;
             }
+            handleControlMessage(msg);
             return;
         }
 
@@ -1672,11 +1920,21 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
     function onWsClose(event) {
         log('WebSocket closed:', event.code, event.reason);
+        if (state.connectTimer) {
+            clearTimeout(state.connectTimer);
+            state.connectTimer = null;
+        }
+        if (state.stableTimer) {
+            clearTimeout(state.stableTimer);
+            state.stableTimer = null;
+        }
+        stopHeartbeat();
         state.isConnecting = false;
         state.ws = null;
         state.streamActive = false;
 
         resetAudioPipeline();
+        qualityReset();
         updateBufferUI();
         updateStatsUI();
 
@@ -1687,16 +1945,10 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         }
 
         if (state.shouldReconnect) {
-            if (event.code === 1000) {
-                setStatus('disconnected', 'Node Offline');
-                setButtonState('idle');
-                setSystemToast('Link closed. Standing by.', false, 'lucide:check-circle');
-                showMessage('Disconnected from server.', 'info', false);
-            } else {
-                setStatus('disconnected', 'Node Offline');
-                setButtonState('idle');
-                scheduleReconnect(event.reason || 'Code ' + event.code);
-            }
+            // Includes a clean 1000 close: unless the user ended the link (that
+            // clears shouldReconnect first), the server going away is a reason
+            // to wait for it to come back.
+            scheduleReconnect(event.reason || 'Code ' + event.code);
         } else {
             setStatus('disconnected', 'Node Offline');
             setButtonState('idle');
@@ -1712,6 +1964,11 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     function handleConnectionError(err) {
         state.isConnecting = false;
         state.shouldReconnect = false;
+        state.reconnecting = false;
+        clearConnectionTimers();
+        stopHeartbeat();
+        releaseWakeLock();
+        stopMediaSession();
         setStatus('error', 'Link Error');
         setButtonState('idle');
         setSystemToast('Connection failed. Check the server.', false, 'lucide:alert-triangle');
@@ -1721,25 +1978,36 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         );
     }
 
+    // Exponential backoff with jitter: 1 s, 2 s, 4 s, 8 s, then 15 s. Each
+    // delay is the step scaled by a random factor in [1 - jitter, 1], so a
+    // room of phones that lost the server together does not retry in lockstep
+    // and the cap is never exceeded.
+    function reconnectDelayMs(attempt, random) {
+        const { initialDelay, maxDelay, factor, jitter } = CONFIG.reconnect;
+        const base = Math.min(initialDelay * Math.pow(factor, attempt - 1), maxDelay);
+        return Math.max(250, Math.floor(base * (1 - jitter * random)));
+    }
+
     function scheduleReconnect(reason) {
         if (!state.shouldReconnect) return;
 
+        state.reconnecting = true;
         state.reconnectAttempt++;
-        const { initialDelay, maxDelay, factor, jitter, maxAttempts } = CONFIG.reconnect;
+        const { maxAttempts } = CONFIG.reconnect;
 
         if (state.reconnectAttempt > maxAttempts) {
+            state.reconnecting = false;
+            state.shouldReconnect = false;
+            releaseWakeLock();
+            stopMediaSession();
             setStatus('error', 'Link Error');
+            setButtonState('idle');
             setSystemToast('Reconnection attempts exhausted.', false, 'lucide:alert-triangle');
             showMessage('Max reconnection attempts reached. Refresh the page.', 'error');
             return;
         }
 
-        const base = Math.min(
-            initialDelay * Math.pow(factor, state.reconnectAttempt - 1),
-            maxDelay
-        );
-        const delay = Math.floor(base + base * jitter * Math.random());
-
+        const delay = reconnectDelayMs(state.reconnectAttempt, Math.random());
         log(
             'Reconnect attempt',
             state.reconnectAttempt,
@@ -1748,39 +2016,60 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             '(' + reason + ')'
         );
 
-        showMessage(
-            'Reconnecting in ' + (delay / 1000).toFixed(1) + 's...',
-            'info',
-            false
-        );
-        setSystemToast(
-            'Reconnecting in ' + (delay / 1000).toFixed(1) + 's...',
-            false,
-            'lucide:radio-tower'
-        );
+        setStatus('reconnecting', 'Reconnecting #' + state.reconnectAttempt);
+        setButtonState('reconnecting');
+
+        // The countdown lives in the (non-live) toast; the status text, which
+        // is an aria-live region, changes only once per attempt.
+        const retryAt = performance.now() + delay;
+        const showCountdown = function () {
+            const left = Math.max(0, Math.ceil((retryAt - performance.now()) / 1000));
+            setSystemToast(
+                'Connection lost. Retrying in ' + left + 's...',
+                false,
+                'lucide:radio-tower'
+            );
+        };
+        showCountdown();
+        if (state.countdownTimer) clearInterval(state.countdownTimer);
+        state.countdownTimer = setInterval(showCountdown, 1000);
 
         if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
         state.reconnectTimer = setTimeout(function () {
+            state.reconnectTimer = null;
             if (state.shouldReconnect) doConnect();
         }, delay);
+    }
+
+    // The network came back or the tab returned: no reason to sit out the rest
+    // of the delay.
+    function retryNow() {
+        if (!state.shouldReconnect || !state.reconnecting) return;
+        if (state.ws || !state.reconnectTimer) return; // already trying
+        log('Retrying immediately');
+        doConnect();
     }
 
     function disconnect() {
         log('Manual disconnect');
         state.shouldReconnect = false;
-
-        if (state.reconnectTimer) {
-            clearTimeout(state.reconnectTimer);
-            state.reconnectTimer = null;
-        }
+        state.reconnecting = false;
+        state.connectSeq++;
+        clearConnectionTimers();
+        stopHeartbeat();
 
         if (state.ws) {
+            const ws = state.ws;
+            state.ws = null;
+            ws.onopen = null;
+            ws.onmessage = null;
+            ws.onerror = null;
+            ws.onclose = null;
             try {
-                state.ws.close(1000, 'User disconnected');
+                ws.close(1000, 'User disconnected');
             } catch (e) {
                 // Ignore close errors.
             }
-            state.ws = null;
         }
 
         if (state.audioContext && state.audioContext.state === 'running') {
@@ -1790,13 +2079,35 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.isConnecting = false;
         state.streamActive = false;
         resetAudioPipeline();
+        qualityReset();
         updateBufferUI();
         updateStatsUI();
+        releaseWakeLock();
+        stopMediaSession();
+        setNowPlaying(null, null);
 
         setStatus('disconnected', 'Node Offline');
         setButtonState('idle');
         setSystemToast('System ready. Initializing components.', false, 'lucide:check-circle');
         hideMessage();
+        updateQualityUI(false);
+    }
+
+    // What the lock-screen pause button and the connect button both end up
+    // calling.
+    function stopListening() {
+        disconnect();
+    }
+
+    async function startListening() {
+        await initAudio();
+
+        if (state.audioContext.state === 'suspended') {
+            await state.audioContext.resume();
+        }
+
+        startMediaSession();
+        connect();
     }
 
     function resetAudioPipeline() {
@@ -1822,6 +2133,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.lastPacketMs = null;
         state.jitterMs = 0;
         state.lastTargetEval = 0;
+        state.ageEmaMs = 0;
 
         state.scriptStarted = false;
         state.scriptFade = 0;
@@ -1894,9 +2206,422 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     }
 
     // =========================================================================
+    // Link quality
+    //
+    // Loss is counted from the `seq_no` in the binary frame header (the server
+    // numbers every 10 ms packet), over a sliding window of one-second buckets.
+    // "Weak network" is shown only for sustained trouble: enough loss spread
+    // over several seconds, high arrival jitter or repeated underruns for a few
+    // evaluations in a row; a single short burst does not trigger it.
+    // =========================================================================
+    const QUALITY = {
+        windowSeconds: 10,
+        minPackets: 50, // do not judge on less than half a second of audio
+        fairLossPct: 0.5,
+        weakLossPct: 2,
+        weakLossSeconds: 3, // loss must be spread over this many seconds
+        weakTicks: 3, // consecutive 1 s evaluations before "weak" sticks
+        recoverTicks: 5, // consecutive clean evaluations before it clears
+        fairJitterMs: 30,
+        weakJitterMs: 80,
+        weakUnderruns: 3
+    };
+    const SEQ_DISCONTINUITY = 5000; // a jump this large is a restart, not loss
+
+    const quality = {
+        sec: -1,
+        recv: new Uint32Array(QUALITY.windowSeconds),
+        lost: new Uint32Array(QUALITY.windowSeconds),
+        under: new Uint32Array(QUALITY.windowSeconds),
+        lastUnderruns: 0,
+        weakStreak: 0,
+        okStreak: 0,
+        weak: false,
+        level: 'idle',
+        lossPct: 0,
+        packets: 0,
+        lostPackets: 0
+    };
+
+    function qualityAdvance(nowMs) {
+        const sec = Math.floor(nowMs / 1000);
+        if (quality.sec < 0 || sec - quality.sec >= QUALITY.windowSeconds) {
+            quality.recv.fill(0);
+            quality.lost.fill(0);
+            quality.under.fill(0);
+            quality.sec = sec;
+            return;
+        }
+        while (quality.sec < sec) {
+            quality.sec++;
+            const i = quality.sec % QUALITY.windowSeconds;
+            quality.recv[i] = 0;
+            quality.lost[i] = 0;
+            quality.under[i] = 0;
+        }
+    }
+
+    function qualityRecord(received, lost, nowMs) {
+        qualityAdvance(nowMs);
+        const i = quality.sec % QUALITY.windowSeconds;
+        quality.recv[i] += received;
+        quality.lost[i] += lost;
+    }
+
+    function qualityReset() {
+        quality.sec = -1;
+        quality.recv.fill(0);
+        quality.lost.fill(0);
+        quality.under.fill(0);
+        quality.lastUnderruns = 0;
+        quality.weakStreak = 0;
+        quality.okStreak = 0;
+        quality.weak = false;
+        quality.level = 'idle';
+        quality.lossPct = 0;
+        quality.packets = 0;
+        quality.lostPackets = 0;
+    }
+
+    // One evaluation step (called once a second). `live` is true while audio
+    // frames are flowing; otherwise the quality is simply "idle".
+    function qualityEvaluate(nowMs, live, underrunsTotal, jitterMs) {
+        if (!live) {
+            quality.weakStreak = 0;
+            quality.okStreak = 0;
+            quality.weak = false;
+            quality.level = 'idle';
+            quality.lossPct = 0;
+            quality.packets = 0;
+            quality.lostPackets = 0;
+            quality.lastUnderruns = underrunsTotal;
+            return quality;
+        }
+
+        qualityAdvance(nowMs);
+        const slot = quality.sec % QUALITY.windowSeconds;
+        const delta = underrunsTotal - quality.lastUnderruns;
+        if (delta > 0) quality.under[slot] += delta;
+        quality.lastUnderruns = underrunsTotal;
+
+        let recv = 0;
+        let lost = 0;
+        let under = 0;
+        let lossSeconds = 0;
+        for (let i = 0; i < QUALITY.windowSeconds; i++) {
+            recv += quality.recv[i];
+            lost += quality.lost[i];
+            under += quality.under[i];
+            if (quality.lost[i] > 0) lossSeconds++;
+        }
+        const total = recv + lost;
+        const lossPct = total >= QUALITY.minPackets ? (100 * lost) / total : 0;
+        quality.lossPct = lossPct;
+        quality.packets = total;
+        quality.lostPackets = lost;
+
+        const weakNow =
+            (lossPct >= QUALITY.weakLossPct && lossSeconds >= QUALITY.weakLossSeconds) ||
+            jitterMs >= QUALITY.weakJitterMs ||
+            under >= QUALITY.weakUnderruns;
+        const fairNow =
+            weakNow ||
+            lossPct >= QUALITY.fairLossPct ||
+            jitterMs >= QUALITY.fairJitterMs ||
+            under > 0;
+
+        if (weakNow) {
+            quality.weakStreak++;
+            quality.okStreak = 0;
+        } else {
+            quality.weakStreak = 0;
+            quality.okStreak = fairNow ? 0 : quality.okStreak + 1;
+        }
+        if (!quality.weak && quality.weakStreak >= QUALITY.weakTicks) {
+            quality.weak = true;
+        } else if (quality.weak && quality.okStreak >= QUALITY.recoverTicks) {
+            quality.weak = false;
+        }
+        quality.level = quality.weak ? 'weak' : fairNow ? 'fair' : 'good';
+        return quality;
+    }
+
+    // Rough end-to-end delay: what is queued for playback, the audio device's
+    // own output latency and how far recent packets ran behind the fastest
+    // ones. The network's floor delay (small on a LAN) is not measurable here.
+    function estimateLatencyMs() {
+        const sampleRate = state.bufferSampleRate || CONFIG.sampleRate;
+        const bufferMs = (Math.max(0, state.bufferFrames) / sampleRate) * 1000;
+        const ctx = state.audioContext;
+        const outputMs = ctx
+            ? ((ctx.outputLatency || 0) + (ctx.baseLatency || 0)) * 1000
+            : 0;
+        return Math.round(bufferMs + outputMs + state.ageEmaMs);
+    }
+
+    function setText(el, text) {
+        if (el && el.textContent !== text) el.textContent = text;
+    }
+
+    function updateQualityUI(live) {
+        const online = !!(state.ws && state.ws.readyState === WebSocket.OPEN);
+        if (els.qualityLabel) {
+            const text = live
+                ? quality.level.toUpperCase()
+                : online
+                    ? 'WAITING'
+                    : state.reconnecting
+                        ? 'RECONNECTING'
+                        : 'OFFLINE';
+            setText(els.qualityLabel, text);
+            const level = live ? quality.level : 'idle';
+            if (els.qualityLabel.getAttribute('data-level') !== level) {
+                els.qualityLabel.setAttribute('data-level', level);
+            }
+        }
+
+        if (live) {
+            const sampleRate = state.bufferSampleRate || CONFIG.sampleRate;
+            const bufferMs = Math.round((Math.max(0, state.bufferFrames) / sampleRate) * 1000);
+            setText(els.qualityLatency, '~' + estimateLatencyMs() + ' ms');
+            setText(
+                els.qualityBuffer,
+                bufferMs + ' ms / ' + Math.round(state.workletTargetMs) + ' ms'
+            );
+            setText(
+                els.qualityLoss,
+                quality.packets >= QUALITY.minPackets
+                    ? quality.lossPct.toFixed(1) + '% (' + quality.lostPackets + '/' + quality.packets + ')'
+                    : '--'
+            );
+        } else {
+            setText(els.qualityLatency, '--');
+            setText(els.qualityBuffer, '--');
+            setText(els.qualityLoss, '--');
+        }
+
+        if (els.qualityHint) {
+            const show = live && quality.weak;
+            if (els.qualityHint.hidden === show) els.qualityHint.hidden = !show;
+            if (show) {
+                setText(
+                    els.qualityHint,
+                    'Weak network: audio may stutter or drop out. Move closer to the router or switch to a better connection.'
+                );
+            }
+        }
+    }
+
+    function qualityTick() {
+        const now = performance.now();
+        const live = !!(
+            state.ws &&
+            state.ws.readyState === WebSocket.OPEN &&
+            state.streamActive
+        );
+        qualityEvaluate(now, live, state.underruns, state.jitterMs);
+        if (!document.hidden) updateQualityUI(live);
+    }
+
+    // =========================================================================
+    // Now playing (text message {"type":"now_playing","scene":...,"track":...})
+    // =========================================================================
+    function cleanLabel(value) {
+        if (typeof value !== 'string') return '';
+        // Control characters out, length capped: the text only ever lands in
+        // textContent, but it also goes to the OS media controls.
+        return value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 120);
+    }
+
+    function setNowPlaying(scene, track) {
+        state.nowPlaying.scene = cleanLabel(scene);
+        state.nowPlaying.track = cleanLabel(track);
+        const hasAny = !!(state.nowPlaying.scene || state.nowPlaying.track);
+
+        if (els.nowPlaying) els.nowPlaying.hidden = !hasAny;
+        const headline = state.nowPlaying.scene || state.nowPlaying.track;
+        setText(els.nowPlayingScene, headline);
+        if (els.nowPlayingScene) els.nowPlayingScene.title = headline;
+        if (els.nowPlayingTrack) {
+            const showTrack = !!(state.nowPlaying.scene && state.nowPlaying.track);
+            els.nowPlayingTrack.hidden = !showTrack;
+            setText(els.nowPlayingTrack, showTrack ? state.nowPlaying.track : '');
+            els.nowPlayingTrack.title = showTrack ? state.nowPlaying.track : '';
+        }
+        updateMediaSession();
+    }
+
+    // =========================================================================
+    // Wake Lock: keep the screen on while listening
+    //
+    // Only available in secure contexts (https or localhost); on a plain
+    // http:// LAN address the browser does not expose it and the row says so.
+    // The lock is released by the browser whenever the tab is hidden, so it is
+    // taken again when the tab comes back.
+    // =========================================================================
+    const wake = { sentinel: null, wanted: false, pending: false };
+
+    function setWakeState(text) {
+        setText(els.wakeLockState, text);
+    }
+
+    function wakeLockSupported() {
+        return !!(navigator.wakeLock && typeof navigator.wakeLock.request === 'function');
+    }
+
+    async function acquireWakeLock() {
+        wake.wanted = true;
+        if (!wakeLockSupported()) {
+            setWakeState(window.isSecureContext === false ? 'N/A (needs https)' : 'N/A');
+            return;
+        }
+        if (wake.sentinel || wake.pending || document.hidden) return;
+
+        wake.pending = true;
+        try {
+            const sentinel = await navigator.wakeLock.request('screen');
+            if (!wake.wanted) {
+                sentinel.release().catch(function () {});
+                return;
+            }
+            wake.sentinel = sentinel;
+            sentinel.addEventListener('release', function () {
+                if (wake.sentinel === sentinel) wake.sentinel = null;
+                if (wake.wanted) setWakeState('PAUSED');
+            });
+            setWakeState('ON');
+        } catch (e) {
+            // Denied (battery saver, no user activation yet): not fatal.
+            setWakeState('BLOCKED');
+        } finally {
+            wake.pending = false;
+        }
+    }
+
+    function releaseWakeLock() {
+        wake.wanted = false;
+        const sentinel = wake.sentinel;
+        wake.sentinel = null;
+        if (sentinel) sentinel.release().catch(function () {});
+        setWakeState(wakeLockSupported() ? 'OFF' : '--');
+    }
+
+    // =========================================================================
+    // Media Session: title on the lock screen and a pause button
+    //
+    // A lock-screen widget normally appears only for a media element, and the
+    // stream itself is Web Audio. So a looping silent <audio> element (a
+    // generated 10 s WAV, nothing to download) is played alongside it; it
+    // carries no sound and does not touch the real audio path.
+    // =========================================================================
+    const media = { audio: null, handlersSet: false };
+
+    function makeSilentWavUrl(seconds) {
+        const rate = 8000;
+        const n = rate * seconds;
+        const buf = new ArrayBuffer(44 + n);
+        const v = new DataView(buf);
+        const tag = function (offset, text) {
+            for (let i = 0; i < text.length; i++) v.setUint8(offset + i, text.charCodeAt(i));
+        };
+        tag(0, 'RIFF');
+        v.setUint32(4, 36 + n, true);
+        tag(8, 'WAVE');
+        tag(12, 'fmt ');
+        v.setUint32(16, 16, true);
+        v.setUint16(20, 1, true); // PCM
+        v.setUint16(22, 1, true); // mono
+        v.setUint32(24, rate, true);
+        v.setUint32(28, rate, true); // byte rate (8-bit mono)
+        v.setUint16(32, 1, true);
+        v.setUint16(34, 8, true);
+        tag(36, 'data');
+        v.setUint32(40, n, true);
+        new Uint8Array(buf, 44).fill(128); // 8-bit PCM silence
+        return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+    }
+
+    function updateMediaSession() {
+        if (!('mediaSession' in navigator)) return;
+        try {
+            const np = state.nowPlaying;
+            const title = np.track || np.scene || 'Bardwave live';
+            const artist = np.track && np.scene ? np.scene : 'Bardwave';
+            if (window.MediaMetadata) {
+                navigator.mediaSession.metadata = new window.MediaMetadata({
+                    title: title,
+                    artist: artist,
+                    album: 'Bardwave',
+                    artwork: [
+                        { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+                        { src: '/icon-512.png', sizes: '512x512', type: 'image/png' }
+                    ]
+                });
+            }
+            navigator.mediaSession.playbackState = state.shouldReconnect ? 'playing' : 'paused';
+        } catch (e) {
+            // Media Session is a nicety; never let it break playback.
+        }
+    }
+
+    function startMediaSession() {
+        if (!('mediaSession' in navigator)) return;
+        try {
+            if (!media.audio) {
+                const audio = new Audio();
+                audio.loop = true;
+                audio.setAttribute('playsinline', '');
+                audio.src = makeSilentWavUrl(10);
+                media.audio = audio;
+            }
+            const started = media.audio.play();
+            if (started && typeof started.catch === 'function') {
+                started.catch(function () {});
+            }
+
+            if (!media.handlersSet) {
+                media.handlersSet = true;
+                const bind = function (action, handler) {
+                    try {
+                        navigator.mediaSession.setActionHandler(action, handler);
+                    } catch (e) {
+                        // Action not supported by this browser.
+                    }
+                };
+                // A live stream cannot be paused in place: pausing leaves the
+                // link, playing joins it again at the current position.
+                bind('pause', function () { stopListening(); });
+                bind('stop', function () { stopListening(); });
+                bind('play', function () {
+                    if (!state.shouldReconnect) {
+                        startListening().catch(function (e) {
+                            error('Resume from media controls failed:', e);
+                        });
+                    }
+                });
+            }
+        } catch (e) {
+            // Autoplay policy or unsupported: the page works without it.
+        }
+        updateMediaSession();
+    }
+
+    function stopMediaSession() {
+        if (media.audio) {
+            try { media.audio.pause(); } catch (e) { /* ignore */ }
+        }
+        updateMediaSession();
+    }
+
+    // =========================================================================
     // Events
     // =========================================================================
     async function onConnectClick() {
+        // Waiting for a retry (or retrying): the button gives up.
+        if (state.reconnecting) {
+            disconnect();
+            return;
+        }
         if (state.isConnecting) return;
 
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
@@ -1905,13 +2630,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         }
 
         try {
-            await initAudio();
-
-            if (state.audioContext.state === 'suspended') {
-                await state.audioContext.resume();
-            }
-
-            connect();
+            await startListening();
         } catch (e) {
             error('Failed to initialize audio:', e);
             setStatus('error', 'Audio Error');
@@ -1931,15 +2650,26 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         // Keep the stream running while hidden. The worklet continues to
         // consume audio; the ring buffer caps latency, so there is no need to
         // drop packets or clear the queue when the tab becomes visible again.
+        if (document.hidden) return;
+
         if (
-            !document.hidden &&
             state.audioContext &&
-            state.audioContext.state === 'suspended' &&
+            (state.audioContext.state === 'suspended' ||
+                state.audioContext.state === 'interrupted') &&
             state.ws &&
             state.ws.readyState === WebSocket.OPEN
         ) {
             state.audioContext.resume().catch(function () {});
         }
+        // The browser dropped the wake lock when the tab was hidden.
+        if (wake.wanted) acquireWakeLock();
+        // Back on the page after a lost link: do not sit out the delay.
+        retryNow();
+        qualityTick();
+    }
+
+    function onOnline() {
+        retryNow();
     }
 
     function onBeforeUnload() {
@@ -2043,7 +2773,11 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         els.connectBtn.addEventListener('click', onConnectClick);
         els.dismissBtn.addEventListener('click', hideMessage);
         document.addEventListener('visibilitychange', onVisibilityChange);
+        window.addEventListener('online', onOnline);
         window.addEventListener('beforeunload', onBeforeUnload);
+        setWakeState(wakeLockSupported() ? 'OFF' : '--');
+        updateQualityUI(false);
+        setInterval(qualityTick, 1000);
 
         // 5 fps animation tick when music is playing: briefly resume
         // paused CSS animations every 200 ms.
@@ -2111,7 +2845,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
                 matrixDrops[i]++;
             }
         }
-        setInterval(draw, 60);
+        matrixInterval = setInterval(draw, 60);
     }
 
     function runBootLoader() {
@@ -2127,9 +2861,16 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             return;
         }
 
-        initMatrixRain();
+        const reduceMotion = !!(
+            window.matchMedia &&
+            window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        );
+        // Reduced motion: no rain, and the boot animation is only a blink.
+        if (!reduceMotion) initMatrixRain();
 
-        const durationMs = 6000 + Math.floor(Math.random() * 4000); // 6-10 s
+        const durationMs = reduceMotion
+            ? 300
+            : 6000 + Math.floor(Math.random() * 4000); // 6-10 s
         const start = performance.now();
         let completed = false;
 
@@ -2198,6 +2939,14 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             return Object.assign({}, state);
         },
         connect: connect,
-        disconnect: disconnect
+        disconnect: disconnect,
+        // Pure helpers, exposed so they can be exercised from the console.
+        _internals: {
+            handleControlMessage: handleControlMessage,
+            reconnectDelayMs: reconnectDelayMs,
+            qualityEvaluate: qualityEvaluate,
+            qualityRecord: qualityRecord,
+            qualityReset: qualityReset
+        }
     };
 })();

@@ -11,8 +11,12 @@
 //! off. A new key can be issued from the console at any time; listeners that
 //! connected with the old one are disconnected right away.
 
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use tokio::sync::watch;
 
 /// Query parameter that carries the key.
@@ -101,12 +105,357 @@ pub fn generate_key() -> String {
         .collect()
 }
 
-/// Compare without leaking the position of the first mismatch through timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Compare without leaking the position of the first mismatch or the length
+/// of the expected value through timing: the loop always walks the longer of
+/// the two inputs.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
     }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// Game-master token (remote control panel)
+// ---------------------------------------------------------------------------
+
+/// Query parameter that carries the game-master token (`/control?g=…`,
+/// `/ws/control?g=…`). Headers cannot be set on a link or a WebSocket from a
+/// browser, so the parameter exists next to `Authorization: Bearer`.
+pub const GM_PARAM: &str = "g";
+
+/// WebSocket close code sent to a remote panel when the game-master token it
+/// used was replaced.
+pub const CLOSE_GM_TOKEN_REVOKED: u16 = 4003;
+
+/// Failed attempts per client address before it is locked out for a while.
+pub const GM_MAX_FAILURES: usize = 10;
+
+/// The window in which [`GM_MAX_FAILURES`] failures lock a client out.
+pub const GM_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Multiplier of [`GM_MAX_FAILURES`] for requests relayed by a proxy or tunnel
+/// on this computer (see [`GmAuth`]): such clients share one address.
+pub const GM_PROXY_FAILURE_FACTOR: usize = 6;
+
+/// The game-master token, shared by the console and the server.
+///
+/// Unlike [`AccessGuard`] there is no "open" state: with no token (or an empty
+/// one) nobody can authenticate remotely, and the panel is reachable from this
+/// computer only. The listener key never opens the panel.
+#[derive(Clone, Debug)]
+pub struct GmGuard {
+    token: Arc<watch::Sender<Option<String>>>,
+}
+
+impl Default for GmGuard {
+    /// No token: remote access disabled.
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl GmGuard {
+    /// A guard for `token`; an empty token means "no remote access".
+    pub fn new(token: Option<String>) -> Self {
+        let token = token.filter(|t| !t.trim().is_empty());
+        let (tx, _) = watch::channel(token);
+        Self {
+            token: Arc::new(tx),
+        }
+    }
+
+    /// The token currently in force, if any.
+    pub fn current(&self) -> Option<String> {
+        self.token.borrow().clone()
+    }
+
+    /// Whether remote access is possible at all (a token is set).
+    pub fn remote_enabled(&self) -> bool {
+        self.token.borrow().is_some()
+    }
+
+    /// Replace the token. Remote sessions opened with the old one are closed.
+    pub fn set(&self, token: Option<String>) {
+        self.token
+            .send_replace(token.filter(|t| !t.trim().is_empty()));
+    }
+
+    /// Follow token changes (a remote session watches this).
+    pub fn subscribe(&self) -> watch::Receiver<Option<String>> {
+        self.token.subscribe()
+    }
+
+    /// Whether `provided` is the token. Always false while no token is set,
+    /// whatever is provided (an empty string included).
+    pub fn allows(&self, provided: Option<&str>) -> bool {
+        match (self.token.borrow().as_deref(), provided) {
+            (Some(expected), Some(p)) => constant_time_eq(p.as_bytes(), expected.as_bytes()),
+            _ => false,
+        }
+    }
+
+    /// The link the game master opens on a phone (`<url>/control?g=…`), or
+    /// `None` while remote access is disabled.
+    pub fn share_url(&self, url: &str) -> Option<String> {
+        self.current()
+            .map(|t| format!("{}/control?{GM_PARAM}={t}", url.trim_end_matches('/')))
+    }
+}
+
+/// How a request got access to the control panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GmAccess {
+    /// From this computer, without a token.
+    Local,
+    /// From anywhere, with the game-master token.
+    Token,
+}
+
+/// Why a request was turned away. Deliberately coarse: it never says whether a
+/// token was wrong, missing or disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GmDenied {
+    /// 401.
+    Unauthorized,
+    /// 429: too many failed attempts from this address.
+    TooManyAttempts { retry_after_secs: u64 },
+}
+
+/// Remembers recent failed attempts per client address.
+#[derive(Debug)]
+pub struct AttemptLimiter {
+    max_failures: usize,
+    window: Duration,
+    failures: HashMap<IpAddr, VecDeque<Instant>>,
+}
+
+/// Addresses tracked at once; past this the table is pruned (and, if need be,
+/// reset) so an address-spraying client cannot grow it without bound.
+const MAX_TRACKED_ADDRESSES: usize = 4096;
+
+impl AttemptLimiter {
+    pub fn new(max_failures: usize, window: Duration) -> Self {
+        Self {
+            max_failures,
+            window,
+            failures: HashMap::new(),
+        }
+    }
+
+    /// One IPv6 /64 is one client (a host owns the whole prefix), IPv4-mapped
+    /// IPv6 is the IPv4 address.
+    fn key(ip: IpAddr) -> IpAddr {
+        match ip.to_canonical() {
+            IpAddr::V6(v6) => {
+                let mut octets = v6.octets();
+                octets[8..].fill(0);
+                IpAddr::V6(octets.into())
+            }
+            v4 => v4,
+        }
+    }
+
+    fn prune(queue: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+        while queue
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= window)
+        {
+            queue.pop_front();
+        }
+    }
+
+    /// `Some(wait)` while `ip` is locked out.
+    pub fn blocked_for(&mut self, ip: IpAddr, now: Instant) -> Option<Duration> {
+        let window = self.window;
+        let queue = self.failures.get_mut(&Self::key(ip))?;
+        Self::prune(queue, now, window);
+        if queue.len() < self.max_failures {
+            return None;
+        }
+        // Locked until the oldest counted failure leaves the window.
+        let oldest = *queue.front()?;
+        Some((oldest + window).saturating_duration_since(now))
+    }
+
+    /// Count one failed attempt.
+    pub fn record_failure(&mut self, ip: IpAddr, now: Instant) {
+        let window = self.window;
+        if self.failures.len() >= MAX_TRACKED_ADDRESSES {
+            self.failures.retain(|_, q| {
+                Self::prune(q, now, window);
+                !q.is_empty()
+            });
+            if self.failures.len() >= MAX_TRACKED_ADDRESSES {
+                self.failures.clear();
+            }
+        }
+        let queue = self.failures.entry(Self::key(ip)).or_default();
+        Self::prune(queue, now, window);
+        // Never hold more than needed to decide.
+        if queue.len() < self.max_failures {
+            queue.push_back(now);
+        }
+    }
+}
+
+/// Decides whether a peer address is "this computer". Replaceable so tests can
+/// pretend to be a remote client while connecting over loopback.
+pub type LocalityFn = Arc<dyn Fn(&SocketAddr) -> bool + Send + Sync>;
+
+/// The default locality test: the socket's peer is a loopback address.
+pub fn is_loopback_peer(addr: &SocketAddr) -> bool {
+    addr.ip().to_canonical().is_loopback()
+}
+
+/// Access rules of the control panel (`/control`, `/api/control/*`,
+/// `/ws/control`): who may come in, and how often they may guess.
+///
+/// * loopback peers need no token (as before), unless the request was relayed
+///   by a reverse proxy / tunnel running on this computer (`proxied`): then
+///   the peer is the proxy, not the client, and a token is required;
+/// * everyone else needs the game-master token;
+/// * no token configured = no remote access;
+/// * [`GM_MAX_FAILURES`] failures within [`GM_FAILURE_WINDOW`] lock the
+///   address out; while locked even the right token is refused.
+///
+/// "Local" comes from the socket address only: `X-Forwarded-For` and friends
+/// are never believed (they can only make a request *less* trusted).
+///
+/// # Lockout behind a proxy or tunnel
+///
+/// The limiter counts failures per socket address. Behind a reverse proxy or
+/// tunnel (cloudflared, ngrok, nginx...) running on this computer every remote
+/// client arrives from the proxy's loopback address, so they would all share
+/// one counter, and one noisy or hostile client would lock the real game master
+/// out of the panel. Such requests (proxy headers present *and* a loopback
+/// peer) therefore use a separate, more tolerant counter: its limit is
+/// [`GM_PROXY_FAILURE_FACTOR`] times [`GM_MAX_FAILURES`]. Brute-forcing the
+/// token stays infeasible at that rate, and direct clients keep the strict
+/// per-address limit, which a client cannot escape by adding proxy headers
+/// (the relaxed counter applies only when the peer really is loopback).
+///
+/// Known limitation: clients behind the same proxy still share the relaxed
+/// counter, so a hostile one can lock the others out by exceeding it. The
+/// forwarded address is not used to tell them apart because the client controls
+/// it and could rotate it to dodge the limit. Rotating the game-master token
+/// from the console or reaching the panel locally is the way out.
+#[derive(Clone)]
+pub struct GmAuth {
+    guard: GmGuard,
+    limiter: Arc<Mutex<AttemptLimiter>>,
+    /// Failures of requests relayed by a proxy on this computer.
+    proxy_limiter: Arc<Mutex<AttemptLimiter>>,
+    is_local: LocalityFn,
+}
+
+impl std::fmt::Debug for GmAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GmAuth")
+            .field("remote_enabled", &self.guard.remote_enabled())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GmAuth {
+    pub fn new(guard: GmGuard) -> Self {
+        Self {
+            guard,
+            limiter: Arc::new(Mutex::new(AttemptLimiter::new(
+                GM_MAX_FAILURES,
+                GM_FAILURE_WINDOW,
+            ))),
+            proxy_limiter: Arc::new(Mutex::new(AttemptLimiter::new(
+                GM_MAX_FAILURES * GM_PROXY_FAILURE_FACTOR,
+                GM_FAILURE_WINDOW,
+            ))),
+            is_local: Arc::new(is_loopback_peer),
+        }
+    }
+
+    /// Replace the "is this peer local" test (tests use it to simulate a
+    /// remote client over loopback).
+    pub fn with_locality(mut self, is_local: LocalityFn) -> Self {
+        self.is_local = is_local;
+        self
+    }
+
+    /// Replace the limiters (tests use small ones): the strict per-address one
+    /// gets `max_failures`, the proxy one [`GM_PROXY_FAILURE_FACTOR`] times
+    /// that.
+    pub fn with_limits(mut self, max_failures: usize, window: Duration) -> Self {
+        self.limiter = Arc::new(Mutex::new(AttemptLimiter::new(max_failures, window)));
+        self.proxy_limiter = Arc::new(Mutex::new(AttemptLimiter::new(
+            max_failures * GM_PROXY_FAILURE_FACTOR,
+            window,
+        )));
+        self
+    }
+
+    /// The token guard.
+    pub fn guard(&self) -> &GmGuard {
+        &self.guard
+    }
+
+    /// Decide one request. `bearer` / `query` are the two places a token may
+    /// come from; `proxied` says the request carries reverse-proxy headers.
+    pub fn authorize(
+        &self,
+        peer: Option<SocketAddr>,
+        proxied: bool,
+        bearer: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<GmAccess, GmDenied> {
+        self.authorize_at(peer, proxied, bearer, query, Instant::now())
+    }
+
+    /// [`authorize`](Self::authorize) with an explicit clock.
+    pub fn authorize_at(
+        &self,
+        peer: Option<SocketAddr>,
+        proxied: bool,
+        bearer: Option<&str>,
+        query: Option<&str>,
+        now: Instant,
+    ) -> Result<GmAccess, GmDenied> {
+        if !proxied && peer.as_ref().is_some_and(|p| (self.is_local)(p)) {
+            return Ok(GmAccess::Local);
+        }
+        // A peer-less request cannot be told apart from another one: they
+        // share one bucket.
+        let ip = peer
+            .map(|p| p.ip())
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+        // A request relayed by a proxy on this computer carries the proxy's
+        // loopback address, not the client's: count it apart (see the type docs).
+        let relayed = proxied && peer.as_ref().is_some_and(|p| (self.is_local)(p));
+        let mut limiter = if relayed {
+            self.proxy_limiter.lock()
+        } else {
+            self.limiter.lock()
+        };
+        if let Some(wait) = limiter.blocked_for(ip, now) {
+            // Round up, never advertise 0.
+            let retry_after_secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+            return Err(GmDenied::TooManyAttempts {
+                retry_after_secs: retry_after_secs.max(1),
+            });
+        }
+        // Both candidates are always compared (no short-circuit on the first).
+        let by_header = self.guard.allows(bearer);
+        let by_query = self.guard.allows(query);
+        if by_header | by_query {
+            Ok(GmAccess::Token)
+        } else {
+            limiter.record_failure(ip, now);
+            Err(GmDenied::Unauthorized)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -159,5 +508,229 @@ mod tests {
             .bytes()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn constant_time_eq_handles_lengths() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn gm_guard_without_a_token_never_matches() {
+        let guard = GmGuard::default();
+        assert!(!guard.allows(None));
+        assert!(!guard.allows(Some("")));
+        assert!(!guard.allows(Some("anything")));
+        assert!(GmGuard::new(Some(String::new())).current().is_none());
+        assert!(GmGuard::new(Some("  ".into())).current().is_none());
+        assert!(!guard.remote_enabled());
+        assert_eq!(guard.share_url("http://10.0.0.2:8080"), None);
+    }
+
+    #[test]
+    fn gm_guard_needs_the_exact_token() {
+        let guard = GmGuard::new(Some("tok123".into()));
+        assert!(guard.allows(Some("tok123")));
+        assert!(!guard.allows(Some("tok12")));
+        assert!(!guard.allows(Some("tok1234")));
+        assert!(!guard.allows(None));
+        assert_eq!(
+            guard.share_url("http://10.0.0.2:8080/").as_deref(),
+            Some("http://10.0.0.2:8080/control?g=tok123")
+        );
+        let rx = guard.subscribe();
+        guard.set(Some("new".into()));
+        assert!(rx.has_changed().unwrap());
+        assert!(!guard.allows(Some("tok123")));
+    }
+
+    fn peer(ip: &str) -> Option<SocketAddr> {
+        Some(SocketAddr::new(ip.parse().unwrap(), 50_000))
+    }
+
+    #[test]
+    fn auth_local_needs_no_token_remote_does() {
+        let auth = GmAuth::new(GmGuard::new(Some("secret".into())));
+        assert_eq!(
+            auth.authorize(peer("127.0.0.1"), false, None, None),
+            Ok(GmAccess::Local)
+        );
+        assert_eq!(
+            auth.authorize(peer("::1"), false, None, None),
+            Ok(GmAccess::Local)
+        );
+        assert_eq!(
+            auth.authorize(peer("::ffff:127.0.0.1"), false, None, None),
+            Ok(GmAccess::Local)
+        );
+        assert_eq!(
+            auth.authorize(peer("192.168.1.9"), false, None, None),
+            Err(GmDenied::Unauthorized)
+        );
+        assert_eq!(
+            auth.authorize(peer("192.168.1.9"), false, Some("secret"), None),
+            Ok(GmAccess::Token)
+        );
+        assert_eq!(
+            auth.authorize(peer("192.168.1.9"), false, None, Some("secret")),
+            Ok(GmAccess::Token)
+        );
+        // No peer address at all is never local.
+        assert_eq!(
+            auth.authorize(None, false, None, None),
+            Err(GmDenied::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn proxied_loopback_requests_are_treated_as_remote() {
+        let auth = GmAuth::new(GmGuard::new(Some("secret".into())));
+        assert_eq!(
+            auth.authorize(peer("127.0.0.1"), true, None, None),
+            Err(GmDenied::Unauthorized)
+        );
+        assert_eq!(
+            auth.authorize(peer("127.0.0.1"), true, Some("secret"), None),
+            Ok(GmAccess::Token)
+        );
+    }
+
+    #[test]
+    fn empty_token_forbids_remote_access_even_with_an_empty_credential() {
+        let auth = GmAuth::new(GmGuard::new(Some(String::new())));
+        for provided in [None, Some(""), Some("x")] {
+            assert_eq!(
+                auth.authorize(peer("10.1.1.1"), false, provided, provided),
+                Err(GmDenied::Unauthorized)
+            );
+        }
+        // The same answer as for a wrong token: nothing is revealed.
+        let keyed = GmAuth::new(GmGuard::new(Some("secret".into())));
+        assert_eq!(
+            keyed.authorize(peer("10.1.1.1"), false, Some("nope"), None),
+            Err(GmDenied::Unauthorized)
+        );
+        assert_eq!(
+            auth.authorize(peer("127.0.0.1"), false, None, None),
+            Ok(GmAccess::Local)
+        );
+    }
+
+    #[test]
+    fn limiter_locks_out_after_repeated_failures_and_recovers() {
+        let auth = GmAuth::new(GmGuard::new(Some("secret".into())))
+            .with_limits(3, Duration::from_secs(60));
+        let t0 = Instant::now();
+        let ip = peer("203.0.113.7");
+        for _ in 0..3 {
+            assert_eq!(
+                auth.authorize_at(ip, false, Some("bad"), None, t0),
+                Err(GmDenied::Unauthorized)
+            );
+        }
+        // Locked: even the right token is refused.
+        match auth.authorize_at(ip, false, Some("secret"), None, t0 + Duration::from_secs(1)) {
+            Err(GmDenied::TooManyAttempts { retry_after_secs }) => {
+                assert!((1..=60).contains(&retry_after_secs), "{retry_after_secs}");
+            }
+            other => panic!("expected a lockout, got {other:?}"),
+        }
+        // Other addresses are unaffected.
+        assert_eq!(
+            auth.authorize_at(peer("203.0.113.8"), false, Some("secret"), None, t0),
+            Ok(GmAccess::Token)
+        );
+        // The lockout expires with the window.
+        assert_eq!(
+            auth.authorize_at(
+                ip,
+                false,
+                Some("secret"),
+                None,
+                t0 + Duration::from_secs(61)
+            ),
+            Ok(GmAccess::Token)
+        );
+    }
+
+    #[test]
+    fn proxied_clients_do_not_lock_out_direct_ones_and_get_a_wider_budget() {
+        let auth = GmAuth::new(GmGuard::new(Some("secret".into())))
+            .with_limits(3, Duration::from_secs(60));
+        let t0 = Instant::now();
+        let proxy = peer("127.0.0.1");
+        // More failures than the strict limit do not lock the shared address...
+        for _ in 0..(3 * GM_PROXY_FAILURE_FACTOR - 1) {
+            assert_eq!(
+                auth.authorize_at(proxy, true, Some("bad"), None, t0),
+                Err(GmDenied::Unauthorized)
+            );
+        }
+        assert_eq!(
+            auth.authorize_at(proxy, true, Some("secret"), None, t0),
+            Ok(GmAccess::Token)
+        );
+        // ...until the wider budget is spent.
+        assert_eq!(
+            auth.authorize_at(proxy, true, Some("bad"), None, t0),
+            Err(GmDenied::Unauthorized)
+        );
+        assert!(matches!(
+            auth.authorize_at(proxy, true, Some("secret"), None, t0),
+            Err(GmDenied::TooManyAttempts { .. })
+        ));
+        // A direct client has its own, strict counter and is unaffected.
+        let direct = peer("203.0.113.7");
+        assert_eq!(
+            auth.authorize_at(direct, false, Some("secret"), None, t0),
+            Ok(GmAccess::Token)
+        );
+        for _ in 0..3 {
+            let _ = auth.authorize_at(direct, false, Some("bad"), None, t0);
+        }
+        assert!(matches!(
+            auth.authorize_at(direct, false, Some("secret"), None, t0),
+            Err(GmDenied::TooManyAttempts { .. })
+        ));
+    }
+
+    #[test]
+    fn faking_proxy_headers_does_not_widen_a_direct_clients_budget() {
+        let auth = GmAuth::new(GmGuard::new(Some("secret".into())))
+            .with_limits(3, Duration::from_secs(60));
+        let t0 = Instant::now();
+        let remote = peer("203.0.113.7");
+        for _ in 0..3 {
+            let _ = auth.authorize_at(remote, true, Some("bad"), None, t0);
+        }
+        assert!(matches!(
+            auth.authorize_at(remote, true, Some("secret"), None, t0),
+            Err(GmDenied::TooManyAttempts { .. })
+        ));
+    }
+
+    #[test]
+    fn limiter_groups_ipv6_by_prefix_and_bounds_its_memory() {
+        let mut limiter = AttemptLimiter::new(2, Duration::from_secs(60));
+        let now = Instant::now();
+        limiter.record_failure("2001:db8::1".parse().unwrap(), now);
+        limiter.record_failure("2001:db8::2".parse().unwrap(), now);
+        assert!(limiter
+            .blocked_for("2001:db8::ffff".parse().unwrap(), now)
+            .is_some());
+        assert!(limiter
+            .blocked_for("2001:db9::1".parse().unwrap(), now)
+            .is_none());
+
+        let mut limiter = AttemptLimiter::new(2, Duration::from_secs(60));
+        for i in 0..(MAX_TRACKED_ADDRESSES as u32 * 2) {
+            limiter.record_failure(IpAddr::V4(i.into()), now);
+        }
+        assert!(limiter.failures.len() <= MAX_TRACKED_ADDRESSES);
     }
 }

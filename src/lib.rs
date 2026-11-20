@@ -7,7 +7,14 @@ pub mod audio;
 pub mod config;
 pub mod error;
 pub mod gui;
+pub mod hotkeys;
+pub mod library_bundle;
+pub mod library_query;
+pub mod library_scan;
 pub mod network;
+pub mod paths;
+pub mod profiles;
+pub mod updates;
 
 /// SoundShared version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

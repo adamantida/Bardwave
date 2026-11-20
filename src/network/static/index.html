@@ -1,9 +1,28 @@
 <!DOCTYPE html><html lang="en"><head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="color-scheme" content="dark">
-    <title>SoundShared | CRT Glitch Terminal</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%2339ff7a'/%3E%3C/svg%3E">
+    <meta name="theme-color" content="#000000">
+    <title>Bardwave Listener</title>
+    <!-- PWA: installable to the home screen. No service worker: the stream is live. -->
+    <link rel="manifest" href="/manifest.webmanifest" id="manifestLink">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Bardwave">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+    <script>
+        // A home-screen shortcut opens the manifest's start_url, so the manifest
+        // is requested with the access key of this link and echoes it there.
+        try {
+            var accessKey = new URLSearchParams(location.search).get('k');
+            if (accessKey) {
+                document.getElementById('manifestLink').href =
+                    '/manifest.webmanifest?k=' + encodeURIComponent(accessKey);
+            }
+        } catch (e) { /* the page works without it */ }
+    </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://code.iconify.design/iconify-icon/1.0.7/iconify-icon.min.js"></script>
     <style>
@@ -402,6 +421,125 @@
             98% { filter: hue-rotate(180deg); opacity: 0.9; }
             99% { filter: hue-rotate(270deg); opacity: 0.4; }
         }
+
+        /* ------------------------------------------------------------------
+           Listener extras: reconnect state, link quality, now playing,
+           accessibility. Scoped by id so they win over the Tailwind CDN
+           utility classes that are injected after this block.
+           ------------------------------------------------------------------ */
+        body {
+            padding: env(safe-area-inset-top) env(safe-area-inset-right)
+                     env(safe-area-inset-bottom) env(safe-area-inset-left);
+        }
+
+        .status-dot.reconnecting { background: var(--amber); box-shadow: 0 0 10px var(--amber); animation: status-pulse 1.2s infinite step-end; }
+        .status-text.reconnecting { color: var(--amber); }
+
+        .now-playing {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 4px 12px;
+            padding: 10px 12px;
+            border: 1px solid var(--panel-border);
+            border-left: 2px solid var(--phosphor);
+            background: var(--panel);
+        }
+        .now-playing[hidden] { display: none; }
+        .now-playing-label {
+            font-size: 10px;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: #6fcf8f;
+        }
+        .now-playing-scene {
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--phosphor);
+            /* One line each; a long title is cut with an ellipsis (the full
+               text is in the title attribute). */
+            max-width: 100%;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .now-playing-track {
+            font-size: 12px;
+            color: #b8e6c6;
+            max-width: 100%;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .now-playing-track[hidden] { display: none; }
+
+        .quality-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            font-size: 11px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(20, 83, 45, 0.45);
+        }
+        .quality-row:last-of-type { border-bottom: none; padding-bottom: 0; }
+        .quality-key { color: #6fcf8f; }
+        .quality-val { color: #ffffff; text-align: right; font-variant-numeric: tabular-nums; }
+        .quality-badge { font-weight: 800; letter-spacing: 0.12em; }
+        .quality-badge[data-level="good"] { color: var(--phosphor); }
+        .quality-badge[data-level="fair"] { color: var(--amber); }
+        .quality-badge[data-level="weak"] { color: #ff6b6b; }
+        .quality-badge[data-level="idle"] { color: #9ca3a0; }
+        .quality-hint {
+            margin: 0;
+            padding: 8px 10px;
+            border: 1px solid #ff6b6b;
+            color: #ffb3b3;
+            font-size: 11px;
+            line-height: 1.5;
+        }
+        .quality-hint[hidden] { display: none; }
+
+        /* Readable contrast on black for the dim Tailwind greens and faded text. */
+        #mainApp .text-green-800,
+        #mainApp .text-green-900,
+        #bootLoader .text-green-800 { color: #6fcf8f; }
+        #mainApp .opacity-60,
+        #mainApp .opacity-80 { opacity: 1; color: #a7d9b6; }
+        #systemToast { opacity: 1; border-color: var(--panel-border); }
+        #systemToast #systemToastText,
+        #systemToast iconify-icon { color: #8fd6a6; }
+        #mainApp .volume-value { color: var(--phosphor); }
+
+        :focus-visible {
+            outline: 2px solid var(--amber);
+            outline-offset: 2px;
+        }
+        .volume-slider:focus-visible { outline-offset: 6px; }
+
+        h1, h2, h3 { overflow-wrap: anywhere; }
+
+        @media (max-width: 480px) {
+            #mainApp .app-title { font-size: clamp(1.6rem, 9vw, 2.4rem); }
+            #bootLoader .boot-title { font-size: clamp(1.6rem, 9vw, 2.4rem); }
+            #mainApp .panel-pad { padding: 1.25rem; }
+            #mainApp .stat-card { padding: 1rem; }
+            #mainApp > div { padding-left: 1rem; padding-right: 1rem; }
+        }
+
+        /* Reduced motion: no glitch, no flicker, no rain; state is still shown
+           by the colour and text of the status indicators. */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation: none !important;
+                transition: none !important;
+                scroll-behavior: auto !important;
+            }
+            .pixel-corruption, .screen-tear, .scanlines, #matrixRain { display: none !important; }
+            .crt-content { filter: none !important; transform: none !important; }
+            #mainApp { opacity: 1; transform: none; }
+        }
     </style>
 </head>
 <body>
@@ -424,7 +562,7 @@
         <div class="relative z-[70] w-full max-w-md p-8 text-center">
             <div class="mb-6">
                 <div class="text-[10px] uppercase tracking-widest text-green-800 mb-2 block glitch">BOOT_SEQUENCE_INIT</div>
-                <h1 class="text-5xl font-black phosphor-glow glitch tracking-tighter uppercase mb-2">
+                <h1 class="boot-title text-5xl font-black phosphor-glow glitch tracking-tighter uppercase mb-2">
                     SOUND_SHARED<span class="cursor-blink"></span>
                 </h1>
                 <p class="text-xs font-medium max-w-md border-l-2 border-green-900/50 pl-4 opacity-80 mx-auto">
@@ -472,7 +610,7 @@
                     <span class="text-xs tracking-widest text-[#39ff7a] border border-[#39ff7a] px-2 py-0.5">0x7F_PROTOCOL</span>
                     <span class="text-xs tracking-widest text-amber-500">PROMPT_ACTIVE</span>
                 </div>
-                <h1 class="text-6xl font-black phosphor-glow glitch tracking-tighter uppercase">
+                <h1 class="app-title text-6xl font-black phosphor-glow glitch tracking-tighter uppercase">
                     SOUND_SHARED<span class="animate-pulse">_</span>
                 </h1>
                 <p class="text-xs font-medium max-w-md border-l-2 border-green-900/50 pl-4 opacity-80">
@@ -483,7 +621,7 @@
             <div class="terminal-box flex items-center gap-4 p-4 border-dashed">
                 <div class="flex flex-col items-end">
                     <span class="text-[10px] text-green-900 uppercase tracking-widest">Status_Report</span>
-                    <span id="statusText" class="status-text disconnected amber-glow font-bold text-sm uppercase">Node Offline</span>
+                    <span id="statusText" class="status-text disconnected amber-glow font-bold text-sm uppercase" role="status" aria-live="polite" aria-atomic="true">Node Offline</span>
                 </div>
                 <span id="statusIndicator" class="status-dot disconnected" aria-hidden="true"></span>
                 <div class="w-3 h-3 bg-amber-500 shadow-[0_0_10px_rgba(255,210,74,0.8)]"></div>
@@ -499,7 +637,12 @@
                         <div class="dot dot-green"></div>
                         <span class="text-[10px] ml-4 text-green-800">/dev/soundshared/audio_output_v1</span>
                     </div>
-                    <div class="p-10 space-y-12">
+                    <div class="panel-pad p-10 space-y-12">
+                        <div id="nowPlaying" class="now-playing" role="status" aria-live="polite" aria-atomic="true" hidden>
+                            <span class="now-playing-label">Now_Playing</span>
+                            <span id="nowPlayingScene" class="now-playing-scene"></span>
+                            <span id="nowPlayingTrack" class="now-playing-track" hidden></span>
+                        </div>
                         <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-8">
                             <div class="space-y-2">
                                 <h2 class="text-xl font-bold uppercase tracking-widest phosphor-glow glitch">_ESTABLISH_HANDSHAKE</h2>
@@ -549,15 +692,15 @@
                 </section>
 
                 <section class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <div class="terminal-box p-6">
+                    <div class="stat-card terminal-box p-6">
                         <span class="text-[9px] uppercase tracking-widest text-green-800 mb-4 block glitch">UNDERRUN_ERR</span>
                         <span id="statsUnderruns" class="text-3xl font-bold text-amber-500 glitch">0</span>
                     </div>
-                    <div class="terminal-box p-6 border-l-2 border-l-[#39ff7a]">
+                    <div class="stat-card terminal-box p-6 border-l-2 border-l-[#39ff7a]">
                         <span class="text-[9px] uppercase tracking-widest text-green-800 mb-4 block glitch">OVERRUN_ERR</span>
                         <span id="statsOverruns" class="text-3xl font-bold phosphor-glow glitch">0</span>
                     </div>
-                    <div class="terminal-box p-6">
+                    <div class="stat-card terminal-box p-6">
                         <span class="text-[9px] uppercase tracking-widest text-green-800 mb-4 block glitch">LOST_FRAMES</span>
                         <span id="statsLost" class="text-3xl font-bold text-amber-500 glitch">0</span>
                     </div>
@@ -565,6 +708,33 @@
             </div>
 
             <aside class="lg:col-span-4 space-y-8">
+                <div id="qualityPanel" class="terminal-box border-dashed">
+                    <div class="panel-pad p-6 space-y-4">
+                        <h3 class="text-xs font-bold uppercase tracking-widest phosphor-glow glitch">[ LINK_QUALITY ]</h3>
+                        <div class="quality-row">
+                            <span class="quality-key">Quality</span>
+                            <span id="qualityLabel" class="quality-badge" data-level="idle">IDLE</span>
+                        </div>
+                        <div class="quality-row">
+                            <span class="quality-key">Latency (est.)</span>
+                            <span id="qualityLatency" class="quality-val">--</span>
+                        </div>
+                        <div class="quality-row">
+                            <span class="quality-key">Buffer</span>
+                            <span id="qualityBuffer" class="quality-val">--</span>
+                        </div>
+                        <div class="quality-row">
+                            <span class="quality-key">Packet loss (10 s)</span>
+                            <span id="qualityLoss" class="quality-val">--</span>
+                        </div>
+                        <div class="quality-row">
+                            <span class="quality-key">Screen stay-awake</span>
+                            <span id="wakeLockState" class="quality-val">--</span>
+                        </div>
+                        <p id="qualityHint" class="quality-hint" role="status" aria-live="polite" hidden></p>
+                    </div>
+                </div>
+
                 <div class="terminal-box border-dashed">
                     <div class="p-6 space-y-6">
                         <h3 class="text-xs font-bold uppercase tracking-widest phosphor-glow glitch">[ CONNECTION_METADATA ]</h3>
@@ -645,6 +815,8 @@
 
         // Start the random glitch cycle when page loads
         window.addEventListener('load', () => {
+            // Reduced motion: no glitch bursts at all.
+            if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
             const initialDelay = Math.floor(Math.random() * (20000 - 3000 + 1) + 3000);
             setTimeout(triggerRandomGlitch, initialDelay);
         });

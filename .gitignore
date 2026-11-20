@@ -11,3 +11,8 @@
 *.pdb
 *.exe
 /tools
+# patch/merge leftovers
+*.orig
+*.backup
+*.rej
+/dist

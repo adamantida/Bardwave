@@ -44,7 +44,7 @@ ctrlc = "3.4"
 
 [package]
 name = "soundshared"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 description = "Open-source TTRPG soundboard: desktop ambience console streamed to players' browsers over LAN."
 license = "MIT"
@@ -83,7 +83,70 @@ backtrace = { workspace = true }
 ctrlc = { workspace = true }
 socket2 = { workspace = true }
 roxmltree = { workspace = true }
+# EBU R128 loudness measurement (pure Rust) for track normalization
+ebur128 = "0.1.11"
+# Lock-free SPSC ring buffer (pure Rust) between the stream decoder thread and
+# the audio callback
+rtrb = "0.3.6"
+# Library bundles (.zip export/import); deflate only, via flate2 (pure Rust)
+zip = { version = "=2.6.1", default-features = false, features = ["deflate-flate2", "flate2"] }
+
+# QR code of the game-master panel link, drawn offline into an egui texture
+# (pure Rust; no image/svg backends needed)
+qrcode = { version = "0.14.1", default-features = false }
+
+# Optional HTTPS (`server.tls`): self-signed certificate generation (rcgen),
+# a rustls acceptor over the existing tokio listener (the `ring` provider is
+# already in the tree through ureq) and the SHA-256 certificate fingerprint.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower = { version = "0.5", default-features = false }
+ring = "0.17"
+
+# System-wide hotkeys (console not focused); see src/hotkeys.rs
+global-hotkey = "0.7.0"
+# MIDI input for hotkey bindings, only with `--features midi` (off by default)
+midir = { version = "0.10.1", optional = true }
+
+[features]
+default = []
+# MIDI controller bindings (src/hotkeys.rs `midi` module)
+midi = ["dep:midir"]
 
 # getifaddrs for LAN address detection on Linux / macOS
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Debian/Ubuntu package: `cargo deb` (cargo-deb), see packaging/linux and
+# .github/workflows/release-extras.yml. The crate is called `soundshared`; the
+# package, the installed binary and the menu entry are called Bardwave.
+[package.metadata.deb]
+name = "bardwave"
+maintainer = "Bardwave contributors <noreply@github.com>"
+section = "sound"
+priority = "optional"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Bardwave is a desktop ambience console for tabletop role-playing games. \
+It mixes music, ambience and sound effects on the game master's computer \
+and streams the result to the players' browsers over the local network \
+(or the internet). Players only open a link; nothing is installed on their side."""
+# $auto adds the exact shared libraries the binary links against; the rest are
+# libraries loaded at run time (winit/egui dlopen X11/Wayland/xkbcommon, rfd
+# loads GTK 3) plus the CI build list (libasound2 for cpal, libssl for TLS).
+# The "t64" names are the Ubuntu 24.04 / Debian 13 renames of the same packages.
+depends = "$auto, libasound2 | libasound2t64, libgtk-3-0 | libgtk-3-0t64, libxkbcommon0, libssl3 | libssl3t64"
+assets = [
+    ["target/release/soundshared", "usr/bin/bardwave", "755"],
+    ["packaging/linux/bardwave.desktop", "usr/share/applications/bardwave.desktop", "644"],
+    ["assets/icons/icon-48.png", "usr/share/icons/hicolor/48x48/apps/bardwave.png", "644"],
+    ["assets/icons/icon-128.png", "usr/share/icons/hicolor/128x128/apps/bardwave.png", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/bardwave.png", "644"],
+    ["assets/icons/icon-512.png", "usr/share/icons/hicolor/512x512/apps/bardwave.png", "644"],
+    ["README.md", "usr/share/doc/bardwave/README.md", "644"],
+    ["packaging/README.txt", "usr/share/doc/bardwave/QUICKSTART.txt", "644"],
+    ["packaging/config.toml", "usr/share/doc/bardwave/examples/config.toml", "644"],
+]
